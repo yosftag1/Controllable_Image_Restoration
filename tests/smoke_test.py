@@ -122,7 +122,54 @@ def test_selective_pipeline():
         assert len(train_ds) == 3, f"Expected all 3 nested+symlinked train images, got {len(train_ds)}"
         assert len(val_ds) == 1, f"Expected 1 val image, got {len(val_ds)}"
 
-    print("[PASS] Seed-synchronized selective degradation pipeline & Kaggle DF2K-OST loader verified.")
+        # Verify Single-Image Raw As-Is + Synthetic Benchmark Suite end-to-end
+        from utils.image_benchmark import run_single_image_benchmark
+        from utils.semantic_mask import parse_action_spec
+
+        bench_out = tmp_path / "bench_out"
+        test_photo = np.clip(clean.copy(), 0, 255).astype(np.uint8)
+        test_photo = cv2.resize(test_photo, (256, 200), interpolation=cv2.INTER_LINEAR)
+
+        def _mock_restore(
+            image_rgb_u8,
+            action="all",
+            bg_action="none",
+            point_mask=None,
+            mask_2d=None,
+            steps=1,
+            fidelity_scale=1.0,
+            detail_scale=0.0,
+        ):
+            fg = parse_action_spec(action, ds_cfg.DEGRADATION_TYPES)
+            if np.allclose(fg, 0.0):
+                return image_rgb_u8.copy(), None, None
+            smoothed = cv2.GaussianBlur(image_rgb_u8, (3, 3), 0.7)
+            if point_mask is not None and mask_2d is None:
+                mh, mw = image_rgb_u8.shape[:2]
+                mask_2d = np.zeros((mh, mw), dtype=np.float32)
+                cv2.circle(mask_2d, (mw // 2, mh // 2), min(mh, mw) // 4, 1.0, -1)
+            if mask_2d is not None:
+                m3 = mask_2d[:, :, None]
+                out = np.clip(np.round(m3 * smoothed + (1.0 - m3) * image_rgb_u8), 0, 255).astype(np.uint8)
+                return out, mask_2d, None
+            return smoothed, None, None
+
+        report = run_single_image_benchmark(
+            image_rgb_u8=test_photo,
+            config=ds_cfg,
+            restore_fn=_mock_restore,
+            output_dir=str(bench_out),
+            image_stem="demo_photo",
+            benchmark_size=128,
+            ckpt_stage="pixel_stage",
+        )
+        assert Path(report["outputs"]["raw_asis_sweep_png"]).exists()
+        assert Path(report["outputs"]["synthetic_artifact_sweep_png"]).exists()
+        assert Path(report["outputs"]["raw_fullres_restored_png"]).exists()
+        assert len(report["synthetic_benchmark_metrics"]) == 4
+        assert "native_1to1_crop" in report["raw_asis_metrics"]
+
+    print("[PASS] Seed-synchronized selective degradation pipeline, benchmark suite & DF2K-OST loader verified.")
 
 
 def test_model_and_stages_mock():

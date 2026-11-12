@@ -21,6 +21,7 @@ if PROJECT_ROOT not in sys.path:
 from config import Config
 from models.controllable_restorer import ControllableRestorer
 from train import cast_frozen_base_to_fp16
+from utils.image_benchmark import run_single_image_benchmark
 from utils.semantic_mask import (
     build_spatial_action_overlay,
     extract_one_click_semantic_mask,
@@ -82,6 +83,7 @@ class ControllableInferencer:
         bg_action: str = "none",
         point_mask: Optional[Tuple[float, float]] = None,
         mask_path: Optional[str] = None,
+        mask_2d: Optional[np.ndarray] = None,
         mask_threshold: Optional[float] = None,
         feather_sigma: float = 6.0,
         steps: int = 1,
@@ -103,9 +105,9 @@ class ControllableInferencer:
         fg_vec = parse_action_spec(action, self.config.DEGRADATION_TYPES)
         bg_vec = parse_action_spec(bg_action, self.config.DEGRADATION_TYPES)
 
-        mask_2d = None
+        resolved_mask = None
         if point_mask is not None:
-            mask_2d = extract_one_click_semantic_mask(
+            resolved_mask = extract_one_click_semantic_mask(
                 self.model.semantic_encoder,
                 src_t,
                 point_xy=point_mask,
@@ -113,9 +115,13 @@ class ControllableInferencer:
                 feather_sigma=feather_sigma,
             )
         elif mask_path is not None:
-            mask_2d = load_grayscale_mask(mask_path, height=h, width=w, feather_sigma=feather_sigma)
+            resolved_mask = load_grayscale_mask(mask_path, height=h, width=w, feather_sigma=feather_sigma)
+        elif mask_2d is not None:
+            resolved_mask = np.clip(mask_2d.astype(np.float32), 0.0, 1.0)
+            if resolved_mask.shape[:2] != (h, w):
+                resolved_mask = cv2.resize(resolved_mask, (w, h), interpolation=cv2.INTER_LINEAR)
 
-        if mask_2d is None:
+        if resolved_mask is None:
             # Compact [1, K] global vector avoids allocating a full-res [1, 8, H, W] overlay on 2K/4K images
             overlay = torch.from_numpy(fg_vec).unsqueeze(0).to(device=self.device, dtype=torch.float32)
         else:
@@ -124,7 +130,7 @@ class ControllableInferencer:
                 width=w,
                 fg_action=fg_vec,
                 bg_action=bg_vec,
-                mask_2d=mask_2d,
+                mask_2d=resolved_mask,
                 device=self.device,
             )
 
@@ -175,7 +181,59 @@ class ControllableInferencer:
         pred_u8 = np.clip(
             np.round(pred_t[0].permute(1, 2, 0).cpu().numpy() * 255.0), 0.0, 255.0
         ).astype(np.uint8)
-        return pred_u8, mask_2d, traj_u8
+        return pred_u8, resolved_mask, traj_u8
+
+    def benchmark(
+        self,
+        image_rgb_u8: np.ndarray,
+        output_dir: str = "./restored",
+        image_stem: str = "image",
+        user_action: str = "all",
+        point_mask: Optional[Tuple[float, float]] = None,
+        steps: int = 1,
+        benchmark_size: int = 512,
+        seed: int = 1234,
+        tile_size: Optional[int] = None,
+        tile_overlap: Optional[int] = None,
+    ):
+        """Run Raw As-Is + 4-Scenario Synthetic Artifact Benchmark Suite on `image_rgb_u8`."""
+
+        def _restore_cb(
+            image_rgb_u8: np.ndarray,
+            action: str = "all",
+            bg_action: str = "none",
+            point_mask: Optional[Tuple[float, float]] = None,
+            mask_2d: Optional[np.ndarray] = None,
+            steps: int = 1,
+            fidelity_scale: Optional[float] = None,
+            detail_scale: Optional[float] = None,
+        ):
+            return self.restore(
+                image_rgb_u8=image_rgb_u8,
+                action=action,
+                bg_action=bg_action,
+                point_mask=point_mask,
+                mask_2d=mask_2d,
+                steps=steps,
+                fidelity_scale=fidelity_scale,
+                detail_scale=detail_scale,
+                tile_size=tile_size,
+                tile_overlap=tile_overlap,
+            )
+
+        return run_single_image_benchmark(
+            image_rgb_u8=image_rgb_u8,
+            config=self.config,
+            restore_fn=_restore_cb,
+            output_dir=output_dir,
+            image_stem=image_stem,
+            user_action=user_action,
+            point_xy=point_mask,
+            steps=steps,
+            benchmark_size=benchmark_size,
+            seed=seed,
+            ckpt_stage=self.ckpt_stage,
+        )
 
 
 def main():
@@ -219,6 +277,23 @@ def main():
         default=None,
         help="Overlap margin in pixels between adjacent tiles (default: 96)",
     )
+    parser.add_argument(
+        "--benchmark",
+        action="store_true",
+        help="Run full Raw 'As-Is' + 4-Scenario Synthetic Artifact benchmark sweep on --image",
+    )
+    parser.add_argument(
+        "--benchmark-size",
+        type=int,
+        default=512,
+        help="Max side in pixels for multi-column benchmark panels (default: 512, 0=full native res)",
+    )
+    parser.add_argument(
+        "--benchmark-seed",
+        type=int,
+        default=1234,
+        help="Deterministic seed for synthetic benchmark degradations (default: 1234)",
+    )
     parser.add_argument("--save-trajectory", action="store_true", help="Save intermediate multi-step frames")
     parser.add_argument("--mock", action="store_true", help="Run with offline mock_tiny backbones")
     args = parser.parse_args()
@@ -236,6 +311,22 @@ def main():
     rgb_u8 = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
     pt = inferencer._parse_point(args.point_mask) if args.point_mask else None
+    stem = Path(args.image).stem
+
+    if args.benchmark:
+        inferencer.benchmark(
+            image_rgb_u8=rgb_u8,
+            output_dir=args.output_dir,
+            image_stem=stem,
+            user_action=args.action,
+            point_mask=pt,
+            steps=args.steps,
+            benchmark_size=args.benchmark_size,
+            seed=args.benchmark_seed,
+            tile_size=args.tile_size,
+            tile_overlap=args.tile_overlap,
+        )
+        return
     restored_u8, mask_2d, traj_u8 = inferencer.restore(
         image_rgb_u8=rgb_u8,
         action=args.action,
