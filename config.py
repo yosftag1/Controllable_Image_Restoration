@@ -159,7 +159,10 @@ class Config:
     PERCEPTUAL_LAYERS = ["relu2_2", "relu3_4", "relu4_4"]
 
     # Logging & Validation Sweeps
-    LOG_INTERVAL = 50
+    # Clean line-based logging by default so Kaggle background runs / piped logs never flood with \r bars
+    USE_TQDM = False
+    LOG_INTERVAL = 100
+    SAMPLE_EVERY_N_STEPS = 500     # Save mid-epoch visual sweep every N steps (0 = end-of-epoch only)
     VAL_EPOCH_INTERVAL = 1
     EVAL_IMAGE_COUNT = 3
 
@@ -174,4 +177,5 @@ class DebugConfig(Config):
     TRAIN_IMAGES_COUNT = 8
     VAL_IMAGES_COUNT = 2
     LOG_INTERVAL = 2
+    SAMPLE_EVERY_N_STEPS = 0
     EVAL_IMAGE_COUNT = 1

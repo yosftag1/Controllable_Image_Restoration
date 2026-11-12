@@ -9,12 +9,17 @@ from pathlib import Path
 import random
 import subprocess
 import sys
+import time
+import warnings
 
 # Kaggle notebook %run path fix; ensure expandable_segments is NOT set (prevents multi-GPU T4 illegal address)
 if "/kaggle/working/Controllable_Image_Restoration" not in sys.path:
     sys.path.insert(0, "/kaggle/working/Controllable_Image_Restoration")
 if os.environ.get("PYTORCH_CUDA_ALLOC_CONF") == "expandable_segments:True":
     os.environ.pop("PYTORCH_CUDA_ALLOC_CONF", None)
+if os.environ.get("RANK", "0") != "0":
+    os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+warnings.filterwarnings("ignore", category=FutureWarning, module=r"timm(\..*)?")
 
 import cv2
 import numpy as np
@@ -162,6 +167,13 @@ def compute_psnr(pred_01: torch.Tensor, tgt_01: torch.Tensor) -> float:
     return float(psnr.mean().item())
 
 
+def _format_duration(seconds: float) -> str:
+    secs = max(0, int(round(seconds)))
+    h, rem = divmod(secs, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h:d}:{m:02d}:{s:02d}" if h > 0 else f"{m:02d}:{s:02d}"
+
+
 @torch.no_grad()
 def evaluate_validation(model, val_loader, device, config, stage: str):
     raw_model = unwrap_model(model)
@@ -173,7 +185,7 @@ def evaluate_validation(model, val_loader, device, config, stage: str):
     total_l1 = 0.0
     count = 0
 
-    for batch in tqdm(val_loader, desc="Validation", leave=False):
+    for batch in val_loader:
         src = batch["source"].to(device, non_blocking=True)
         tgt = batch["target"].to(device, non_blocking=True)
         act = batch["action_map"].to(device, non_blocking=True)
@@ -193,13 +205,22 @@ def evaluate_validation(model, val_loader, device, config, stage: str):
         total_l1 += l1 * bsz
         count += bsz
 
+    raw_model.clear_runtime_contexts()
     raw_model.train()
     denom = max(1, count)
     return {"val_psnr": total_psnr / denom, "val_l1": total_l1 / denom}
 
 
 @torch.no_grad()
-def save_controllable_validation_grid(model, val_dataset, device, config, epoch: int, stage: str):
+def save_controllable_validation_grid(
+    model,
+    val_dataset,
+    device,
+    config,
+    epoch: int,
+    stage: str,
+    step: int = None,
+):
     """Render visual sweep proving selective, partial, Dual-LoRA, and localized mask control."""
     out_dir = Path(config.OUTPUT_DIR) / "controllable_sweeps"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -280,8 +301,14 @@ def save_controllable_validation_grid(model, val_dataset, device, config, epoch:
         rows_canvas.append(panel)
 
     full_grid = np.concatenate(rows_canvas, axis=0)
-    save_path = out_dir / f"epoch_{epoch:03d}_{stage}.png"
-    cv2.imwrite(str(save_path), cv2.cvtColor(full_grid, cv2.COLOR_RGB2BGR))
+    bgr_grid = cv2.cvtColor(full_grid, cv2.COLOR_RGB2BGR)
+    if step is not None:
+        save_path = out_dir / f"epoch_{epoch:03d}_step_{step:05d}_{stage}.png"
+    else:
+        save_path = out_dir / f"epoch_{epoch:03d}_{stage}.png"
+    cv2.imwrite(str(save_path), bgr_grid)
+    cv2.imwrite(str(out_dir / "latest_preview.png"), bgr_grid)
+    raw_model.clear_runtime_contexts()
     raw_model.train()
     return str(save_path)
 
@@ -356,6 +383,8 @@ def _launch_ddp_subprocess(num_gpus: int) -> None:
     env["OMP_NUM_THREADS"] = "1"
     env["MKL_NUM_THREADS"] = "1"
     env["TOKENIZERS_PARALLELISM"] = "false"
+    if "--tqdm" not in sys.argv[1:]:
+        env.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 
     cmd = [
         sys.executable,
@@ -664,15 +693,21 @@ def train(config: Config, resume_path: str = None, debug: bool = False, batch_si
             model.train()
             running = {}
             num_steps = len(train_loader)
+            use_tqdm = bool(getattr(config, "USE_TQDM", False))
+            log_interval = max(1, int(getattr(config, "LOG_INTERVAL", 100)))
+            sample_every = max(0, int(getattr(config, "SAMPLE_EVERY_N_STEPS", 500)))
+            step_width = max(4, len(str(num_steps)))
+            epoch_start_t = time.perf_counter()
+
             pbar = (
                 tqdm(
                     train_loader,
                     desc=f"Epoch {epoch:03d}/{config.EPOCHS} [{stage}]",
                     file=sys.stdout,
                     ncols=118,
-                    mininterval=1.5,
+                    mininterval=10.0,
                 )
-                if is_main
+                if (is_main and use_tqdm)
                 else train_loader
             )
 
@@ -733,12 +768,58 @@ def train(config: Config, resume_path: str = None, debug: bool = False, batch_si
                 for k, v in metrics.items():
                     running[k] = running.get(k, 0.0) + v
 
-                if is_main and (step_idx % config.LOG_INTERVAL == 0 or step_idx == num_steps):
+                if is_main and (step_idx == 1 or step_idx % log_interval == 0 or step_idx == num_steps):
                     avg_tot = running["total"] / step_idx
                     avg_al = running.get("align", 0.0) / step_idx
-                    pbar.set_postfix(
-                        {"loss": f"{avg_tot:.4f}", "align": f"{avg_al:.4f}", "gpu": format_gpu_postfix()}
-                    )
+                    gpu_str = format_gpu_postfix()
+                    if use_tqdm:
+                        pbar.set_postfix(
+                            {"loss": f"{avg_tot:.4f}", "align": f"{avg_al:.4f}", "gpu": gpu_str}
+                        )
+                    else:
+                        elapsed = max(1e-6, time.perf_counter() - epoch_start_t)
+                        sec_per_it = elapsed / step_idx
+                        rate_str = f"{sec_per_it:.2f}s/it" if sec_per_it >= 1.0 else f"{1.0 / sec_per_it:.2f}it/s"
+                        eta_str = _format_duration(sec_per_it * (num_steps - step_idx))
+                        pct = 100.0 * step_idx / max(1, num_steps)
+                        cur_lr = optimizer.param_groups[-1]["lr"]
+                        if stage == "align_warmup":
+                            loss_parts = f"loss={avg_tot:.4f} align={avg_al:.4f}"
+                        elif stage == "pixel_stage":
+                            avg_l1 = running.get("l1", 0.0) / step_idx
+                            loss_parts = f"loss={avg_tot:.4f} l1={avg_l1:.4f} align={avg_al:.4f}"
+                        else:
+                            avg_l1 = running.get("l1", 0.0) / step_idx
+                            avg_perc = running.get("perc", 0.0) / step_idx
+                            loss_parts = f"loss={avg_tot:.4f} l1={avg_l1:.4f} perc={avg_perc:.4f}"
+                        print(
+                            f"[Epoch {epoch:03d}/{config.EPOCHS} | {stage}] "
+                            f"{step_idx:0{step_width}d}/{num_steps} ({pct:5.1f}%) | "
+                            f"{loss_parts} | lr={cur_lr:.2e} | {rate_str} ETA {eta_str} | {gpu_str}",
+                            flush=True,
+                        )
+
+                # Rank-symmetric mid-epoch visual sweep check (avoids redundant save right before epoch end)
+                should_mid_sample = (
+                    sample_every > 0
+                    and stage != "align_warmup"
+                    and (step_idx % sample_every == 0)
+                    and (num_steps - step_idx) > min(75, sample_every // 5)
+                )
+                if should_mid_sample:
+                    if is_main and val_dataset is not None:
+                        if device.type == "cuda":
+                            torch.cuda.empty_cache()
+                        preview_path = save_controllable_validation_grid(
+                            raw_model, val_dataset, device, config, epoch, stage, step=step_idx
+                        )
+                        print(
+                            f"  ↳ [Preview @ Epoch {epoch:03d} Step {step_idx:0{step_width}d}/{num_steps}] "
+                            f"Saved sweep -> {preview_path}",
+                            flush=True,
+                        )
+                    if is_ddp:
+                        dist.barrier()
 
             # Step scheduler BEFORE saving checkpoints so resumed runs have the exact next-epoch LR
             if scheduler is not None:
@@ -811,6 +892,9 @@ def main():
     parser.add_argument("--align-epochs", type=int, help="Override Phase-1 Vision LoRA warmup epochs", default=None)
     parser.add_argument("--pixel-epochs", type=int, help="Override Phase-2 Pixel-LoRA stage epochs", default=None)
     parser.add_argument("--num-workers", type=int, default=None)
+    parser.add_argument("--log-interval", type=int, default=None, help="Steps between clean log lines (default: 100)")
+    parser.add_argument("--sample-steps", type=int, default=None, help="Save mid-epoch sweep grid every N steps (0=disable, default: 500)")
+    parser.add_argument("--tqdm", action="store_true", help="Use interactive tqdm progress bar instead of background-safe line logs")
     args = parser.parse_args()
 
     config = DebugConfig() if args.debug else Config()
@@ -847,6 +931,12 @@ def main():
         config.PIXEL_STAGE_EPOCHS = args.pixel_epochs
     if args.num_workers is not None:
         config.NUM_WORKERS = args.num_workers
+    if args.log_interval is not None:
+        config.LOG_INTERVAL = args.log_interval
+    if args.sample_steps is not None:
+        config.SAMPLE_EVERY_N_STEPS = args.sample_steps
+    if args.tqdm:
+        config.USE_TQDM = True
 
     in_ddp_worker = "LOCAL_RANK" in os.environ and "RANK" in os.environ
     if not in_ddp_worker and not args.no_ddp and config.MULTI_GPU and config.DEVICE == "cuda":
