@@ -199,8 +199,8 @@ class SwitchableLoRALinear(nn.Module):
         base_out = self.base(x)
         if not _get_vision_lora_enabled():
             return base_out
-        x_fp32 = self.dropout(x.float())
-        delta = self.lora_B(self.lora_A(x_fp32)) * self.scaling
+        x_in = x if torch.is_autocast_enabled() else x.to(self.lora_A.weight.dtype)
+        delta = self.lora_B(self.lora_A(self.dropout(x_in))) * self.scaling
         return base_out + delta.to(base_out.dtype)
 
 
@@ -244,12 +244,14 @@ class _DualLoRABranch(nn.Module):
         nn.init.zeros_(self.gate_proj.weight)
         nn.init.zeros_(self.gate_proj.bias)
 
-    def forward(self, x_fp32: torch.Tensor, action_cond: Optional[torch.Tensor]) -> torch.Tensor:
-        h = self.down(x_fp32)
+    def forward(self, x: torch.Tensor, action_cond: Optional[torch.Tensor]) -> torch.Tensor:
+        x_in = x if torch.is_autocast_enabled() else x.to(self.down.weight.dtype)
+        h = self.down(x_in)
         if action_cond is not None:
+            cond_in = action_cond if torch.is_autocast_enabled() else action_cond.to(self.gate_proj.weight.dtype)
             # Centered at 1.0 + tanh(...) in [0.0, 2.0] so individual rank channels scale up/down per action
-            gate = 1.0 + torch.tanh(self.gate_proj(action_cond.float()))
-            h = h * _broadcast_rank_gate(gate, h)
+            gate = 1.0 + torch.tanh(self.gate_proj(cond_in))
+            h = h * _broadcast_rank_gate(gate.to(h.dtype), h)
         return self.up(h)
 
 
@@ -291,15 +293,14 @@ class ActionDualLoRALinear(nn.Module):
         if abs(lam_pix) < 1e-6 and abs(lam_sem) < 1e-6:
             return out
 
-        x_fp32 = x.float()
         if action_cond is not None and action_cond.device != x.device:
             action_cond = action_cond.to(x.device)
 
         delta = None
         if abs(lam_pix) >= 1e-6:
-            delta = (lam_pix * self.scaling) * self.pix_branch(x_fp32, action_cond)
+            delta = (lam_pix * self.scaling) * self.pix_branch(x, action_cond)
         if abs(lam_sem) >= 1e-6:
-            sem_d = (lam_sem * self.scaling) * self.sem_branch(x_fp32, action_cond)
+            sem_d = (lam_sem * self.scaling) * self.sem_branch(x, action_cond)
             delta = sem_d if delta is None else (delta + sem_d)
 
         return out if delta is None else (out + delta.to(out.dtype))
@@ -362,15 +363,14 @@ class ActionDualLoRAConv2d(nn.Module):
         if abs(lam_pix) < 1e-6 and abs(lam_sem) < 1e-6:
             return out
 
-        x_fp32 = x.float()
         if action_cond is not None and action_cond.device != x.device:
             action_cond = action_cond.to(x.device)
 
         delta = None
         if abs(lam_pix) >= 1e-6:
-            delta = (lam_pix * self.scaling) * self.pix_branch(x_fp32, action_cond)
+            delta = (lam_pix * self.scaling) * self.pix_branch(x, action_cond)
         if abs(lam_sem) >= 1e-6:
-            sem_d = (lam_sem * self.scaling) * self.sem_branch(x_fp32, action_cond)
+            sem_d = (lam_sem * self.scaling) * self.sem_branch(x, action_cond)
             delta = sem_d if delta is None else (delta + sem_d)
 
         return out if delta is None else (out + delta.to(out.dtype))

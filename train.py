@@ -413,7 +413,7 @@ def _build_train_loader(
         train_dataset._cache_capacity = max(4, int(getattr(config, "DECODE_CACHE_SIZE", 16)) // world_size)
 
     global_bsz = (
-        min(32, config.BATCH_SIZE * 2)
+        min(32, config.BATCH_SIZE * 4)
         if (align_only and not getattr(config, "_debug_mode", False))
         else config.BATCH_SIZE
     )
@@ -483,8 +483,8 @@ def train(config: Config, resume_path: str = None, debug: bool = False, batch_si
         num_gpus = world_size if is_ddp else (torch.cuda.device_count() if device.type == "cuda" else 0)
         use_amp = config.USE_AMP and (device.type == "cuda")
 
-        if num_gpus == 1 and not batch_size_overridden and config.BATCH_SIZE >= 16 and not debug:
-            config.BATCH_SIZE = 8
+        if num_gpus == 1 and not batch_size_overridden and config.BATCH_SIZE >= 8 and not debug:
+            config.BATCH_SIZE = 4
 
         if is_main:
             mode_tag = f"DDP ({world_size} GPUs)" if is_ddp else f"{device} (GPUs: {num_gpus})"
@@ -614,6 +614,8 @@ def train(config: Config, resume_path: str = None, debug: bool = False, batch_si
                 if is_ddp and model is not raw_model:
                     del model
                     gc.collect()
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
                 current_stage = stage
                 optimizer, active_params = build_stage_optimizer(raw_model, stage, config)
                 remaining = max(1, config.EPOCHS - epoch + 1)
@@ -644,7 +646,7 @@ def train(config: Config, resume_path: str = None, debug: bool = False, batch_si
                         raw_model,
                         device_ids=[local_rank],
                         output_device=local_rank,
-                        find_unused_parameters=True,
+                        find_unused_parameters=False,
                     )
                 else:
                     model = raw_model
@@ -742,6 +744,8 @@ def train(config: Config, resume_path: str = None, debug: bool = False, batch_si
 
             if is_main:
                 if stage != "align_warmup" and (epoch % max(1, config.VAL_EPOCH_INTERVAL) == 0 or epoch == config.EPOCHS):
+                    if device.type == "cuda":
+                        torch.cuda.empty_cache()
                     val_metrics = evaluate_validation(raw_model, val_loader, device, config, stage)
                     epoch_summary.update(val_metrics)
                     grid_path = save_controllable_validation_grid(raw_model, val_dataset, device, config, epoch, stage)

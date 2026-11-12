@@ -123,7 +123,7 @@ class Config:
     CHECKPOINT_DIR = "./checkpoints"
 
     PATCH_SIZE = 256
-    BATCH_SIZE = 16                # 8 per T4 GPU on 2x T4 (auto-scales to 8 on 1x GPU)
+    BATCH_SIZE = 8                 # 4 per T4 GPU on 2x T4 (~8 GB/15 GB VRAM safe across all 3 phases)
     NUM_WORKERS = 4
     DATALOADER_PREFETCH_FACTOR = 4
     DECODE_CACHE_SIZE = 16         # Per-worker staggered 2K-PNG decode cache (cuts FUSE/libpng CPU cost ~6x)
