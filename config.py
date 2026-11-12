@@ -117,6 +117,7 @@ class Config:
     VAL_DATASET_PATH = None
     TRAIN_IMAGES_COUNT = 0         # 0 = use all available images
     VAL_IMAGES_COUNT = 0
+    MAX_STEPS_PER_EPOCH = 0        # 0 = full dataset per epoch; >0 = cap steps/epoch (reshuffled slice each epoch)
 
     OUTPUT_DIR = "./outputs"
     LOG_DIR = "./logs"

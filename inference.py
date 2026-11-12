@@ -36,12 +36,14 @@ class ControllableInferencer:
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
         self.config = config or Config()
 
+        self.ckpt_stage = None
         ckpt = None
         if checkpoint_path:
             try:
                 ckpt = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
             except TypeError:
                 ckpt = torch.load(checkpoint_path, map_location=self.device)
+            self.ckpt_stage = ckpt.get("stage")
             if "model_config" in ckpt:
                 for key, val in ckpt["model_config"].items():
                     setattr(self.config, key, val)
@@ -112,6 +114,11 @@ class ControllableInferencer:
             device=self.device,
         )
 
+        effective_detail_scale = detail_scale
+        if effective_detail_scale is None and self.ckpt_stage in ("align_warmup", "pixel_stage"):
+            # Semantic-LoRA has not been trained yet in pre-Stage-3 checkpoints; skip zero branch cleanly
+            effective_detail_scale = 0.0
+
         use_amp = (self.device.type == "cuda") and self.config.USE_AMP
         with torch.amp.autocast("cuda", enabled=use_amp):
             out = self.model.sample(
@@ -119,7 +126,7 @@ class ControllableInferencer:
                 action_input=overlay,
                 steps=steps,
                 fidelity_scale=fidelity_scale,
-                detail_scale=detail_scale,
+                detail_scale=effective_detail_scale,
                 return_trajectory=return_trajectory,
             )
 

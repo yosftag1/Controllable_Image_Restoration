@@ -318,8 +318,12 @@ class SelectiveDegradationPipeline:
                     action[idx] = float(rng.uniform(0.15, 0.90))
 
         elif u < p_sel + p_part + p_full:
-            for idx in active_indices:
-                action[idx] = 1.0
+            if rng.random() < 0.50:
+                # Explicitly include global 'all' ([1, 1, ..., 1]) so '--action all' stays strictly in-distribution
+                action[:] = 1.0
+            else:
+                for idx in active_indices:
+                    action[idx] = 1.0
 
         elif u < p_sel + p_part + p_full + p_fp:
             for idx in active_indices:

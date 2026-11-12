@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import random
+import shutil
 import subprocess
 import sys
 import time
@@ -26,7 +27,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.optim as optim
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Sampler
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 
@@ -426,6 +427,47 @@ def _launch_ddp_subprocess(num_gpus: int) -> None:
         raise
 
 
+class _EpochStepCapSampler(Sampler):
+    """Deterministic per-epoch sub-sampler that draws a fresh random slice of exact `num_steps` batches."""
+
+    def __init__(
+        self,
+        dataset_len: int,
+        num_steps: int,
+        per_gpu_bsz: int,
+        rank: int = 0,
+        world_size: int = 1,
+        seed: int = 42,
+    ):
+        self.dataset_len = int(dataset_len)
+        self.num_steps = max(1, int(num_steps))
+        self.per_gpu_bsz = max(1, int(per_gpu_bsz))
+        self.rank = int(rank)
+        self.world_size = max(1, int(world_size))
+        self.seed = int(seed)
+        self.epoch = 0
+        self.num_samples = self.num_steps * self.per_gpu_bsz
+        self.total_size = self.num_samples * self.world_size
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
+
+    def __iter__(self):
+        g = torch.Generator()
+        g.manual_seed(self.seed + self.epoch)
+        if self.total_size <= self.dataset_len:
+            perm = torch.randperm(self.dataset_len, generator=g)[: self.total_size].tolist()
+        else:
+            reps = (self.total_size + self.dataset_len - 1) // self.dataset_len
+            perm = torch.cat([torch.randperm(self.dataset_len, generator=g) for _ in range(reps)])[
+                : self.total_size
+            ].tolist()
+        return iter(perm[self.rank : self.total_size : self.world_size])
+
+    def __len__(self) -> int:
+        return self.num_samples
+
+
 def _build_train_loader(
     train_dataset,
     config: Config,
@@ -450,8 +492,19 @@ def _build_train_loader(
     total_nw = int(config.NUM_WORKERS)
     nw = max(1, total_nw // max(1, world_size)) if total_nw > 0 else 0
 
+    max_steps = int(getattr(config, "MAX_STEPS_PER_EPOCH", 0) or 0)
+    full_steps = len(train_dataset) // max(1, global_bsz)
     sampler = None
-    if is_ddp:
+    if max_steps > 0 and max_steps < full_steps:
+        sampler = _EpochStepCapSampler(
+            dataset_len=len(train_dataset),
+            num_steps=max_steps,
+            per_gpu_bsz=per_gpu_bsz,
+            rank=rank,
+            world_size=world_size,
+            seed=config.SEED,
+        )
+    elif is_ddp:
         sampler = DistributedSampler(
             train_dataset,
             num_replicas=world_size,
@@ -476,7 +529,17 @@ def _build_train_loader(
     return DataLoader(train_dataset, **loader_kwargs), sampler
 
 
-def train(config: Config, resume_path: str = None, debug: bool = False, batch_size_overridden: bool = False):
+def train(
+    config: Config,
+    resume_path: str = None,
+    debug: bool = False,
+    batch_size_overridden: bool = False,
+    speedrun: bool = False,
+    extra_epochs: int = None,
+    remaining_pixel_epochs: int = None,
+    epochs_overridden: bool = False,
+    pixel_epochs_overridden: bool = False,
+):
     is_ddp = (
         "LOCAL_RANK" in os.environ
         and "RANK" in os.environ
@@ -583,21 +646,65 @@ def train(config: Config, resume_path: str = None, debug: bool = False, batch_si
                 if adapter_state is not None:
                     raw_model.load_trainable_state_dict(adapter_state)
                 start_epoch = int(ckpt.get("epoch", 0)) + 1
+                last_epoch = start_epoch - 1
                 best_psnr = float(ckpt.get("best_psnr", -1.0))
                 resumed_stage = ckpt.get("stage")
                 resumed_opt_state = ckpt.get("optimizer_state_dict")
                 resumed_sched_state = ckpt.get("scheduler_state_dict")
                 del ckpt
+
+                eff_rem_pix = remaining_pixel_epochs
+                eff_extra = extra_epochs
+                if speedrun:
+                    if eff_rem_pix is None and not pixel_epochs_overridden:
+                        if resumed_stage == "pixel_stage":
+                            eff_rem_pix = 1
+                        elif resumed_stage == "semantic_stage":
+                            eff_rem_pix = 0
+                        else:
+                            eff_rem_pix = 4
+                    if eff_extra is None and not epochs_overridden:
+                        if resumed_stage == "pixel_stage":
+                            eff_extra = int(eff_rem_pix or 0) + 4
+                        elif resumed_stage == "semantic_stage":
+                            eff_extra = 4
+                        else:
+                            eff_extra = int(eff_rem_pix or 4) + 4
+
+                if eff_rem_pix is not None:
+                    config.ALIGN_WARMUP_EPOCHS = min(config.ALIGN_WARMUP_EPOCHS, max(0, last_epoch))
+                    config.PIXEL_STAGE_EPOCHS = max(
+                        0, (last_epoch - config.ALIGN_WARMUP_EPOCHS) + int(eff_rem_pix)
+                    )
+                if eff_extra is not None:
+                    config.EPOCHS = last_epoch + max(1, int(eff_extra))
+                    resumed_sched_state = None
+
                 if resumed_stage != determine_epoch_stage(start_epoch, config):
                     resumed_opt_state = None
                     resumed_sched_state = None
                 if is_main:
+                    sched_note = ""
+                    if speedrun or eff_rem_pix is not None or eff_extra is not None:
+                        sched_note = (
+                            f" | schedule -> total_epochs={config.EPOCHS}, "
+                            f"pixel_end={config.ALIGN_WARMUP_EPOCHS + config.PIXEL_STAGE_EPOCHS}, "
+                            f"steps_cap={getattr(config, 'MAX_STEPS_PER_EPOCH', 0) or 'full'}"
+                        )
                     print(
-                        f"Resumed trainable adapters (starting at Epoch {start_epoch}, best PSNR={best_psnr:.2f} dB)",
+                        f"Resumed trainable adapters (starting at Epoch {start_epoch}, "
+                        f"best PSNR={best_psnr:.2f} dB){sched_note}",
                         flush=True,
                     )
-            elif is_main:
-                print(f"No checkpoint found at {resume_path} — starting fresh training from Epoch 1.", flush=True)
+            else:
+                if speedrun:
+                    if not pixel_epochs_overridden:
+                        config.ALIGN_WARMUP_EPOCHS = 1
+                        config.PIXEL_STAGE_EPOCHS = 6
+                    if not epochs_overridden:
+                        config.EPOCHS = 11
+                if is_main:
+                    print(f"No checkpoint found at {resume_path} — starting fresh training from Epoch 1.", flush=True)
 
         # Diversify per-rank augmentation RNG after identical model weight initialization
         if is_ddp:
@@ -648,6 +755,17 @@ def train(config: Config, resume_path: str = None, debug: bool = False, batch_si
                 train_sampler.set_epoch(epoch)
 
             if stage != current_stage:
+                prev_stage = current_stage if current_stage is not None else resumed_stage
+                if prev_stage in ("align_warmup", "pixel_stage") and stage == "semantic_stage":
+                    if is_main:
+                        best_ckpt_p = Path(config.CHECKPOINT_DIR) / "model_best.pt"
+                        pix_backup_p = Path(config.CHECKPOINT_DIR) / "model_best_pixel.pt"
+                        if best_ckpt_p.exists() and not pix_backup_p.exists():
+                            shutil.copy2(str(best_ckpt_p), str(pix_backup_p))
+                            print(f"Backed up best Pixel-Stage checkpoint -> {pix_backup_p}", flush=True)
+                    # Reset best_psnr so model_best.pt saves the best Dual-LoRA (semantic_stage) checkpoint
+                    best_psnr = -1.0
+
                 if is_ddp and model is not raw_model:
                     del model
                     gc.collect()
@@ -891,6 +1009,31 @@ def main():
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--align-epochs", type=int, help="Override Phase-1 Vision LoRA warmup epochs", default=None)
     parser.add_argument("--pixel-epochs", type=int, help="Override Phase-2 Pixel-LoRA stage epochs", default=None)
+    parser.add_argument(
+        "--extra-epochs",
+        type=int,
+        default=None,
+        help="When resuming, run N more epochs past the checkpoint epoch",
+    )
+    parser.add_argument(
+        "--remaining-pixel-epochs",
+        type=int,
+        default=None,
+        help="When resuming, run K more pixel_stage epochs (0 = jump straight to semantic_stage)",
+    )
+    parser.add_argument(
+        "--steps-per-epoch",
+        type=int,
+        default=None,
+        help="Cap optimizer steps per epoch (draws a fresh random dataset slice each epoch)",
+    )
+    parser.add_argument("--train-images", type=int, default=None, help="Cap number of training reference images")
+    parser.add_argument("--val-images", type=int, default=None, help="Cap number of validation reference images")
+    parser.add_argument(
+        "--speedrun",
+        action="store_true",
+        help="Fast ~50-min finish preset (300 steps/epoch + quick transition into semantic_stage)",
+    )
     parser.add_argument("--num-workers", type=int, default=None)
     parser.add_argument("--log-interval", type=int, default=None, help="Steps between clean log lines (default: 100)")
     parser.add_argument("--sample-steps", type=int, default=None, help="Save mid-epoch sweep grid every N steps (0=disable, default: 500)")
@@ -923,12 +1066,26 @@ def main():
         config.LOG_DIR = args.log_dir
     if args.batch_size:
         config.BATCH_SIZE = args.batch_size
+    if args.speedrun:
+        config.MAX_STEPS_PER_EPOCH = 300
+        config.LOG_INTERVAL = 50
+        config.SAMPLE_EVERY_N_STEPS = 0
+        if not args.resume:
+            config.ALIGN_WARMUP_EPOCHS = 1
+            config.PIXEL_STAGE_EPOCHS = 6
+            config.EPOCHS = 11
     if args.epochs:
         config.EPOCHS = args.epochs
     if args.align_epochs is not None:
         config.ALIGN_WARMUP_EPOCHS = args.align_epochs
     if args.pixel_epochs is not None:
         config.PIXEL_STAGE_EPOCHS = args.pixel_epochs
+    if args.steps_per_epoch is not None:
+        config.MAX_STEPS_PER_EPOCH = args.steps_per_epoch
+    if args.train_images is not None:
+        config.TRAIN_IMAGES_COUNT = args.train_images
+    if args.val_images is not None:
+        config.VAL_IMAGES_COUNT = args.val_images
     if args.num_workers is not None:
         config.NUM_WORKERS = args.num_workers
     if args.log_interval is not None:
@@ -950,6 +1107,11 @@ def main():
         resume_path=args.resume,
         debug=args.debug,
         batch_size_overridden=(args.batch_size is not None),
+        speedrun=args.speedrun,
+        extra_epochs=args.extra_epochs,
+        remaining_pixel_epochs=args.remaining_pixel_epochs,
+        epochs_overridden=(args.epochs is not None),
+        pixel_epochs_overridden=(args.pixel_epochs is not None),
     )
 
 
