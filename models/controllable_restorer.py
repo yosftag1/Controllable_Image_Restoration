@@ -19,10 +19,12 @@ import torch.nn.functional as F
 
 from .action_overlay import ActionOverlayEncoder, PointwiseSpatialModulator
 from .lora_layers import (
+    clear_generator_lora_state,
     generator_lora_context,
     infer_module_device,
     infer_module_dtype,
     inject_generator_dual_lora,
+    set_generator_lora_state,
 )
 from .semantic_encoder import SemanticEncoder, load_hf_public_safe
 from .skip_vae import SkipConnectedVAE, _MockTinyVAE
@@ -31,10 +33,20 @@ from .skip_vae import SkipConnectedVAE, _MockTinyVAE
 _SPATIAL_OVERLAY_STATE = threading.local()
 
 
+def set_spatial_action_map(action_map: Optional[torch.Tensor]) -> None:
+    """Persist thread-local spatial action map across forward + gradient-checkpointed backward."""
+    _SPATIAL_OVERLAY_STATE.action_map = action_map
+
+
+def clear_spatial_action_map() -> None:
+    """Release thread-local spatial action map tensor reference after backward completes."""
+    _SPATIAL_OVERLAY_STATE.action_map = None
+
+
 @contextmanager
 def _spatial_action_context(action_map: Optional[torch.Tensor]):
     prev = getattr(_SPATIAL_OVERLAY_STATE, "action_map", None)
-    _SPATIAL_OVERLAY_STATE.action_map = action_map
+    set_spatial_action_map(action_map)
     try:
         yield
     finally:
@@ -208,6 +220,13 @@ class ControllableRestorer(nn.Module):
             include_conv=True,
         )
 
+        # Enable non-reentrant gradient checkpointing on UNet blocks before wrapping spatial overlays
+        if getattr(config, "GRADIENT_CHECKPOINTING", True) and hasattr(self.unet, "enable_gradient_checkpointing"):
+            try:
+                self.unet.enable_gradient_checkpointing(gradient_checkpointing_kwargs={"use_reentrant": False})
+            except TypeError:
+                self.unet.enable_gradient_checkpointing()
+
         # 5. Wrap UNet multi-scale blocks with 1x1 Pointwise Spatial Action Overlay Modulators
         cross_attn_dim = getattr(self.unet.config, "cross_attention_dim", 768)
         if isinstance(cross_attn_dim, (list, tuple)):
@@ -371,6 +390,12 @@ class ControllableRestorer(nn.Module):
             )
         return missing, unexpected
 
+    @staticmethod
+    def clear_runtime_contexts() -> None:
+        """Clear thread-local LoRA & spatial overlay references after backward() finishes."""
+        clear_generator_lora_state()
+        clear_spatial_action_map()
+
     def _predict_velocity(
         self,
         z_t: torch.Tensor,
@@ -389,11 +414,14 @@ class ControllableRestorer(nn.Module):
 
         t_unet = (t_cont.float() * 999.0).round().long().clamp(1, 999)
         unet_dtype = infer_module_dtype(self.unet, fallback=z_t.dtype)
+        z_in = z_t.to(unet_dtype)
+        if self.training and torch.is_grad_enabled() and not z_in.requires_grad:
+            z_in = z_in.detach().requires_grad_(True)
 
         with generator_lora_context(global_action_cond, lambda_pix=fidelity_scale, lambda_sem=detail_scale):
             with _spatial_action_context(action_map):
                 raw_pred = self.unet(
-                    z_t.to(unet_dtype),
+                    z_in,
                     t_unet,
                     encoder_hidden_states=cross_tokens.to(unet_dtype),
                 ).sample.float()
@@ -428,23 +456,38 @@ class ControllableRestorer(nn.Module):
         bsz, _, h, w = src_01.shape
         action_map = self.action_overlay.ensure_spatial_map(action_input, h, w)
 
-        # 1. Self-Teacher Vision Semantics + Alignment Loss
-        align_loss, sem_out = self.semantic_encoder.compute_self_teacher_loss(src_01, clean_01)
+        # 1. Self-Teacher Vision Semantics + Alignment Loss (skip teacher/grad pass when vision_lora is frozen)
+        vision_trainable = torch.is_grad_enabled() and any(
+            p.requires_grad for p in self.semantic_encoder.vision_lora_params
+        )
+        if vision_trainable:
+            align_loss, sem_out = self.semantic_encoder.compute_self_teacher_loss(src_01, clean_01)
+        else:
+            with torch.no_grad():
+                sem_out = self.semantic_encoder(src_01, use_lora=True)
+            align_loss = src_01.new_zeros(1, dtype=torch.float32)
+
         cross_tokens, global_action_cond = self.action_overlay(
             action_map, sem_out["tokens"], sem_out["global"]
         )
 
-        # 2. Encode source image (with Encoder Dual-LoRA active)
-        with generator_lora_context(global_action_cond, lambda_pix=fidelity_scale, lambda_sem=detail_scale):
-            z_src, enc_skips = self.skip_vae.encode_with_skips(src_01)
-
-        # 3. Mix 1-step direct (t=1.0) and multi-step Rectified Flow bridge (t in [0.25, 1.0])
+        # 2. Sample Rectified Flow bridge target first (clean base VAE latents under no_grad)
         use_bridge = torch.rand(1, device=src_01.device).item() < getattr(
             self.config, "MULTI_STEP_TRAIN_PROB", 0.30
         )
+        z_tgt = None
         if use_bridge:
-            with torch.no_grad():
+            with torch.no_grad(), generator_lora_context(None, lambda_pix=0.0, lambda_sem=0.0):
                 z_tgt = self.skip_vae.encode_target_latents(tgt_01)
+
+        # 3. Persist thread-local Dual-LoRA & Spatial Overlay state across forward + backward
+        # so gradient-checkpointed UNet and Skip-VAE blocks recompute with identical conditioning.
+        set_generator_lora_state(global_action_cond, lambda_pix=fidelity_scale, lambda_sem=detail_scale)
+        set_spatial_action_map(action_map)
+
+        z_src, enc_skips = self.skip_vae.encode_with_skips(src_01)
+
+        if use_bridge and z_tgt is not None:
             t_vec = torch.empty(bsz, device=src_01.device).uniform_(0.25, 1.0)
             t_4d = t_vec.view(bsz, 1, 1, 1)
             z_t = (1.0 - t_4d) * z_tgt + t_4d * z_src

@@ -488,11 +488,12 @@ def train(config: Config, resume_path: str = None, debug: bool = False, batch_si
 
         if is_main:
             mode_tag = f"DDP ({world_size} GPUs)" if is_ddp else f"{device} (GPUs: {num_gpus})"
+            gckpt_tag = "ON" if getattr(config, "GRADIENT_CHECKPOINTING", True) else "OFF"
             print(
                 f"Device: {mode_tag} | Global Batch Size: {config.BATCH_SIZE} "
                 f"({max(1, config.BATCH_SIZE // max(1, world_size))}/GPU) | "
                 f"Backbone: {config.GENERATOR_BACKBONE} | Vision: {config.SEMANTIC_ENCODER_TYPE} | "
-                f"AMP: {'ENABLED' if use_amp else 'DISABLED'}",
+                f"AMP: {'ENABLED' if use_amp else 'DISABLED'} | GradCkpt: {gckpt_tag}",
                 flush=True,
             )
             print("Loading datasets...", flush=True)
@@ -505,7 +506,7 @@ def train(config: Config, resume_path: str = None, debug: bool = False, batch_si
             val_nw = min(2, int(config.NUM_WORKERS))
             val_loader = DataLoader(
                 val_dataset,
-                batch_size=max(1, min(config.BATCH_SIZE, 8)),
+                batch_size=max(1, min(config.BATCH_SIZE // max(1, world_size), 4)),
                 shuffle=False,
                 num_workers=val_nw,
                 pin_memory=(device.type == "cuda"),
@@ -676,50 +677,53 @@ def train(config: Config, resume_path: str = None, debug: bool = False, batch_si
 
                 optimizer.zero_grad(set_to_none=True)
 
-                if stage == "align_warmup":
-                    with torch.amp.autocast("cuda", enabled=use_amp):
-                        align_out = model(src, clean_01=clean, align_only=True)
-                        loss = align_out.float().mean()
-                    val_f = float(loss.detach().item())
-                    metrics = {"align": val_f, "total": val_f}
-                else:
-                    tgt = batch["target"].to(device, non_blocking=True)
-                    act_map = unpack_batch_action_map(batch, device)
-                    d_scale = 0.0 if stage == "pixel_stage" else float(random.uniform(0.4, 1.25))
+                try:
+                    if stage == "align_warmup":
+                        with torch.amp.autocast("cuda", enabled=use_amp):
+                            align_out = model(src, clean_01=clean, align_only=True)
+                            loss = align_out.float().mean()
+                        val_f = float(loss.detach().item())
+                        metrics = {"align": val_f, "total": val_f}
+                    else:
+                        tgt = batch["target"].to(device, non_blocking=True)
+                        act_map = unpack_batch_action_map(batch, device)
+                        d_scale = 0.0 if stage == "pixel_stage" else float(random.uniform(0.4, 1.25))
 
-                    with torch.amp.autocast("cuda", enabled=use_amp):
-                        out = model(
-                            src,
-                            act_map,
-                            tgt_01=tgt,
-                            clean_01=clean,
-                            fidelity_scale=1.0,
-                            detail_scale=d_scale,
-                        )
-                        loss, metrics = loss_fn(
-                            pred_01=out["pred"],
-                            target_01=tgt,
-                            action_map=act_map,
-                            align_loss=out["align_loss"],
-                            stage=stage,
-                            t_vec=out["t"],
-                            semantic_encoder=raw_model.semantic_encoder if stage in ("semantic_stage", "joint") else None,
-                        )
+                        with torch.amp.autocast("cuda", enabled=use_amp):
+                            out = model(
+                                src,
+                                act_map,
+                                tgt_01=tgt,
+                                clean_01=clean,
+                                fidelity_scale=1.0,
+                                detail_scale=d_scale,
+                            )
+                            loss, metrics = loss_fn(
+                                pred_01=out["pred"],
+                                target_01=tgt,
+                                action_map=act_map,
+                                align_loss=out["align_loss"],
+                                stage=stage,
+                                t_vec=out["t"],
+                                semantic_encoder=raw_model.semantic_encoder if stage in ("semantic_stage", "joint") else None,
+                            )
 
-                if scaler is not None and use_amp:
-                    scaler.scale(loss).backward()
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(
-                        [p for p in raw_model.parameters() if p.requires_grad], config.GRAD_CLIP_NORM
-                    )
-                    scaler.step(optimizer)
-                    scaler.update()
-                else:
-                    loss.backward()
-                    torch.nn.utils.clip_grad_norm_(
-                        [p for p in raw_model.parameters() if p.requires_grad], config.GRAD_CLIP_NORM
-                    )
-                    optimizer.step()
+                    if scaler is not None and use_amp:
+                        scaler.scale(loss).backward()
+                        scaler.unscale_(optimizer)
+                        torch.nn.utils.clip_grad_norm_(
+                            [p for p in raw_model.parameters() if p.requires_grad], config.GRAD_CLIP_NORM
+                        )
+                        scaler.step(optimizer)
+                        scaler.update()
+                    else:
+                        loss.backward()
+                        torch.nn.utils.clip_grad_norm_(
+                            [p for p in raw_model.parameters() if p.requires_grad], config.GRAD_CLIP_NORM
+                        )
+                        optimizer.step()
+                finally:
+                    raw_model.clear_runtime_contexts()
 
                 for k, v in metrics.items():
                     running[k] = running.get(k, 0.0) + v

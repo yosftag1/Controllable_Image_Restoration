@@ -130,6 +130,7 @@ class Config:
     CROPS_PER_DECODE = 6
     DEVICE = "cuda"
     USE_AMP = True
+    GRADIENT_CHECKPOINTING = True  # Cuts UNet + Skip-VAE activation VRAM by ~7 GB on 15 GB T4 GPUs
     MULTI_GPU = True
     SEED = 42
 

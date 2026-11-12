@@ -10,6 +10,7 @@ from typing import List, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as grad_checkpoint
 
 from .action_overlay import PointwiseSpatialModulator
 from .lora_layers import infer_module_dtype, inject_generator_dual_lora
@@ -95,6 +96,7 @@ class SkipConnectedVAE(nn.Module):
         self.vae = vae
         self.config = config
         self.scaling_factor = float(getattr(vae.config, "scaling_factor", 0.18215))
+        self.gradient_checkpointing = bool(getattr(config, "GRADIENT_CHECKPOINTING", True))
 
         # Freeze entire base VAE first
         for p in self.vae.parameters():
@@ -133,19 +135,29 @@ class SkipConnectedVAE(nn.Module):
             enc_skips[0].shape[1], dec_channels[3], num_actions, mod_hidden
         )
 
+        if self.gradient_checkpointing and hasattr(self.vae, "enable_gradient_checkpointing"):
+            try:
+                self.vae.enable_gradient_checkpointing(gradient_checkpointing_kwargs={"use_reentrant": False})
+            except TypeError:
+                self.vae.enable_gradient_checkpointing()
+
     def _raw_encode(self, x_minus1_to_1: torch.Tensor) -> Tuple[torch.Tensor, List[torch.Tensor]]:
         enc = self.vae.encoder
         vae_dtype = infer_module_dtype(enc, fallback=x_minus1_to_1.dtype)
+        use_ckpt = getattr(self, "gradient_checkpointing", False) and self.training and torch.is_grad_enabled()
+
         h = enc.conv_in(x_minus1_to_1.to(vae_dtype))
+        if use_ckpt and not h.requires_grad:
+            h = h.requires_grad_(True)
         skips: List[torch.Tensor] = [h]  # skip[0]: full resolution (H, W)
 
         num_down = len(enc.down_blocks)
         for idx, down_block in enumerate(enc.down_blocks):
-            h = down_block(h)
+            h = grad_checkpoint(down_block, h, use_reentrant=False) if use_ckpt else down_block(h)
             if idx < num_down - 1:
                 skips.append(h)          # skip[1]: H/2, skip[2]: H/4, skip[3]: H/8
 
-        h = enc.mid_block(h)
+        h = grad_checkpoint(enc.mid_block, h, use_reentrant=False) if use_ckpt else enc.mid_block(h)
         h = enc.conv_norm_out(h)
         h = enc.conv_act(h)
         moments = enc.conv_out(h)
@@ -193,23 +205,36 @@ class SkipConnectedVAE(nn.Module):
         """Decode latents back to [0, 1] RGB using explicit encoder skips & 1x1 action overlay."""
         dec = self.vae.decoder
         vae_dtype = infer_module_dtype(dec, fallback=latents.dtype)
+        use_ckpt = getattr(self, "gradient_checkpointing", False) and self.training and torch.is_grad_enabled()
+
         h = (latents / self.scaling_factor).to(vae_dtype)
         if getattr(self.vae, "post_quant_conv", None) is not None:
             h = self.vae.post_quant_conv(h)
 
         h = dec.conv_in(h)
-        h = dec.mid_block(h)
+        if use_ckpt and not h.requires_grad:
+            h = h.requires_grad_(True)
+        h = grad_checkpoint(dec.mid_block, h, use_reentrant=False) if use_ckpt else dec.mid_block(h)
 
         # Reverse order matches [skip_8x (3), skip_4x (2), skip_2x (1)]
         skip_indices = [3, 2, 1]
         for idx, up_block in enumerate(dec.up_blocks):
             if idx < 3 and skip_scale > 0.0:
-                bridged = self.up_skip_bridges[idx](h, enc_skips[skip_indices[idx]], action_map)
+                enc_skip = enc_skips[skip_indices[idx]]
+                bridged = (
+                    grad_checkpoint(self.up_skip_bridges[idx], h, enc_skip, action_map, use_reentrant=False)
+                    if use_ckpt
+                    else self.up_skip_bridges[idx](h, enc_skip, action_map)
+                )
                 h = h + skip_scale * (bridged - h)
-            h = up_block(h)
+            h = grad_checkpoint(up_block, h, use_reentrant=False) if use_ckpt else up_block(h)
 
         if skip_scale > 0.0:
-            bridged_full = self.fullres_skip_bridge(h, enc_skips[0], action_map)
+            bridged_full = (
+                grad_checkpoint(self.fullres_skip_bridge, h, enc_skips[0], action_map, use_reentrant=False)
+                if use_ckpt
+                else self.fullres_skip_bridge(h, enc_skips[0], action_map)
+            )
             h = h + skip_scale * (bridged_full - h)
 
         h = dec.conv_norm_out(h)

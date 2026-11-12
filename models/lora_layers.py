@@ -135,20 +135,36 @@ def vision_lora_context(enabled: bool):
         _THREAD_STATE.vision_lora_enabled = prev
 
 
+def set_generator_lora_state(
+    action_cond: Optional[torch.Tensor],
+    lambda_pix: float = 1.0,
+    lambda_sem: float = 0.75,
+) -> None:
+    """Persist thread-local action conditioning across forward + gradient-checkpointed backward."""
+    _THREAD_STATE.gen_action_cond = action_cond
+    _THREAD_STATE.gen_lambda_pix = float(lambda_pix)
+    _THREAD_STATE.gen_lambda_sem = float(lambda_sem)
+
+
+def clear_generator_lora_state() -> None:
+    """Release thread-local action conditioning tensor references after backward completes."""
+    _THREAD_STATE.gen_action_cond = None
+    _THREAD_STATE.gen_lambda_pix = 1.0
+    _THREAD_STATE.gen_lambda_sem = 0.75
+
+
 @contextmanager
 def generator_lora_context(
     action_cond: Optional[torch.Tensor],
     lambda_pix: float = 1.0,
     lambda_sem: float = 0.75,
 ):
-    """Provide thread-local action conditioning & Dual-LoRA scales (safe under DataParallel)."""
+    """Provide thread-local action conditioning & Dual-LoRA scales."""
     prev_cond = getattr(_THREAD_STATE, "gen_action_cond", None)
     prev_pix = getattr(_THREAD_STATE, "gen_lambda_pix", 1.0)
     prev_sem = getattr(_THREAD_STATE, "gen_lambda_sem", 0.75)
 
-    _THREAD_STATE.gen_action_cond = action_cond
-    _THREAD_STATE.gen_lambda_pix = float(lambda_pix)
-    _THREAD_STATE.gen_lambda_sem = float(lambda_sem)
+    set_generator_lora_state(action_cond, lambda_pix=lambda_pix, lambda_sem=lambda_sem)
     try:
         yield
     finally:
