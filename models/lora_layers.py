@@ -339,8 +339,8 @@ class _DualLoRABranch(nn.Module):
         h = self.down(x_in)
         if action_cond is not None:
             cond_in = action_cond if torch.is_autocast_enabled() else action_cond.to(self.gate_proj.weight.dtype)
-            # Centered at 1.0 + tanh(...) in [0.0, 2.0] so individual rank channels scale up/down per action
-            gate = 1.0 + torch.tanh(self.gate_proj(cond_in))
+            # Signed rank gate in [-1.0, 3.0] (starts at 1.0; can hard-zero at tanh=-0.5, amplify 3x, or flip sign)
+            gate = 1.0 + 2.0 * torch.tanh(self.gate_proj(cond_in))
             h = h * _broadcast_rank_gate(gate.to(h.dtype), h)
         return self.up(h)
 

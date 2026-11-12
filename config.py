@@ -51,12 +51,14 @@ class Config:
     DEFAULT_FIDELITY_SCALE = 1.0   # lambda_pix: strict structural & color accuracy
     DEFAULT_DETAIL_SCALE = 0.75    # lambda_sem: perceptual/semantic texture synthesis (0.0 = conservative)
 
-    # Latent Rectified Flow / Turbo sampling & High-Res Tiled Inference
-    DEFAULT_INFERENCE_STEPS = 1    # 1 step default; supports 2-4 Euler steps for severe compound cases
+    # Latent Euler/DDPM Turbo Preconditioning & High-Res Tiled Inference
+    DEFAULT_INFERENCE_STEPS = 1    # 1 step default; supports 2-4 steps for severe compound cases
+    RESTORATION_MAX_TIMESTEP = 249 # Native sd-turbo ADD step (c_in=0.822, sigma=0.693; avoids t=999 noise collapse)
     INFERENCE_TILE_SIZE = 512      # Seamless overlapping tile size for 2K/4K photos (0 = untiled)
     INFERENCE_TILE_OVERLAP = 96    # Raised-cosine feather overlap in pixels between adjacent tiles
-    MULTI_STEP_TRAIN_PROB = 0.30   # 70% t=1.0 (1-step direct), 30% t~U(0.25, 1.0) (enables 2-4 step trajectory)
-    INITIAL_VELOCITY_SCALE = 0.15  # Smooth initial latent step before LoRA converges
+    MULTI_STEP_TRAIN_PROB = 0.20   # 80% t=1.0 (1-step direct), 20% t~U(0.35, 1.0) (enables 2-4 step trajectory)
+    INITIAL_VELOCITY_SCALE = 1.0   # Native 1.0x Euler/DDPM step scale (previously 0.15 throttled 99% of UNet output)
+    SKIP_DROPOUT_PROB = 0.50       # Drop encoder skips on 50% of train samples so UNet masters all 8 tasks directly
 
     # -------------------------------------------------------------------------
     # 3. Controllable Action Space & Spatial Pixel Overlay (1x1 SPADE)
@@ -89,11 +91,11 @@ class Config:
     SPATIAL_MASK_PROB = 0.40       # 40% localized smooth/object masks, 60% uniform whole-image sliders
 
     # Action sampling distribution (must sum to 1.0)
-    ACTION_DIST_SELECTIVE = 0.30   # Fix subset of active degradations, strictly preserve others (a_j = 0)
-    ACTION_DIST_PARTIAL = 0.25     # Fractional removal sliders a_k in [0.15, 0.85]
-    ACTION_DIST_FULL = 0.20        # Full removal of active degradations
-    ACTION_DIST_FALSE_POS = 0.15   # Non-zero slider on clean attributes (teaches safe no-op on clean areas)
-    ACTION_DIST_IDENTITY = 0.10    # All-zero action vector -> exact identity preservation
+    ACTION_DIST_SELECTIVE = 0.28   # Fix subset of active degradations, strictly preserve others (a_j = 0)
+    ACTION_DIST_PARTIAL = 0.20     # Fractional removal sliders a_k in [0.15, 0.90]
+    ACTION_DIST_FULL = 0.38        # Strong full-restoration supervision across all active degradations
+    ACTION_DIST_FALSE_POS = 0.08   # Non-zero slider on clean attributes (teaches safe no-op on clean areas)
+    ACTION_DIST_IDENTITY = 0.06    # All-zero action vector -> exact identity preservation
 
     # Physical camera degradation parameter ranges
     GAUSSIAN_NOISE_STD_RANGE = (8.0, 50.0)
@@ -142,9 +144,9 @@ class Config:
     #   Phase 2 (Next PIXEL_STAGE_EPOCHS):       Train Pixel-LoRA + Skip-VAE + Action Overlay (lambda_sem=0)
     #   Phase 3 (Remaining epochs):              Freeze Pixel-LoRA & Skip-VAE; train Semantic-LoRA for crisp detail
     TRAINING_MODE = "staged"
-    EPOCHS = 40
-    ALIGN_WARMUP_EPOCHS = 2
-    PIXEL_STAGE_EPOCHS = 22        # Epochs 3..24 = Pixel-Faithful Stage; Epochs 25..40 = Semantic-Detail Stage
+    EPOCHS = 24
+    ALIGN_WARMUP_EPOCHS = 1
+    PIXEL_STAGE_EPOCHS = 12        # Epochs 2..13 = Pixel-Faithful Stage; Epochs 14..24 = Semantic-Detail Stage
 
     LEARNING_RATE = 2e-4
     VISION_LORA_LR = 1e-4
@@ -154,11 +156,14 @@ class Config:
 
     # Loss weights
     LOSS_L1_WEIGHT = 1.0
-    LOSS_GRADIENT_WEIGHT = 0.20
-    LOSS_FREQUENCY_WEIGHT = 0.08
+    LOSS_SEMANTIC_STAGE_L1_WEIGHT = 0.35  # Relax pixelwise L1 in Phase 3 so Semantic-LoRA synthesizes crisp detail
+    LOSS_GRADIENT_WEIGHT = 0.25
+    LOSS_FREQUENCY_WEIGHT = 0.10
+    LOSS_COLOR_TONE_WEIGHT = 0.25  # Multi-scale pooled RGB + chroma loss for white-balance, exposure & debanding
     LOSS_ALIGN_WEIGHT = 0.15       # Self-Teacher vision encoder feature alignment
-    LOSS_PERCEPTUAL_WEIGHT = 0.25  # Active in Phase 3 (or joint mode)
-    LOSS_SEM_CONSISTENCY_WEIGHT = 0.20  # Semantic feature match between restored & target in Phase 3
+    LOSS_PIXEL_STAGE_PERCEPTUAL_WEIGHT = 0.10  # Structural VGG supervision in Phase 2 to prevent blurry L1 averages
+    LOSS_PERCEPTUAL_WEIGHT = 0.35  # Strong perceptual sharpness in Phase 3 (Semantic-LoRA)
+    LOSS_SEM_CONSISTENCY_WEIGHT = 0.25  # Semantic feature match between restored & target in Phase 3
     PERCEPTUAL_LAYERS = ["relu2_2", "relu3_4", "relu4_4"]
 
     # Logging & Validation Sweeps

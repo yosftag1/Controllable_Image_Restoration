@@ -162,10 +162,15 @@ def build_stage_optimizer(raw_model: ControllableRestorer, stage: str, config: C
     return optimizer, active_count
 
 
+def _per_sample_psnr(pred_01: torch.Tensor, tgt_01: torch.Tensor, max_db: float = 55.0) -> torch.Tensor:
+    """Compute per-image PSNR capped at `max_db` (55 dB ~ sub-8-bit floor) so identity tasks never spike 100 dB."""
+    min_mse = 10.0 ** (-float(max_db) / 10.0)
+    mse = torch.mean((pred_01.float() - tgt_01.float()) ** 2, dim=(1, 2, 3)).clamp(min=min_mse)
+    return -10.0 * torch.log10(mse)
+
+
 def compute_psnr(pred_01: torch.Tensor, tgt_01: torch.Tensor) -> float:
-    mse = torch.mean((pred_01.float() - tgt_01.float()) ** 2, dim=(1, 2, 3)).clamp(min=1e-10)
-    psnr = -10.0 * torch.log10(mse)
-    return float(psnr.mean().item())
+    return float(_per_sample_psnr(pred_01, tgt_01).mean().item())
 
 
 def _format_duration(seconds: float) -> str:
@@ -186,6 +191,10 @@ def evaluate_validation(model, val_loader, device, config, stage: str):
     total_l1 = 0.0
     count = 0
 
+    restore_psnr_sum = 0.0
+    restore_gain_sum = 0.0
+    restore_count = 0
+
     for batch in val_loader:
         src = batch["source"].to(device, non_blocking=True)
         tgt = batch["target"].to(device, non_blocking=True)
@@ -202,14 +211,35 @@ def evaluate_validation(model, val_loader, device, config, stage: str):
             l1 = float(torch.mean(torch.abs(pred.float() - tgt.float())).item())
 
         bsz = src.shape[0]
-        total_psnr += compute_psnr(pred, tgt) * bsz
+        pred_psnrs = _per_sample_psnr(pred, tgt)
+        in_psnrs = _per_sample_psnr(src, tgt)
+
+        total_psnr += float(pred_psnrs.sum().item())
         total_l1 += l1 * bsz
         count += bsz
+
+        # Track real non-trivial restoration PSNR & dB gain separately from identity/no-op samples
+        act_max = act.float().amax(dim=(1, 2, 3))
+        src_tgt_mse = torch.mean((src.float() - tgt.float()) ** 2, dim=(1, 2, 3))
+        active_mask = (act_max > 0.20) & (src_tgt_mse > 2.5e-4)
+        n_act = int(active_mask.sum().item())
+        if n_act > 0:
+            restore_psnr_sum += float(pred_psnrs[active_mask].sum().item())
+            restore_gain_sum += float((pred_psnrs[active_mask] - in_psnrs[active_mask]).sum().item())
+            restore_count += n_act
 
     raw_model.clear_runtime_contexts()
     raw_model.train()
     denom = max(1, count)
-    return {"val_psnr": total_psnr / denom, "val_l1": total_l1 / denom}
+    overall_psnr = total_psnr / denom
+    restore_psnr = (restore_psnr_sum / restore_count) if restore_count > 0 else overall_psnr
+    restore_gain = (restore_gain_sum / restore_count) if restore_count > 0 else 0.0
+    return {
+        "val_psnr": overall_psnr,
+        "val_restore_psnr": restore_psnr,
+        "val_restore_gain": restore_gain,
+        "val_l1": total_l1 / denom,
+    }
 
 
 @torch.no_grad()
@@ -222,7 +252,7 @@ def save_controllable_validation_grid(
     stage: str,
     step: int = None,
 ):
-    """Render visual sweep proving selective, partial, Dual-LoRA, and localized mask control."""
+    """Render visual sweep covering all 8 degradations across 3 validation rows."""
     out_dir = Path(config.OUTPUT_DIR) / "controllable_sweeps"
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -239,17 +269,59 @@ def save_controllable_validation_grid(
         h, w = clean_u8.shape[:2]
         rng = np.random.default_rng(config.SEED + 1000 + idx)
         params = pipeline.sample_params(h, w, rng=rng)
-        params.underexpose = True  # Consistent dark mood + motion blur + noise demo
 
         s_demo = np.zeros(config.NUM_ACTIONS, dtype=np.float32)
-        s_demo[pipeline.type_to_idx["motion_blur"]] = 0.80
-        s_demo[pipeline.type_to_idx["gaussian_noise"]] = 0.75
-        s_demo[pipeline.type_to_idx["exposure_issue"]] = 0.65
-        src_u8 = pipeline.render_with_params(clean_u8, s_demo, params)
+        scenario_id = idx % 3
+        if scenario_id == 0:
+            # Row 0: Motion Blur + Sensor Noise + Dark Underexposure
+            params.underexpose = True
+            s_demo[pipeline.type_to_idx["motion_blur"]] = 0.80
+            s_demo[pipeline.type_to_idx["gaussian_noise"]] = 0.75
+            s_demo[pipeline.type_to_idx["exposure_issue"]] = 0.65
+            runs = [
+                ("Identity (a=0)", "none", None, None, 1.0, 0.0),
+                ("Denoise (Keep Blur)", "noise=1.0,motion=0.0,exposure=0.0", None, None, 1.0, 0.0),
+                ("Denoise+Exp (Keep Blur)", "noise=1.0,exposure=1.0,motion=0.0", None, None, 1.0, 0.0),
+                ("50% Partial Deblur", "noise=1.0,exposure=1.0,motion=0.5", None, None, 1.0, 0.5),
+                ("Full (Pixel LoRA)", "all", None, None, 1.0, 0.0),
+                ("Full (Dual LoRA)", "all", None, None, 1.0, 1.0),
+                ("Split Mask Overlay", "all", "noise=1.0,motion=0.0", "left_half", 1.0, 0.8),
+            ]
+        elif scenario_id == 1:
+            # Row 1: Defocus Blur + 8-bit Color Banding + Warm Color Cast
+            params.rgb_gains = np.array([1.25, 1.02, 0.76], dtype=np.float32)
+            params.saturation_scale = 0.88
+            s_demo[pipeline.type_to_idx["defocus_blur"]] = 0.80
+            s_demo[pipeline.type_to_idx["color_banding"]] = 0.82
+            s_demo[pipeline.type_to_idx["color_degradation"]] = 0.85
+            runs = [
+                ("Identity (a=0)", "none", None, None, 1.0, 0.0),
+                ("Deband (Keep Cast)", "banding=1.0,color=0.0,defocus=0.0", None, None, 1.0, 0.0),
+                ("Deband+Color (Keep Blur)", "banding=1.0,color=1.0,defocus=0.0", None, None, 1.0, 0.0),
+                ("50% Partial Defocus", "banding=1.0,color=1.0,defocus=0.5", None, None, 1.0, 0.5),
+                ("Full (Pixel LoRA)", "all", None, None, 1.0, 0.0),
+                ("Full (Dual LoRA)", "all", None, None, 1.0, 1.0),
+                ("Split Mask Overlay", "all", "banding=1.0,defocus=0.0", "left_half", 1.0, 0.8),
+            ]
+        else:
+            # Row 2: 4x Downsample/SR + Heavy JPEG + Bright Overexposure
+            params.underexpose = False
+            s_demo[pipeline.type_to_idx["downsample_upsample"]] = 0.85
+            s_demo[pipeline.type_to_idx["jpeg_compression"]] = 0.78
+            s_demo[pipeline.type_to_idx["exposure_issue"]] = 0.65
+            runs = [
+                ("Identity (a=0)", "none", None, None, 1.0, 0.0),
+                ("DeJPEG (Keep LowRes)", "jpeg=1.0,sr=0.0,exposure=0.0", None, None, 1.0, 0.0),
+                ("DeJPEG+Exp (Keep LowRes)", "jpeg=1.0,exposure=1.0,sr=0.0", None, None, 1.0, 0.0),
+                ("50% Partial SR", "jpeg=1.0,exposure=1.0,sr=0.5", None, None, 1.0, 0.5),
+                ("Full (Pixel LoRA)", "all", None, None, 1.0, 0.0),
+                ("Full (Dual LoRA)", "all", None, None, 1.0, 1.0),
+                ("Split Mask Overlay", "all", "jpeg=1.0,sr=0.0", "left_half", 1.0, 0.8),
+            ]
 
+        src_u8 = pipeline.render_with_params(clean_u8, s_demo, params)
         src_t = torch.from_numpy(src_u8.astype(np.float32) / 255.0).permute(2, 0, 1).unsqueeze(0).to(device)
 
-        # Split mask: Left half = Full restore, Right half = Denoise only (keep motion blur & mood)
         left_mask = np.zeros((h, w), dtype=np.float32)
         left_mask[:, : w // 2] = 1.0
         left_mask = cv2.GaussianBlur(left_mask, (0, 0), sigmaX=5.0, sigmaY=5.0)
@@ -259,17 +331,8 @@ def save_controllable_validation_grid(
             ("Degraded Input", src_u8),
         ]
 
-        runs = [
-            ("Identity (a=0)", "none", None, None, 1.0, 0.0),
-            ("Denoise (Keep Blur!)", "noise=1.0,motion=0.0,exposure=0.0", None, None, 1.0, 0.0),
-            ("Denoise+Exp (Keep Blur)", "noise=1.0,exposure=1.0,motion=0.0", None, None, 1.0, 0.0),
-            ("50% Partial Deblur", "noise=1.0,exposure=1.0,motion=0.5", None, None, 1.0, 0.5),
-            ("Full (Pixel LoRA)", "all", None, None, 1.0, 0.0),
-            ("Full (Dual LoRA)", "all", None, None, 1.0, 1.0),
-            ("Split Mask Overlay", "all", "noise=1.0,motion=0.0", left_mask, 1.0, 0.8),
-        ]
-
-        for label, fg_str, bg_str, mask_2d, f_scale, d_scale in runs:
+        for label, fg_str, bg_str, mask_tag, f_scale, d_scale in runs:
+            mask_2d = left_mask if mask_tag == "left_half" else None
             fg_vec = parse_action_spec(fg_str, config.DEGRADATION_TYPES)
             bg_vec = parse_action_spec(bg_str, config.DEGRADATION_TYPES) if bg_str else None
             overlay = build_spatial_action_overlay(h, w, fg_vec, bg_vec, mask_2d, device=device)
@@ -295,8 +358,7 @@ def save_controllable_validation_grid(
 
         for c_idx, (col_title, tile_u8) in enumerate(specs):
             x0 = pad + c_idx * (w + pad)
-            if idx == 0:
-                cv2.putText(panel, col_title, (x0 + 4, header_h - 12), font, 0.42, (220, 240, 180), 1, cv2.LINE_AA)
+            cv2.putText(panel, col_title, (x0 + 4, header_h - 12), font, 0.39, (220, 240, 180), 1, cv2.LINE_AA)
             panel[header_h : header_h + h, x0 : x0 + w] = tile_u8
 
         rows_canvas.append(panel)
@@ -339,6 +401,7 @@ def save_checkpoint(
             "SEMANTIC_ENCODER_TYPE": config.SEMANTIC_ENCODER_TYPE,
             "RADIO_MODEL_ID": getattr(config, "RADIO_MODEL_ID", "nvidia/C-RADIOv3-B"),
             "GENERATOR_BACKBONE": config.GENERATOR_BACKBONE,
+            "RESTORATION_MAX_TIMESTEP": getattr(config, "RESTORATION_MAX_TIMESTEP", 249),
             "UNET_LORA_RANK": config.UNET_LORA_RANK,
             "UNET_LORA_ALPHA": config.UNET_LORA_ALPHA,
             "VAE_ENC_LORA_RANK": config.VAE_ENC_LORA_RANK,
@@ -644,7 +707,14 @@ def train(
                     ckpt = torch.load(resume_path, map_location=device)
                 adapter_state = ckpt.get("trainable_state_dict") or ckpt.get("model_state_dict")
                 if adapter_state is not None:
-                    raw_model.load_trainable_state_dict(adapter_state)
+                    missing_keys, unexpected_keys = raw_model.load_trainable_state_dict(adapter_state)
+                    if is_main and (missing_keys or unexpected_keys):
+                        print(
+                            f"[Warning] Partial adapter match on resume "
+                            f"(missing={len(missing_keys)}, unexpected={len(unexpected_keys)}). "
+                            f"If this is an older V1 checkpoint, start V2 fresh without --resume!",
+                            flush=True,
+                        )
                 start_epoch = int(ckpt.get("epoch", 0)) + 1
                 last_epoch = start_epoch - 1
                 best_psnr = float(ckpt.get("best_psnr", -1.0))
@@ -702,7 +772,7 @@ def train(
                         config.ALIGN_WARMUP_EPOCHS = 1
                         config.PIXEL_STAGE_EPOCHS = 6
                     if not epochs_overridden:
-                        config.EPOCHS = 11
+                        config.EPOCHS = 12
                 if is_main:
                     print(f"No checkpoint found at {resume_path} — starting fresh training from Epoch 1.", flush=True)
 
@@ -961,14 +1031,17 @@ def train(
                     val_metrics = evaluate_validation(raw_model, val_loader, device, config, stage)
                     epoch_summary.update(val_metrics)
                     grid_path = save_controllable_validation_grid(raw_model, val_dataset, device, config, epoch, stage)
+                    rest_psnr = val_metrics.get("val_restore_psnr", val_metrics["val_psnr"])
+                    rest_gain = val_metrics.get("val_restore_gain", 0.0)
                     print(
                         f"Epoch {epoch:03d} | train_loss={epoch_summary['total']:.4f} | "
+                        f"restore_psnr={rest_psnr:.2f} dB ({rest_gain:+.2f} dB) | "
                         f"val_psnr={val_metrics['val_psnr']:.2f} dB | val_l1={val_metrics['val_l1']:.4f} | sweep={grid_path}",
                         flush=True,
                     )
 
-                    if val_metrics["val_psnr"] > best_psnr:
-                        best_psnr = val_metrics["val_psnr"]
+                    if rest_psnr > best_psnr:
+                        best_psnr = rest_psnr
                         save_checkpoint(raw_model, optimizer, scheduler, epoch, stage, best_psnr, config, "model_best.pt")
 
                 # Always save model_latest.pt after every epoch for seamless Kaggle resuming
@@ -1067,13 +1140,13 @@ def main():
     if args.batch_size:
         config.BATCH_SIZE = args.batch_size
     if args.speedrun:
-        config.MAX_STEPS_PER_EPOCH = 300
+        config.MAX_STEPS_PER_EPOCH = 400
         config.LOG_INTERVAL = 50
-        config.SAMPLE_EVERY_N_STEPS = 0
+        config.SAMPLE_EVERY_N_STEPS = 200
         if not args.resume:
             config.ALIGN_WARMUP_EPOCHS = 1
             config.PIXEL_STAGE_EPOCHS = 6
-            config.EPOCHS = 11
+            config.EPOCHS = 12
     if args.epochs:
         config.EPOCHS = args.epochs
     if args.align_epochs is not None:

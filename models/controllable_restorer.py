@@ -20,6 +20,7 @@ from torch.utils.checkpoint import checkpoint as grad_checkpoint
 
 from .action_overlay import ActionOverlayEncoder, PointwiseSpatialModulator
 from .lora_layers import (
+    _get_generator_lora_state,
     _resolve_device_key,
     clear_generator_lora_state,
     generator_lora_context,
@@ -103,6 +104,72 @@ def _spatial_action_context(
             _SPATIAL_MAP_BY_DEVICE.clear()
             _SPATIAL_MAP_BY_DEVICE.update(prev_map)
             _DEFAULT_SPATIAL_ACTION_MAP = prev_default
+
+
+def _build_default_alphas_cumprod(
+    num_train_timesteps: int = 1000,
+    beta_start: float = 0.00085,
+    beta_end: float = 0.012,
+) -> torch.Tensor:
+    """Exact SD 1.5 / SD 2.1 / sd-turbo `scaled_linear` cumulative alpha schedule."""
+    betas = torch.linspace(
+        math.sqrt(beta_start), math.sqrt(beta_end), num_train_timesteps, dtype=torch.float64
+    ) ** 2
+    alphas = 1.0 - betas
+    return torch.cumprod(alphas, dim=0).float()
+
+
+class _ActionModulatedTimeEmbedding(nn.Module):
+    """Injects Dual-Branch (Pixel + Semantic) slider FiLM offsets directly into UNet `temb`.
+
+    Gives the 8 continuous sliders direct per-channel scale/shift leverage over all ~22 ResNet
+    blocks in `sd-turbo` (critical for global color-cast neutralization, exposure recovery & debanding).
+    """
+
+    def __init__(self, orig_time_emb: nn.Module, action_dim: int, temb_dim: int):
+        super().__init__()
+        self.orig_time_emb = orig_time_emb
+        self.pix_mlp = self._make_zero_mlp(action_dim, temb_dim)
+        self.sem_mlp = self._make_zero_mlp(action_dim, temb_dim)
+
+    @staticmethod
+    def _make_zero_mlp(in_dim: int, out_dim: int) -> nn.Sequential:
+        proj_out = nn.Linear(out_dim, out_dim)
+        nn.init.zeros_(proj_out.weight)
+        nn.init.zeros_(proj_out.bias)
+        return nn.Sequential(
+            nn.Linear(in_dim, out_dim),
+            nn.SiLU(),
+            proj_out,
+        )
+
+    def __getattr__(self, name: str):
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            modules = self.__dict__.get("_modules")
+            if modules is not None and "orig_time_emb" in modules:
+                return getattr(modules["orig_time_emb"], name)
+            raise
+
+    def forward(self, *args, **kwargs):
+        temb = self.orig_time_emb(*args, **kwargs)
+        action_cond, lambda_pix, lambda_sem = _get_generator_lora_state(temb.device)
+        if action_cond is None:
+            return temb
+
+        cond_f = action_cond.float()
+        if cond_f.device != temb.device:
+            cond_f = cond_f.to(temb.device)
+        if cond_f.shape[0] != temb.shape[0] and temb.shape[0] % max(1, cond_f.shape[0]) == 0:
+            cond_f = cond_f.repeat_interleave(temb.shape[0] // cond_f.shape[0], dim=0)
+
+        delta = temb.new_zeros(temb.shape, dtype=torch.float32)
+        if lambda_pix != 0.0:
+            delta = delta + float(lambda_pix) * self.pix_mlp(cond_f)
+        if lambda_sem != 0.0:
+            delta = delta + float(lambda_sem) * self.sem_mlp(cond_f)
+        return temb + delta.to(temb.dtype)
 
 
 class _SpatialModulatedUNetStage(nn.Module):
@@ -254,18 +321,30 @@ class ControllableRestorer(nn.Module):
         # 1. Pretrained Vision Semantic Encoder + Self-Teacher LoRA
         self.semantic_encoder = SemanticEncoder(config)
 
-        # 2. Load Pretrained AutoencoderKL & UNet2DConditionModel (no CLIP text encoder bloat!)
+        # 2. Load Pretrained AutoencoderKL, UNet2DConditionModel & native DDPM/Euler schedule
+        alphas_cumprod = _build_default_alphas_cumprod()
+        prediction_type = "epsilon"
         if backbone_key == "mock_tiny":
             raw_vae = _MockTinyVAE(base_ch=32)
             raw_unet = _MockTinyUNet()
         else:
-            from diffusers import AutoencoderKL, UNet2DConditionModel
+            from diffusers import AutoencoderKL, DDPMScheduler, UNet2DConditionModel
 
             repo_id = config.GENERATOR_REPO_MAP.get(backbone_key, config.GENERATOR_BACKBONE)
             raw_vae = load_hf_public_safe(AutoencoderKL.from_pretrained, repo_id, subfolder="vae")
             raw_unet = load_hf_public_safe(UNet2DConditionModel.from_pretrained, repo_id, subfolder="unet")
+            try:
+                sched = load_hf_public_safe(DDPMScheduler.from_pretrained, repo_id, subfolder="scheduler")
+                if getattr(sched, "alphas_cumprod", None) is not None:
+                    alphas_cumprod = sched.alphas_cumprod.detach().clone().float()
+                prediction_type = str(getattr(sched.config, "prediction_type", "epsilon")).lower()
+            except Exception:
+                pass
 
-        # 3. Wrap VAE with Action-Gated Skip Bridges + Encoder Dual-LoRA
+        self.prediction_type = prediction_type
+        self.register_buffer("alphas_cumprod", alphas_cumprod, persistent=False)
+
+        # 3. Wrap VAE with Action-Suppressed Skip Bridges + Encoder Dual-LoRA
         self.skip_vae = SkipConnectedVAE(raw_vae, config)
 
         # 4. Inject Action-Modulated Dual-LoRA (Pixel-LoRA + Semantic-LoRA) into UNet
@@ -285,7 +364,7 @@ class ControllableRestorer(nn.Module):
             except TypeError:
                 self.unet.enable_gradient_checkpointing()
 
-        # 5. Wrap UNet multi-scale blocks with 1x1 Pointwise Spatial Action Overlay Modulators
+        # 5. Wrap UNet multi-scale blocks with 1x1 Spatial Modulators & hook direct slider FiLM into `temb`
         cross_attn_dim = getattr(self.unet.config, "cross_attention_dim", 768)
         if isinstance(cross_attn_dim, (list, tuple)):
             cross_attn_dim = int(cross_attn_dim[-1])
@@ -293,6 +372,8 @@ class ControllableRestorer(nn.Module):
             cross_attn_dim = int(cross_attn_dim)
 
         self.spatial_mod_params: List[nn.Parameter] = []
+        self.temb_pix_params: List[nn.Parameter] = []
+        self.temb_sem_params: List[nn.Parameter] = []
         self._attach_unet_spatial_overlays(config, cross_attn_dim=cross_attn_dim)
 
         # 6. Action & Semantic Token Encoder
@@ -304,18 +385,19 @@ class ControllableRestorer(nn.Module):
             action_hidden_dim=config.ACTION_HIDDEN_DIM,
         )
 
-        # 7. Smooth Latent Velocity Scaling + Zero-Init Residual Head
+        # 7. Native Euler/DDPM Step Scale + Zero-Init Residual Head
         latent_ch = int(getattr(self.unet.config, "out_channels", 4))
-        init_scale = float(getattr(config, "INITIAL_VELOCITY_SCALE", 0.15))
+        init_scale = float(getattr(config, "INITIAL_VELOCITY_SCALE", 1.0))
         self.velocity_scale = nn.Parameter(torch.full((1, latent_ch, 1, 1), init_scale))
         self.velocity_zero_conv = nn.Conv2d(latent_ch, latent_ch, kernel_size=1)
         nn.init.zeros_(self.velocity_zero_conv.weight)
         nn.init.zeros_(self.velocity_zero_conv.bias)
 
     def _attach_unet_spatial_overlays(self, config, cross_attn_dim: int):
-        """Probe exact runtime UNet block output channels and wrap with 1x1 spatial modulators."""
+        """Probe exact runtime UNet block & `temb` dimensions and wrap with action modulators."""
         num_actions = config.NUM_ACTIONS
         mod_hidden = getattr(config, "SPATIAL_MOD_HIDDEN_DIM", 64)
+        action_dim = int(getattr(config, "ACTION_HIDDEN_DIM", 128))
 
         in_ch = int(getattr(self.unet.config, "in_channels", 4))
         unet_dev = infer_module_device(self.unet)
@@ -327,9 +409,15 @@ class ControllableRestorer(nn.Module):
         def _make_probe_hook(stage_key: str):
             def _hook(_module, _inputs, output):
                 sample = output[0] if isinstance(output, tuple) else output
-                probed_channels[stage_key] = int(sample.shape[1])
+                probed_channels[stage_key] = int(sample.shape[-1] if stage_key == "temb" else sample.shape[1])
 
             return _hook
+
+        temb_attr = "time_embedding" if hasattr(self.unet, "time_embedding") else (
+            "time_mlp" if hasattr(self.unet, "time_mlp") else None
+        )
+        if temb_attr is not None:
+            hooks.append(getattr(self.unet, temb_attr).register_forward_hook(_make_probe_hook("temb")))
 
         hooks.append(self.unet.mid_block.register_forward_hook(_make_probe_hook("mid")))
         for idx, blk in enumerate(self.unet.up_blocks):
@@ -338,21 +426,34 @@ class ControllableRestorer(nn.Module):
         try:
             with torch.no_grad():
                 dummy_lat = torch.zeros(1, in_ch, 32, 32, device=unet_dev, dtype=unet_dtype)
-                dummy_t = torch.tensor([500], device=unet_dev, dtype=torch.long)
+                dummy_t = torch.tensor([249], device=unet_dev, dtype=torch.long)
                 dummy_enc = torch.zeros(1, 4, cross_attn_dim, device=unet_dev, dtype=unet_dtype)
                 self.unet(dummy_lat, dummy_t, encoder_hidden_states=dummy_enc)
         finally:
             for handle in hooks:
                 handle.remove()
 
+        if temb_attr is not None and "temb" in probed_channels:
+            orig_temb = getattr(self.unet, temb_attr)
+            wrapped_temb = _ActionModulatedTimeEmbedding(orig_temb, action_dim, probed_channels["temb"]).to(
+                device=unet_dev
+            )
+            setattr(self.unet, temb_attr, wrapped_temb)
+            self.temb_pix_params.extend(list(wrapped_temb.pix_mlp.parameters()))
+            self.temb_sem_params.extend(list(wrapped_temb.sem_mlp.parameters()))
+
         mid_ch = probed_channels["mid"]
-        wrapped_mid = _SpatialModulatedUNetStage(self.unet.mid_block, mid_ch, num_actions, mod_hidden)
+        wrapped_mid = _SpatialModulatedUNetStage(self.unet.mid_block, mid_ch, num_actions, mod_hidden).to(
+            device=unet_dev
+        )
         self.unet.mid_block = wrapped_mid
         self.spatial_mod_params.extend(list(wrapped_mid.spatial_mod.parameters()))
 
         for idx in range(len(self.unet.up_blocks)):
             out_ch = probed_channels[f"up_{idx}"]
-            wrapped_up = _SpatialModulatedUNetStage(self.unet.up_blocks[idx], out_ch, num_actions, mod_hidden)
+            wrapped_up = _SpatialModulatedUNetStage(self.unet.up_blocks[idx], out_ch, num_actions, mod_hidden).to(
+                device=unet_dev
+            )
             self.unet.up_blocks[idx] = wrapped_up
             self.spatial_mod_params.extend(list(wrapped_up.spatial_mod.parameters()))
 
@@ -361,6 +462,7 @@ class ControllableRestorer(nn.Module):
         vision_params = list(self.semantic_encoder.vision_lora_params)
         pixel_params = (
             list(self.unet_pix_lora_params)
+            + list(self.temb_pix_params)
             + list(self.skip_vae.vae_pix_lora_params)
             + list(self.skip_vae.skip_bridge_parameters())
             + list(self.action_overlay.parameters())
@@ -368,7 +470,11 @@ class ControllableRestorer(nn.Module):
             + [self.velocity_scale]
             + list(self.velocity_zero_conv.parameters())
         )
-        semantic_params = list(self.unet_sem_lora_params) + list(self.skip_vae.vae_sem_lora_params)
+        semantic_params = (
+            list(self.unet_sem_lora_params)
+            + list(self.temb_sem_params)
+            + list(self.skip_vae.vae_sem_lora_params)
+        )
         return {
             "vision_lora": vision_params,
             "pixel_stage": pixel_params,
@@ -428,10 +534,16 @@ class ControllableRestorer(nn.Module):
             for name, tensor in state_dict.items():
                 if name in param_map:
                     dst = param_map[name]
+                    if tuple(dst.shape) != tuple(tensor.shape):
+                        unexpected.append(f"{name} (shape {tuple(tensor.shape)} != {tuple(dst.shape)})")
+                        continue
                     dst.copy_(tensor.to(device=dst.device, dtype=dst.dtype))
                     loaded_keys.add(name)
                 elif name in buffer_map:
                     dst = buffer_map[name]
+                    if tuple(dst.shape) != tuple(tensor.shape):
+                        unexpected.append(f"{name} (shape {tuple(tensor.shape)} != {tuple(dst.shape)})")
+                        continue
                     dst.copy_(tensor.to(device=dst.device, dtype=dst.dtype))
                     loaded_keys.add(name)
                 else:
@@ -454,7 +566,7 @@ class ControllableRestorer(nn.Module):
         clear_generator_lora_state()
         clear_spatial_action_map()
 
-    def _predict_velocity(
+    def _predict_clean_latent(
         self,
         z_t: torch.Tensor,
         t_cont: torch.Tensor,
@@ -464,15 +576,25 @@ class ControllableRestorer(nn.Module):
         fidelity_scale: float,
         detail_scale: float,
     ) -> torch.Tensor:
-        """Predict latent Rectified Flow velocity v_theta(z_t, t) with Dual-LoRA & Spatial Overlay."""
+        """Predict clean target latent `hat_z_0` using native `sd-turbo` Euler/DDPM preconditioning."""
         if t_cont.ndim == 0:
             t_cont = t_cont.unsqueeze(0)
         if t_cont.shape[0] == 1 and z_t.shape[0] > 1:
             t_cont = t_cont.expand(z_t.shape[0])
 
-        t_unet = (t_cont.float() * 999.0).round().long().clamp(1, 999)
+        max_t = int(getattr(self.config, "RESTORATION_MAX_TIMESTEP", 249))
+        num_sched = int(self.alphas_cumprod.numel())
+        t_unet = (t_cont.float() * float(max_t)).round().long().clamp(1, num_sched - 1)
+
+        abar_table = self.alphas_cumprod if self.alphas_cumprod.device == z_t.device else self.alphas_cumprod.to(z_t.device)
+        alpha_bar = abar_table.index_select(0, t_unet).view(-1, 1, 1, 1).float()
+        sqrt_alpha_bar = torch.sqrt(alpha_bar.clamp(min=1e-6))        # = 0.8218 at t=249
+        sqrt_one_minus = torch.sqrt((1.0 - alpha_bar).clamp(min=0.0))  # = 0.5698 at t=249
+        sigma_t = sqrt_one_minus / sqrt_alpha_bar                     # = 0.6932 at t=249
+
         unet_dtype = infer_module_dtype(self.unet, fallback=z_t.dtype)
-        z_in = z_t.to(unet_dtype)
+        # Match EulerDiscreteScheduler.scale_model_input (`sample / sqrt(sigma^2 + 1) == sqrt(alpha_bar) * sample`)
+        z_in = (z_t.float() * sqrt_alpha_bar).to(unet_dtype)
         if self.training and torch.is_grad_enabled() and not z_in.requires_grad:
             z_in = z_in.detach().requires_grad_(True)
 
@@ -489,8 +611,18 @@ class ControllableRestorer(nn.Module):
                     encoder_hidden_states=cross_tokens.to(unet_dtype),
                 ).sample.float()
 
-        vel = self.velocity_scale * raw_pred + self.velocity_zero_conv(z_t.float())
-        return vel
+        t_4d = t_cont.float().view(-1, 1, 1, 1)
+        zero_res = t_4d * self.velocity_zero_conv(z_t.float())
+        if self.prediction_type == "v_prediction":
+            step_delta = sqrt_one_minus * self.velocity_scale * raw_pred + zero_res
+            return z_t.float() - step_delta
+        if self.prediction_type == "sample":
+            return z_t.float() + self.velocity_scale * (raw_pred - z_t.float()) - zero_res
+
+        # Default ("epsilon", e.g. sd-turbo / tiny-sd / bk-sdm-tiny):
+        # Exact Euler/DDPM `pred_original_sample` = (z_in - sqrt_one_minus * eps) / sqrt_alpha_bar = z_t - sigma_t * eps
+        step_delta = sigma_t * self.velocity_scale * raw_pred + zero_res
+        return z_t.float() - step_delta
 
     def _apply_zero_action_lock(
         self, src_01: torch.Tensor, pred_01: torch.Tensor, action_map: torch.Tensor
@@ -559,16 +691,15 @@ class ControllableRestorer(nn.Module):
         z_src, enc_skips = self.skip_vae.encode_with_skips(src_01)
 
         if use_bridge and z_tgt is not None:
-            t_vec = torch.empty(bsz, device=src_01.device).uniform_(0.25, 1.0)
+            t_vec = torch.empty(bsz, device=src_01.device).uniform_(0.35, 1.0)
             t_4d = t_vec.view(bsz, 1, 1, 1)
             z_t = (1.0 - t_4d) * z_tgt + t_4d * z_src
         else:
             t_vec = torch.ones(bsz, device=src_01.device)
-            t_4d = t_vec.view(bsz, 1, 1, 1)
             z_t = z_src
 
-        # 4. Predict clean/target latent endpoint hat_z_0 = z_t - t * v_theta(z_t, t)
-        vel = self._predict_velocity(
+        # 4. Predict clean/target latent endpoint hat_z_0 via native Euler/DDPM preconditioning
+        hat_z_0 = self._predict_clean_latent(
             z_t=z_t,
             t_cont=t_vec,
             cross_tokens=cross_tokens,
@@ -577,7 +708,6 @@ class ControllableRestorer(nn.Module):
             fidelity_scale=fidelity_scale,
             detail_scale=detail_scale,
         )
-        hat_z_0 = z_t - t_4d * vel
 
         # 5. Decode back to RGB via Action-Gated Skip-VAE & apply Zero-Action Lock
         raw_rgb = self.skip_vae.decode_with_skips(hat_z_0, enc_skips, action_map)
@@ -688,9 +818,10 @@ class ControllableRestorer(nn.Module):
         trajectory: List[torch.Tensor] = [src_01.clone()] if return_trajectory else []
 
         for i in range(steps):
+            t_cur_scalar = float(t_schedule[i].item())
+            t_next_scalar = float(t_schedule[i + 1].item())
             t_cur = t_schedule[i].expand(bsz)
-            dt = float(t_schedule[i] - t_schedule[i + 1])
-            vel = self._predict_velocity(
+            hat_z_0 = self._predict_clean_latent(
                 z_t=z_cur,
                 t_cont=t_cur,
                 cross_tokens=cross_tokens,
@@ -699,8 +830,9 @@ class ControllableRestorer(nn.Module):
                 fidelity_scale=fidelity_scale,
                 detail_scale=detail_scale,
             )
-            z_cur = z_cur - dt * vel
-            del vel
+            step_ratio = (t_cur_scalar - t_next_scalar) / max(1e-6, t_cur_scalar)
+            z_cur = z_cur + step_ratio * (hat_z_0 - z_cur)
+            del hat_z_0
 
             if return_trajectory and i < steps - 1:
                 mid_rgb = self.skip_vae.decode_with_skips(z_cur, enc_skips, act_padded)[:, :, :h, :w]
@@ -869,6 +1001,8 @@ class _GeneratorParallelStage(nn.Module):
     def __init__(self, restorer: ControllableRestorer):
         super().__init__()
         self.config = restorer.config
+        self.prediction_type = restorer.prediction_type
+        self.register_buffer("alphas_cumprod", restorer.alphas_cumprod.clone(), persistent=False)
         self.action_overlay = restorer.action_overlay
         self.skip_vae = restorer.skip_vae
         self.unet = restorer.unet
@@ -889,7 +1023,7 @@ class _GeneratorParallelStage(nn.Module):
         cross_tokens, global_action_cond = self.action_overlay(action_map, sem_tokens, sem_global)
 
         use_bridge = torch.rand(1, device=src_01.device).item() < getattr(
-            self.config, "MULTI_STEP_TRAIN_PROB", 0.30
+            self.config, "MULTI_STEP_TRAIN_PROB", 0.20
         )
         z_tgt = None
         if use_bridge:
@@ -909,35 +1043,23 @@ class _GeneratorParallelStage(nn.Module):
         z_src, enc_skips = self.skip_vae.encode_with_skips(src_01)
 
         if use_bridge and z_tgt is not None:
-            t_vec = torch.empty(bsz, device=src_01.device).uniform_(0.25, 1.0)
+            t_vec = torch.empty(bsz, device=src_01.device).uniform_(0.35, 1.0)
             t_4d = t_vec.view(bsz, 1, 1, 1)
             z_t = (1.0 - t_4d) * z_tgt + t_4d * z_src
         else:
             t_vec = torch.ones(bsz, device=src_01.device)
-            t_4d = t_vec.view(bsz, 1, 1, 1)
             z_t = z_src
 
-        t_unet = (t_vec.float() * 999.0).round().long().clamp(1, 999)
-        unet_dtype = infer_module_dtype(self.unet, fallback=z_t.dtype)
-        z_in = z_t.to(unet_dtype)
-        if self.training and torch.is_grad_enabled() and not z_in.requires_grad:
-            z_in = z_in.detach().requires_grad_(True)
-
-        with generator_lora_context(
-            global_action_cond,
-            lambda_pix=fidelity_scale,
-            lambda_sem=detail_scale,
-            device=z_in.device,
-        ):
-            with _spatial_action_context(action_map, device=z_in.device):
-                raw_pred = self.unet(
-                    z_in,
-                    t_unet,
-                    encoder_hidden_states=cross_tokens.to(unet_dtype),
-                ).sample.float()
-
-        vel = self.velocity_scale * raw_pred + self.velocity_zero_conv(z_t.float())
-        hat_z_0 = z_t - t_4d * vel
+        hat_z_0 = ControllableRestorer._predict_clean_latent(
+            self,
+            z_t=z_t,
+            t_cont=t_vec,
+            cross_tokens=cross_tokens,
+            global_action_cond=global_action_cond,
+            action_map=action_map,
+            fidelity_scale=fidelity_scale,
+            detail_scale=detail_scale,
+        )
 
         raw_rgb = self.skip_vae.decode_with_skips(hat_z_0, enc_skips, action_map)
         thresh = max(1e-4, float(getattr(self.config, "ZERO_ACTION_LOCK_THRESHOLD", 0.03)))

@@ -81,11 +81,13 @@ class ActionOverlayEncoder(nn.Module):
         sem_global_dim: int,
         cross_attn_dim: int,
         action_hidden_dim: int = 128,
+        tokens_per_action: int = 4,
     ):
         super().__init__()
         self.num_actions = num_actions
         self.cross_attn_dim = cross_attn_dim
         self.action_hidden_dim = action_hidden_dim
+        self.tokens_per_action = max(1, int(tokens_per_action))
 
         # Per-operation learned identity basis + preserve/active anchors
         self.op_identity = nn.Parameter(torch.randn(num_actions, action_hidden_dim) * 0.02)
@@ -95,12 +97,19 @@ class ActionOverlayEncoder(nn.Module):
         self.scalar_fourier = ContinuousScalarFourier(dim=32)
         in_tok_dim = action_hidden_dim + self.scalar_fourier.out_dim * 2 + 2
 
-        self.op_token_mlp = nn.Sequential(
+        # Dedicated per-slider encoder so the 8 sliders are never drowned out by high-dim vision vectors
+        self.op_feat_mlp = nn.Sequential(
             nn.Linear(in_tok_dim, action_hidden_dim * 2),
             nn.SiLU(),
-            nn.Linear(action_hidden_dim * 2, cross_attn_dim),
-            nn.LayerNorm(cross_attn_dim),
+            nn.Linear(action_hidden_dim * 2, action_hidden_dim),
+            nn.LayerNorm(action_hidden_dim),
         )
+
+        # Expand each operation into `tokens_per_action` salient cross-attention register tokens (e.g. 8*4 = 32 tokens)
+        self.op_token_proj = nn.Sequential(
+            nn.Linear(action_hidden_dim, cross_attn_dim * self.tokens_per_action),
+        )
+        self.op_token_norm = nn.LayerNorm(cross_attn_dim)
 
         # Project clean-aligned semantic vision patch tokens into UNet cross-attention space
         self.sem_token_proj = nn.Sequential(
@@ -111,9 +120,20 @@ class ActionOverlayEncoder(nn.Module):
             nn.LayerNorm(cross_attn_dim),
         )
 
-        # Global conditioning vector (combines spatial mean, spatial max, and global vision summary)
-        self.global_cond_mlp = nn.Sequential(
-            nn.Linear(num_actions * 2 + sem_global_dim, action_hidden_dim * 2),
+        # Balanced Global Conditioning: dedicated slider highway + normalized semantic context
+        self.action_summary_mlp = nn.Sequential(
+            nn.Linear(num_actions * action_hidden_dim, action_hidden_dim * 2),
+            nn.SiLU(),
+            nn.Linear(action_hidden_dim * 2, action_hidden_dim),
+            nn.LayerNorm(action_hidden_dim),
+        )
+        self.sem_global_proj = nn.Sequential(
+            nn.LayerNorm(sem_global_dim),
+            nn.Linear(sem_global_dim, action_hidden_dim),
+            nn.SiLU(),
+        )
+        self.global_fusion_mlp = nn.Sequential(
+            nn.Linear(action_hidden_dim * 2, action_hidden_dim * 2),
             nn.SiLU(),
             nn.Linear(action_hidden_dim * 2, action_hidden_dim),
         )
@@ -163,12 +183,19 @@ class ActionOverlayEncoder(nn.Module):
         raw_stats = torch.stack([a_mean, a_max], dim=-1)  # [B, K, 2]
 
         op_in = torch.cat([basis, f_mean, f_max, raw_stats], dim=-1)
-        op_tokens = self.op_token_mlp(op_in)        # [B, K, cross_attn_dim]
+        op_feat = self.op_feat_mlp(op_in)           # [B, K, action_hidden_dim]
+
+        op_tokens = self.op_token_proj(op_feat).view(
+            bsz, self.num_actions * self.tokens_per_action, self.cross_attn_dim
+        )
+        op_tokens = self.op_token_norm(op_tokens)   # [B, K * tokens_per_action, cross_attn_dim]
 
         vis_tokens = self.sem_token_proj(sem_tokens.float())  # [B, N_p, cross_attn_dim]
         cross_attn_tokens = torch.cat([vis_tokens, op_tokens], dim=1)
 
-        glob_in = torch.cat([a_mean, a_max, sem_global.float()], dim=-1)
-        global_action_cond = self.global_cond_mlp(glob_in)    # [B, action_hidden_dim]
+        # Direct residual highway from the 8 sliders so image content never drowns out slider values
+        action_vec = self.action_summary_mlp(op_feat.reshape(bsz, -1))
+        sem_vec = self.sem_global_proj(sem_global.float())
+        global_action_cond = action_vec + self.global_fusion_mlp(torch.cat([action_vec, sem_vec], dim=-1))
 
         return cross_attn_tokens, global_action_cond

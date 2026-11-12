@@ -34,6 +34,15 @@ def test_selective_pipeline():
     from utils.semantic_mask import parse_action_spec
 
     cfg = Config()
+    dist_sum = (
+        cfg.ACTION_DIST_SELECTIVE
+        + cfg.ACTION_DIST_PARTIAL
+        + cfg.ACTION_DIST_FULL
+        + cfg.ACTION_DIST_FALSE_POS
+        + cfg.ACTION_DIST_IDENTITY
+    )
+    assert abs(dist_sum - 1.0) < 1e-6, f"Action distribution must sum to 1.0, got {dist_sum}"
+    assert cfg.RESTORATION_MAX_TIMESTEP == 249 and cfg.INITIAL_VELOCITY_SCALE == 1.0
     pipe = SelectiveDegradationPipeline(cfg)
     rng = np.random.default_rng(123)
 
@@ -224,10 +233,12 @@ def test_model_and_stages_mock():
     loss_s2, _ = loss_fn(out_s2["pred"], tgt, act_map, out_s2["align_loss"], stage="pixel_stage", t_vec=out_s2["t"])
     _backward_on_worker_thread(loss_s2)
     model.clear_runtime_contexts()
-    assert any(p.grad is not None for p in groups["pixel_stage"]), "Pixel stage must receive gradients in Stage 2!"
+    assert all(p.grad is not None for p in groups["pixel_stage"]), (
+        "ALL pixel_stage parameters must participate in backward for DDP find_unused_parameters=False!"
+    )
     assert all(p.grad is None for p in groups["semantic_stage"]), "Semantic LoRA must stay frozen in Stage 2!"
 
-    # Stage 3: Semantic-Detail Stage (cross-thread backward recomputation check)
+    # Stage 3: Semantic-Detail Stage (cross-thread backward recomputation + DDP full-grad check)
     model.zero_grad(set_to_none=True)
     model.set_training_stage("semantic_stage")
     out_s3 = model(src, act_map, tgt_01=tgt, clean_01=clean, fidelity_scale=1.0, detail_scale=1.0)
@@ -242,7 +253,9 @@ def test_model_and_stages_mock():
     )
     _backward_on_worker_thread(loss_s3)
     model.clear_runtime_contexts()
-    assert any(p.grad is not None for p in groups["semantic_stage"]), "Semantic LoRA must receive gradients in Stage 3!"
+    assert all(p.grad is not None for p in groups["semantic_stage"]), (
+        "ALL semantic_stage parameters must participate in backward for DDP find_unused_parameters=False!"
+    )
     assert all(p.grad is None for p in groups["pixel_stage"]), "Pixel stage must stay frozen in Stage 3!"
 
     # Zero-Action & Localized Split-Mask Exact Preservation Check

@@ -61,7 +61,12 @@ class ControllableInferencer:
         if ckpt is not None:
             adapter_state = ckpt.get("trainable_state_dict") or ckpt.get("model_state_dict")
             if adapter_state is not None:
-                self.model.load_trainable_state_dict(adapter_state)
+                missing_k, unexp_k = self.model.load_trainable_state_dict(adapter_state)
+                if missing_k or unexp_k:
+                    print(
+                        f"[Warning] Checkpoint had {len(missing_k)} missing / {len(unexp_k)} legacy adapter keys. "
+                        f"Make sure you are loading a V2 checkpoint trained after the SD-Turbo scheduler + Skip-VAE fix!"
+                    )
 
         if self.device.type == "cuda" and self.config.USE_AMP:
             cast_frozen_base_to_fp16(self.model)

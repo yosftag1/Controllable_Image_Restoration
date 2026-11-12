@@ -79,10 +79,27 @@ class ControllableRestorationLoss(nn.Module):
         diff_sq = (pred.float() - target.float()) ** 2
         charb = torch.sqrt(diff_sq + self.eps * self.eps)  # [B, 3, H, W]
 
-        # Boost weight slightly (1.35x) on low-action / preserved pixels so untouched attributes never drift
-        mean_act = action_map.float().mean(dim=1, keepdim=True)  # [B, 1, H, W]
-        pixel_weight = 1.35 - 0.35 * mean_act
+        # Focus extra supervision on actively edited regions while keeping selective preservation accurate
+        max_act = action_map.float().amax(dim=1, keepdim=True)  # [B, 1, H, W]
+        pixel_weight = 1.0 + 0.30 * max_act
         return (charb * pixel_weight).mean()
+
+    @staticmethod
+    def multiscale_color_tone_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """Low-pass pooled RGB + opponent chroma loss for accurate color-cast, exposure & banding removal."""
+        pred_f, tgt_f = pred.float(), target.float()
+        total = pred_f.new_zeros((), dtype=torch.float32)
+        scales = 0
+        for pool_k in (8, 32):
+            if pred_f.shape[-2] >= pool_k and pred_f.shape[-1] >= pool_k:
+                p_low = F.avg_pool2d(pred_f, kernel_size=pool_k, stride=pool_k)
+                t_low = F.avg_pool2d(tgt_f, kernel_size=pool_k, stride=pool_k)
+                l_rgb = F.l1_loss(p_low, t_low)
+                p_chr = torch.cat([p_low[:, 0:1] - p_low[:, 1:2], p_low[:, 2:3] - p_low[:, 1:2]], dim=1)
+                t_chr = torch.cat([t_low[:, 0:1] - t_low[:, 1:2], t_low[:, 2:3] - t_low[:, 1:2]], dim=1)
+                total = total + 0.5 * (l_rgb + F.l1_loss(p_chr, t_chr))
+                scales += 1
+        return total / max(1, scales)
 
     @staticmethod
     def spatial_gradient_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -119,11 +136,20 @@ class ControllableRestorationLoss(nn.Module):
         loss_l1 = self.charbonnier_with_preservation_weight(pred_01, target_01, action_map)
         loss_grad = self.spatial_gradient_loss(pred_01, target_01)
         loss_freq = self.fft_frequency_loss(pred_01, target_01)
+        loss_color = self.multiscale_color_tone_loss(pred_01, target_01)
+
+        l1_weight = (
+            float(getattr(self.config, "LOSS_SEMANTIC_STAGE_L1_WEIGHT", 0.35))
+            if stage == "semantic_stage"
+            else float(self.config.LOSS_L1_WEIGHT)
+        )
+        color_weight = float(getattr(self.config, "LOSS_COLOR_TONE_WEIGHT", 0.25))
 
         total = (
-            self.config.LOSS_L1_WEIGHT * loss_l1
+            l1_weight * loss_l1
             + self.config.LOSS_GRADIENT_WEIGHT * loss_grad
             + self.config.LOSS_FREQUENCY_WEIGHT * loss_freq
+            + color_weight * loss_color
         )
 
         # Keep Self-Teacher alignment active whenever vision_lora has gradients enabled
@@ -133,13 +159,17 @@ class ControllableRestorationLoss(nn.Module):
         loss_perc = pred_01.new_zeros((), dtype=torch.float32)
         loss_sem_cons = pred_01.new_zeros((), dtype=torch.float32)
 
-        if stage in ("semantic_stage", "joint"):
-            # Down-weight perceptual loss slightly on high-t bridge extrapolations for artifact-free edges
-            if t_vec is not None:
-                t_weights = (1.15 - 0.35 * t_vec.float().view(-1)).clamp(0.5, 1.0)
-            else:
-                t_weights = None
+        if t_vec is not None:
+            t_weights = (1.15 - 0.30 * t_vec.float().view(-1)).clamp(0.6, 1.0)
+        else:
+            t_weights = None
 
+        pix_perc_w = float(getattr(self.config, "LOSS_PIXEL_STAGE_PERCEPTUAL_WEIGHT", 0.10))
+        if stage == "pixel_stage" and pix_perc_w > 0.0:
+            # Structural VGG guidance in Phase 2 prevents blurry L1 conditional-mean averaging on blur/SR
+            loss_perc = self.perceptual(pred_01, target_01, sample_weights=t_weights)
+            total = total + pix_perc_w * loss_perc
+        elif stage in ("semantic_stage", "joint"):
             loss_perc = self.perceptual(pred_01, target_01, sample_weights=t_weights)
             total = total + self.config.LOSS_PERCEPTUAL_WEIGHT * loss_perc
 
@@ -156,6 +186,7 @@ class ControllableRestorationLoss(nn.Module):
             "l1": float(loss_l1.detach().item()),
             "grad": float(loss_grad.detach().item()),
             "freq": float(loss_freq.detach().item()),
+            "color": float(loss_color.detach().item()),
             "align": float(align_scalar.detach().item()),
             "perc": float(loss_perc.detach().item()),
             "sem_cons": float(loss_sem_cons.detach().item()),

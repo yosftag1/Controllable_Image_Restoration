@@ -5,36 +5,99 @@ sharp edges, colors) across the 8x latent bottleneck via zero-initialized
 Encoder -> Decoder skip connections modulated locally by the Spatial Action Overlay.
 """
 
-from typing import List, Tuple
+from typing import List, Sequence, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as grad_checkpoint
 
-from .action_overlay import PointwiseSpatialModulator
 from .lora_layers import infer_module_dtype, inject_generator_dual_lora
 
 
-class _ActionZeroSkipBridge(nn.Module):
-    """Pointwise 1x1 action-modulated zero-convolution skip bridge from Encoder to Decoder."""
+# Purely radiometric/tonal edits where spatial edges in the input are still clean once mean/scale-normalized
+_RADIOMETRIC_ONLY_NAMES = {"color_degradation", "exposure_issue"}
 
-    def __init__(self, enc_channels: int, dec_channels: int, num_actions: int, hidden_dim: int = 64):
+
+class _ActionGatedSkipBridge(nn.Module):
+    """Action-suppressed, zero-mean GroupNorm 1x1 skip bridge from Encoder to Decoder.
+
+    Prevents the Skip-VAE shortcut pathology:
+    1. `GroupNorm(..., affine=False)` + `bias=False` strips global color casts & exposure shifts
+       from encoder features so radiometric fixes always come from the UNet's clean latent `hat_z_0`.
+    2. Explicit structural suppression envelope `(1 - s * a_struct)^2` shuts off degraded encoder
+       skips whenever spatial/quantization restoration sliders (deblur, SR, deband, denoise, JPEG)
+       are active, forcing the decoder to reconstruct clean structure from the UNet.
+    """
+
+    def __init__(
+        self,
+        enc_channels: int,
+        dec_channels: int,
+        num_actions: int,
+        struct_indices: Sequence[int],
+        suppression_strength: float = 1.0,
+        hidden_dim: int = 64,
+    ):
         super().__init__()
-        self.spatial_mod = PointwiseSpatialModulator(
-            num_actions=num_actions,
-            channels=enc_channels,
-            hidden_dim=hidden_dim,
-        )
-        self.zero_proj = nn.Conv2d(enc_channels, dec_channels, kernel_size=1)
-        nn.init.zeros_(self.zero_proj.weight)
-        nn.init.zeros_(self.zero_proj.bias)
+        self.suppression_strength = float(suppression_strength)
+        idx_tensor = torch.tensor(list(struct_indices), dtype=torch.long)
+        self.register_buffer("struct_indices", idx_tensor, persistent=False)
 
-    def forward(self, dec_feat: torch.Tensor, enc_skip: torch.Tensor, action_map: torch.Tensor) -> torch.Tensor:
-        if enc_skip.shape[-2:] != dec_feat.shape[-2:]:
-            enc_skip = F.interpolate(enc_skip.float(), size=dec_feat.shape[-2:], mode="bilinear", align_corners=False)
-        modulated = self.spatial_mod(enc_skip, action_map)
-        bridge = self.zero_proj(modulated.float())
+        num_groups = 32
+        while enc_channels % num_groups != 0 and num_groups > 1:
+            num_groups //= 2
+        self.norm = nn.GroupNorm(num_groups=num_groups, num_channels=enc_channels, affine=False)
+
+        self.mlp_1x1 = nn.Sequential(
+            nn.Conv2d(num_actions, hidden_dim, kernel_size=1),
+            nn.SiLU(),
+            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=1),
+            nn.SiLU(),
+        )
+        self.to_gamma_gate = nn.Conv2d(hidden_dim, enc_channels * 2, kernel_size=1)
+        nn.init.zeros_(self.to_gamma_gate.weight)
+        nn.init.zeros_(self.to_gamma_gate.bias)
+
+        # bias=False guarantees zero DC color/brightness offset leak into decoder
+        self.zero_proj = nn.Conv2d(enc_channels, dec_channels, kernel_size=1, bias=False)
+        nn.init.zeros_(self.zero_proj.weight)
+
+    def forward(
+        self,
+        dec_feat: torch.Tensor,
+        enc_skip: torch.Tensor,
+        action_map: torch.Tensor,
+        keep_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        target_hw = dec_feat.shape[-2:]
+        if enc_skip.shape[-2:] != target_hw:
+            enc_skip_f = F.interpolate(enc_skip.float(), size=target_hw, mode="bilinear", align_corners=False)
+        else:
+            enc_skip_f = enc_skip.float()
+
+        if action_map.shape[-2:] != target_hw:
+            a_local = F.interpolate(action_map.float(), size=target_hw, mode="area")
+        else:
+            a_local = action_map.float()
+
+        if self.struct_indices.numel() > 0:
+            s_idx = self.struct_indices.to(a_local.device)
+            a_struct = a_local.index_select(1, s_idx).amax(dim=1, keepdim=True)
+        else:
+            a_struct = a_local.amax(dim=1, keepdim=True)
+
+        # Hard upper-bound retention envelope: -> 0.0 when structural sliders (blur/SR/banding/noise/JPEG) -> 1.0
+        retain_env = (1.0 - self.suppression_strength * a_struct).clamp(0.0, 1.0).square()
+
+        normed_skip = self.norm(enc_skip_f)
+        h_act = self.mlp_1x1(a_local)
+        raw_gamma, raw_gate = self.to_gamma_gate(h_act).chunk(2, dim=1)
+        gamma = torch.tanh(raw_gamma)
+        learned_gate = torch.sigmoid(raw_gate)
+
+        gated_skip = retain_env * learned_gate * (normed_skip * (1.0 + gamma))
+        bridge = self.zero_proj(gated_skip) * keep_mask.to(dtype=torch.float32, device=dec_feat.device)
         return dec_feat + bridge.to(dec_feat.dtype)
 
 
@@ -121,21 +184,37 @@ class SkipConnectedVAE(nn.Module):
 
         num_actions = config.NUM_ACTIONS
         mod_hidden = getattr(config, "SPATIAL_MOD_HIDDEN_DIM", 64)
+        self.skip_dropout_prob = float(getattr(config, "SKIP_DROPOUT_PROB", 0.50))
 
-        # enc_skips = [skip_1x (H), skip_2x (H/2), skip_4x (H/4), skip_8x (H/8)]
-        # dec_channels = [pre_up0 (H/8), pre_up1 (H/4), pre_up2 (H/2), post_up3 (H)]
+        deg_names = list(getattr(config, "DEGRADATION_TYPES", []))
+        struct_indices = [
+            i for i in range(num_actions)
+            if i >= len(deg_names) or deg_names[i] not in _RADIOMETRIC_ONLY_NAMES
+        ]
+
+        # Multi-scale mid/coarse bridges ONLY ([H/8, H/4, H/2] — NO raw HxW conv_in pixel-copy bypass!):
+        # enc_skips = [skip_2x (H/2), skip_4x (H/4), skip_8x (H/8)]
+        # dec_channels = [pre_up0 (H/8), pre_up1 (H/4), pre_up2 (H/2)]
         self.up_skip_bridges = nn.ModuleList(
             [
-                _ActionZeroSkipBridge(enc_skips[3].shape[1], dec_channels[0], num_actions, mod_hidden),
-                _ActionZeroSkipBridge(enc_skips[2].shape[1], dec_channels[1], num_actions, mod_hidden),
-                _ActionZeroSkipBridge(enc_skips[1].shape[1], dec_channels[2], num_actions, mod_hidden),
+                _ActionGatedSkipBridge(
+                    enc_skips[2].shape[1], dec_channels[0], num_actions, struct_indices,
+                    suppression_strength=0.85, hidden_dim=mod_hidden,
+                ),
+                _ActionGatedSkipBridge(
+                    enc_skips[1].shape[1], dec_channels[1], num_actions, struct_indices,
+                    suppression_strength=1.00, hidden_dim=mod_hidden,
+                ),
+                _ActionGatedSkipBridge(
+                    enc_skips[0].shape[1], dec_channels[2], num_actions, struct_indices,
+                    suppression_strength=1.00, hidden_dim=mod_hidden,
+                ),
             ]
         )
-        self.fullres_skip_bridge = _ActionZeroSkipBridge(
-            enc_skips[0].shape[1], dec_channels[3], num_actions, mod_hidden
-        )
 
-    def _raw_encode(self, x_minus1_to_1: torch.Tensor) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+    def _raw_encode(
+        self, x_minus1_to_1: torch.Tensor, collect_skips: bool = True
+    ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
         enc = self.vae.encoder
         vae_dtype = infer_module_dtype(enc, fallback=x_minus1_to_1.dtype)
         use_ckpt = getattr(self, "gradient_checkpointing", False) and self.training and torch.is_grad_enabled()
@@ -143,13 +222,13 @@ class SkipConnectedVAE(nn.Module):
         h = enc.conv_in(x_minus1_to_1.to(vae_dtype))
         if use_ckpt and not h.requires_grad:
             h = h.requires_grad_(True)
-        skips: List[torch.Tensor] = [h]  # skip[0]: full resolution (H, W)
+        skips: List[torch.Tensor] = []
 
         num_down = len(enc.down_blocks)
         for idx, down_block in enumerate(enc.down_blocks):
             h = grad_checkpoint(down_block, h, use_reentrant=False) if use_ckpt else down_block(h)
-            if idx < num_down - 1:
-                skips.append(h)          # skip[1]: H/2, skip[2]: H/4, skip[3]: H/8
+            if collect_skips and idx < num_down - 1:
+                skips.append(h)          # skip[0]: H/2, skip[1]: H/4, skip[2]: H/8
 
         h = grad_checkpoint(enc.mid_block, h, use_reentrant=False) if use_ckpt else enc.mid_block(h)
         h = enc.conv_norm_out(h)
@@ -176,17 +255,17 @@ class SkipConnectedVAE(nn.Module):
             if idx < 3:
                 ch_list.append(int(h.shape[1]))
             h = up_block(h)
-        ch_list.append(int(h.shape[1]))  # post up_blocks[-1] full-resolution feature channels
         return ch_list
 
     def encode_with_skips(self, rgb_01: torch.Tensor) -> Tuple[torch.Tensor, List[torch.Tensor]]:
-        """Encode RGB image in [0, 1] into scaled latents + 4 multi-scale skip tensors."""
+        """Encode RGB image in [0, 1] into scaled latents + 3 multi-scale skip tensors (H/2, H/4, H/8)."""
         x_norm = rgb_01 * 2.0 - 1.0
-        return self._raw_encode(x_norm)
+        return self._raw_encode(x_norm, collect_skips=True)
 
     def encode_target_latents(self, rgb_01: torch.Tensor) -> torch.Tensor:
-        """Encode clean/target RGB image in [0, 1] without storing skip activations."""
-        latents, _ = self.encode_with_skips(rgb_01)
+        """Encode clean/target RGB image in [0, 1] without allocating skip activations."""
+        x_norm = rgb_01 * 2.0 - 1.0
+        latents, _ = self._raw_encode(x_norm, collect_skips=False)
         return latents
 
     def decode_with_skips(
@@ -197,10 +276,19 @@ class SkipConnectedVAE(nn.Module):
         skip_scale: float = 1.0,
         release_skips: bool = False,
     ) -> torch.Tensor:
-        """Decode latents back to [0, 1] RGB using explicit encoder skips & 1x1 action overlay."""
+        """Decode latents back to [0, 1] RGB using action-suppressed skips & DDP-safe skip dropout."""
         dec = self.vae.decoder
         vae_dtype = infer_module_dtype(dec, fallback=latents.dtype)
         use_ckpt = getattr(self, "gradient_checkpointing", False) and self.training and torch.is_grad_enabled()
+
+        bsz = latents.shape[0]
+        if self.training and torch.is_grad_enabled() and self.skip_dropout_prob > 0.0:
+            keep_prob = max(0.0, min(1.0, 1.0 - self.skip_dropout_prob))
+            keep_mask = (
+                torch.rand((bsz, 1, 1, 1), device=latents.device, dtype=torch.float32) < keep_prob
+            ).float() * float(skip_scale)
+        else:
+            keep_mask = torch.full((bsz, 1, 1, 1), float(skip_scale), device=latents.device, dtype=torch.float32)
 
         h = (latents / self.scaling_factor).to(vae_dtype)
         if getattr(self.vae, "post_quant_conv", None) is not None:
@@ -211,36 +299,24 @@ class SkipConnectedVAE(nn.Module):
             h = h.requires_grad_(True)
         h = grad_checkpoint(dec.mid_block, h, use_reentrant=False) if use_ckpt else dec.mid_block(h)
 
-        # Reverse order matches [skip_8x (3), skip_4x (2), skip_2x (1)]
-        skip_indices = [3, 2, 1]
+        # Reverse order matches [skip_8x (2), skip_4x (1), skip_2x (0)]
+        skip_indices = [2, 1, 0]
         for idx, up_block in enumerate(dec.up_blocks):
-            if idx < 3 and skip_scale > 0.0:
+            if idx < 3 and len(enc_skips) > skip_indices[idx]:
                 s_idx = skip_indices[idx]
                 enc_skip = enc_skips[s_idx]
                 if release_skips and not use_ckpt:
                     enc_skips[s_idx] = None
-                bridged = (
-                    grad_checkpoint(self.up_skip_bridges[idx], h, enc_skip, action_map, use_reentrant=False)
-                    if use_ckpt
-                    else self.up_skip_bridges[idx](h, enc_skip, action_map)
-                )
-                del enc_skip
-                h = h + skip_scale * (bridged - h)
-                del bridged
+                if enc_skip is not None:
+                    h = (
+                        grad_checkpoint(
+                            self.up_skip_bridges[idx], h, enc_skip, action_map, keep_mask, use_reentrant=False
+                        )
+                        if use_ckpt
+                        else self.up_skip_bridges[idx](h, enc_skip, action_map, keep_mask)
+                    )
+                    del enc_skip
             h = grad_checkpoint(up_block, h, use_reentrant=False) if use_ckpt else up_block(h)
-
-        if skip_scale > 0.0:
-            full_skip = enc_skips[0]
-            if release_skips and not use_ckpt:
-                enc_skips[0] = None
-            bridged_full = (
-                grad_checkpoint(self.fullres_skip_bridge, h, full_skip, action_map, use_reentrant=False)
-                if use_ckpt
-                else self.fullres_skip_bridge(h, full_skip, action_map)
-            )
-            del full_skip
-            h = h + skip_scale * (bridged_full - h)
-            del bridged_full
 
         h = dec.conv_norm_out(h)
         h = dec.conv_act(h)
@@ -249,5 +325,4 @@ class SkipConnectedVAE(nn.Module):
         return rgb_01
 
     def skip_bridge_parameters(self) -> List[nn.Parameter]:
-        params = list(self.up_skip_bridges.parameters()) + list(self.fullres_skip_bridge.parameters())
-        return params
+        return list(self.up_skip_bridges.parameters())
