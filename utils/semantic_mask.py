@@ -91,6 +91,7 @@ def extract_one_click_semantic_mask(
     point_xy: Tuple[float, float],
     threshold: Optional[float] = None,
     feather_sigma: float = 6.0,
+    max_side: int = 1024,
 ) -> np.ndarray:
     """Extract a soft object mask M in [0, 1]^(H, W) from a single (x, y) click.
 
@@ -115,8 +116,21 @@ def extract_one_click_semantic_mask(
         norm_x = np.clip(px / max(1.0, w - 1.0), 0.0, 1.0)
         norm_y = np.clip(py / max(1.0, h - 1.0), 0.0, 1.0)
 
-    sem_out = semantic_encoder(rgb_01, use_lora=True)
+    # Cap ViT mask extraction resolution to `max_side` so 2K/4K photos use <150 MB VRAM
+    rgb_proc = rgb_01
+    if max_side > 0 and max(h, w) > max_side:
+        scale = float(max_side) / float(max(h, w))
+        nh = max(16, int(round((h * scale) / 16.0)) * 16)
+        nw = max(16, int(round((w * scale) / 16.0)) * 16)
+        rgb_proc = F.interpolate(rgb_01, size=(nh, nw), mode="bilinear", align_corners=False)
+
+    if rgb_proc.is_cuda:
+        with torch.amp.autocast("cuda", enabled=True):
+            sem_out = semantic_encoder(rgb_proc, use_lora=True)
+    else:
+        sem_out = semantic_encoder(rgb_proc, use_lora=True)
     grid = F.normalize(sem_out["grid"].float(), dim=1)  # [1, D, Hp, Wp]
+    del sem_out
 
     # Sample reference feature at clicked coordinate via bilinear grid_sample
     sample_coord = torch.tensor([[[[norm_x * 2.0 - 1.0, norm_y * 2.0 - 1.0]]]], device=grid.device, dtype=torch.float32)

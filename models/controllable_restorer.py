@@ -10,6 +10,7 @@ Combines:
 """
 
 from contextlib import contextmanager
+import math
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -588,32 +589,75 @@ class ControllableRestorer(nn.Module):
             "t": t_vec,
         }
 
+    @staticmethod
+    def _compute_tile_starts(length: int, tile_size: int, overlap: int) -> List[int]:
+        """Compute evenly spaced tile start coordinates covering [0, length) with >= `overlap` margin."""
+        if length <= tile_size:
+            return [0]
+        stride = max(1, tile_size - overlap)
+        n_tiles = 1 + math.ceil((length - tile_size) / stride)
+        max_start = length - tile_size
+        if n_tiles <= 1:
+            return [0]
+        return [int(round(i * max_start / (n_tiles - 1))) for i in range(n_tiles)]
+
+    @staticmethod
+    def _build_tile_feather_window(
+        y0: int,
+        y1: int,
+        x0: int,
+        x1: int,
+        full_h: int,
+        full_w: int,
+        overlap: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Build [1, 1, th, tw] C1-smooth raised-cosine feather window (flat 1.0 on outer image borders)."""
+        th = y1 - y0
+        tw = x1 - x0
+        wy = torch.ones(th, device=device, dtype=torch.float32)
+        wx = torch.ones(tw, device=device, dtype=torch.float32)
+
+        ry = min(max(0, overlap), th // 2)
+        if ry > 0:
+            ramp_y = 0.5 * (
+                1.0 - torch.cos(math.pi * (torch.arange(ry, device=device, dtype=torch.float32) + 0.5) / ry)
+            )
+            if y0 > 0:
+                wy[:ry] = ramp_y
+            if y1 < full_h:
+                wy[-ry:] = torch.minimum(wy[-ry:], ramp_y.flip(0))
+
+        rx = min(max(0, overlap), tw // 2)
+        if rx > 0:
+            ramp_x = 0.5 * (
+                1.0 - torch.cos(math.pi * (torch.arange(rx, device=device, dtype=torch.float32) + 0.5) / rx)
+            )
+            if x0 > 0:
+                wx[:rx] = ramp_x
+            if x1 < full_w:
+                wx[-rx:] = torch.minimum(wx[-rx:], ramp_x.flip(0))
+
+        return (wy[:, None] * wx[None, :]).clamp_(min=1e-5).unsqueeze(0).unsqueeze(0)
+
     @torch.no_grad()
-    def sample(
+    def _sample_single(
         self,
         src_01: torch.Tensor,
         action_input: torch.Tensor,
-        steps: Optional[int] = None,
-        fidelity_scale: Optional[float] = None,
-        detail_scale: Optional[float] = None,
+        steps: int,
+        fidelity_scale: float,
+        detail_scale: float,
         return_trajectory: bool = False,
     ):
-        """Controllable 1-to-N step Rectified Flow restoration at inference time."""
-        steps = int(steps or getattr(self.config, "DEFAULT_INFERENCE_STEPS", 1))
-        fidelity_scale = (
-            float(self.config.DEFAULT_FIDELITY_SCALE) if fidelity_scale is None else float(fidelity_scale)
-        )
-        detail_scale = (
-            float(self.config.DEFAULT_DETAIL_SCALE) if detail_scale is None else float(detail_scale)
-        )
-
+        """Run 1-to-N step Rectified Flow restoration on a single patch/tile."""
         bsz, _, h, w = src_01.shape
         action_map = self.action_overlay.ensure_spatial_map(action_input, h, w)
 
         # Fast shortcut if the entire action overlay is zero everywhere
         if float(action_map.max().item()) <= 1e-5:
             if return_trajectory:
-                return src_01.clone(), [src_01.clone()]
+                return src_01.clone(), [src_01.clone() for _ in range(steps + 1)]
             return src_01.clone()
 
         # Pad non-8-divisible resolutions cleanly for the 8x latent UNet, then crop back
@@ -630,6 +674,7 @@ class ControllableRestorer(nn.Module):
         cross_tokens, global_action_cond = self.action_overlay(
             act_padded, sem_out["tokens"], sem_out["global"]
         )
+        del sem_out
 
         with generator_lora_context(
             global_action_cond,
@@ -655,17 +700,129 @@ class ControllableRestorer(nn.Module):
                 detail_scale=detail_scale,
             )
             z_cur = z_cur - dt * vel
+            del vel
 
             if return_trajectory and i < steps - 1:
                 mid_rgb = self.skip_vae.decode_with_skips(z_cur, enc_skips, act_padded)[:, :, :h, :w]
                 trajectory.append(self._apply_zero_action_lock(src_01, mid_rgb, action_map))
 
-        raw_rgb = self.skip_vae.decode_with_skips(z_cur, enc_skips, act_padded)[:, :, :h, :w]
+        del cross_tokens, global_action_cond
+        raw_rgb = self.skip_vae.decode_with_skips(
+            z_cur, enc_skips, act_padded, release_skips=True
+        )[:, :, :h, :w]
+        del z_cur, enc_skips
         final_rgb = self._apply_zero_action_lock(src_01, raw_rgb, action_map)
 
         if return_trajectory:
             trajectory.append(final_rgb)
             return final_rgb, trajectory
+        return final_rgb
+
+    @torch.no_grad()
+    def sample(
+        self,
+        src_01: torch.Tensor,
+        action_input: torch.Tensor,
+        steps: Optional[int] = None,
+        fidelity_scale: Optional[float] = None,
+        detail_scale: Optional[float] = None,
+        return_trajectory: bool = False,
+        tile_size: Optional[int] = None,
+        tile_overlap: Optional[int] = None,
+    ):
+        """Controllable 1-to-N step Rectified Flow restoration (auto-tiled for 2K/4K images)."""
+        steps = int(steps or getattr(self.config, "DEFAULT_INFERENCE_STEPS", 1))
+        fidelity_scale = (
+            float(self.config.DEFAULT_FIDELITY_SCALE) if fidelity_scale is None else float(fidelity_scale)
+        )
+        detail_scale = (
+            float(self.config.DEFAULT_DETAIL_SCALE) if detail_scale is None else float(detail_scale)
+        )
+        if tile_size is None:
+            tile_size = int(getattr(self.config, "INFERENCE_TILE_SIZE", 512) or 0)
+        else:
+            tile_size = int(tile_size)
+        if tile_overlap is None:
+            tile_overlap = int(getattr(self.config, "INFERENCE_TILE_OVERLAP", 96) or 0)
+        else:
+            tile_overlap = int(tile_overlap)
+
+        _, _, h, w = src_01.shape
+        if float(action_input.max().item()) <= 1e-5:
+            if return_trajectory:
+                return src_01.clone(), [src_01.clone() for _ in range(steps + 1)]
+            return src_01.clone()
+
+        if tile_size <= 0 or (h <= tile_size and w <= tile_size):
+            return self._sample_single(
+                src_01=src_01,
+                action_input=action_input,
+                steps=steps,
+                fidelity_scale=fidelity_scale,
+                detail_scale=detail_scale,
+                return_trajectory=return_trajectory,
+            )
+
+        # Seamless raised-cosine overlapping tile restoration for high-res (1080p / 2K / 4K) images
+        tile_h = min(h, tile_size)
+        tile_w = min(w, tile_size)
+        tile_overlap = min(tile_overlap, min(tile_h, tile_w) // 2)
+        y_starts = self._compute_tile_starts(h, tile_h, tile_overlap)
+        x_starts = self._compute_tile_starts(w, tile_w, tile_overlap)
+
+        full_act_4d = None
+        if action_input.ndim == 4:
+            full_act_4d = self.action_overlay.ensure_spatial_map(action_input, h, w)
+
+        acc_rgb = torch.zeros_like(src_01, dtype=torch.float32)
+        acc_w = torch.zeros((1, 1, h, w), device=src_01.device, dtype=torch.float32)
+        acc_traj = (
+            [torch.zeros_like(src_01, dtype=torch.float32) for _ in range(steps + 1)]
+            if return_trajectory
+            else None
+        )
+
+        for y0 in y_starts:
+            y1 = y0 + tile_h
+            for x0 in x_starts:
+                x1 = x0 + tile_w
+                src_tile = src_01[:, :, y0:y1, x0:x1]
+                act_tile = full_act_4d[:, :, y0:y1, x0:x1] if full_act_4d is not None else action_input
+
+                win = self._build_tile_feather_window(
+                    y0, y1, x0, x1, h, w, tile_overlap, device=src_01.device
+                )
+                if return_trajectory:
+                    tile_out, tile_traj = self._sample_single(
+                        src_01=src_tile,
+                        action_input=act_tile,
+                        steps=steps,
+                        fidelity_scale=fidelity_scale,
+                        detail_scale=detail_scale,
+                        return_trajectory=True,
+                    )
+                    acc_rgb[:, :, y0:y1, x0:x1].add_(tile_out.float() * win)
+                    for s_idx, frame_t in enumerate(tile_traj):
+                        acc_traj[s_idx][:, :, y0:y1, x0:x1].add_(frame_t.float() * win)
+                else:
+                    tile_out = self._sample_single(
+                        src_01=src_tile,
+                        action_input=act_tile,
+                        steps=steps,
+                        fidelity_scale=fidelity_scale,
+                        detail_scale=detail_scale,
+                        return_trajectory=False,
+                    )
+                    acc_rgb[:, :, y0:y1, x0:x1].add_(tile_out.float() * win)
+
+                acc_w[:, :, y0:y1, x0:x1].add_(win)
+
+        inv_w = 1.0 / acc_w.clamp(min=1e-6)
+        final_rgb = (acc_rgb * inv_w).clamp_(0.0, 1.0).to(src_01.dtype)
+
+        if return_trajectory:
+            traj_out = [(frame_acc * inv_w).clamp_(0.0, 1.0).to(src_01.dtype) for frame_acc in acc_traj]
+            return final_rgb, traj_out
         return final_rgb
 
     def forward(

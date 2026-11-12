@@ -51,8 +51,10 @@ class Config:
     DEFAULT_FIDELITY_SCALE = 1.0   # lambda_pix: strict structural & color accuracy
     DEFAULT_DETAIL_SCALE = 0.75    # lambda_sem: perceptual/semantic texture synthesis (0.0 = conservative)
 
-    # Latent Rectified Flow / Turbo sampling
+    # Latent Rectified Flow / Turbo sampling & High-Res Tiled Inference
     DEFAULT_INFERENCE_STEPS = 1    # 1 step default; supports 2-4 Euler steps for severe compound cases
+    INFERENCE_TILE_SIZE = 512      # Seamless overlapping tile size for 2K/4K photos (0 = untiled)
+    INFERENCE_TILE_OVERLAP = 96    # Raised-cosine feather overlap in pixels between adjacent tiles
     MULTI_STEP_TRAIN_PROB = 0.30   # 70% t=1.0 (1-step direct), 30% t~U(0.25, 1.0) (enables 2-4 step trajectory)
     INITIAL_VELOCITY_SCALE = 0.15  # Smooth initial latent step before LoRA converges
 

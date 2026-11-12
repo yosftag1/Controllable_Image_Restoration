@@ -1,6 +1,7 @@
 """Controllable Inference CLI (Global Sliders, Dual-LoRA Dials, 1-Click Semantic Object Masks)."""
 
 import argparse
+import gc
 import os
 from pathlib import Path
 import sys
@@ -33,6 +34,13 @@ class ControllableInferencer:
     """High-level wrapper for controllable global & localized image restoration."""
 
     def __init__(self, checkpoint_path: Optional[str] = None, config: Optional[Config] = None, device: str = "cuda"):
+        # Release any stale Jupyter/%run traceback GPU references before allocating models
+        sys.last_traceback = None
+        sys.last_value = None
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
         self.config = config or Config()
 
@@ -80,6 +88,8 @@ class ControllableInferencer:
         fidelity_scale: Optional[float] = None,
         detail_scale: Optional[float] = None,
         return_trajectory: bool = False,
+        tile_size: Optional[int] = None,
+        tile_overlap: Optional[int] = None,
     ):
         """Restore an RGB uint8 image with global sliders, mask image, or 1-click semantic selection."""
         h, w = image_rgb_u8.shape[:2]
@@ -105,19 +115,39 @@ class ControllableInferencer:
         elif mask_path is not None:
             mask_2d = load_grayscale_mask(mask_path, height=h, width=w, feather_sigma=feather_sigma)
 
-        overlay = build_spatial_action_overlay(
-            height=h,
-            width=w,
-            fg_action=fg_vec,
-            bg_action=bg_vec,
-            mask_2d=mask_2d,
-            device=self.device,
-        )
+        if mask_2d is None:
+            # Compact [1, K] global vector avoids allocating a full-res [1, 8, H, W] overlay on 2K/4K images
+            overlay = torch.from_numpy(fg_vec).unsqueeze(0).to(device=self.device, dtype=torch.float32)
+        else:
+            overlay = build_spatial_action_overlay(
+                height=h,
+                width=w,
+                fg_action=fg_vec,
+                bg_action=bg_vec,
+                mask_2d=mask_2d,
+                device=self.device,
+            )
 
         effective_detail_scale = detail_scale
         if effective_detail_scale is None and self.ckpt_stage in ("align_warmup", "pixel_stage"):
             # Semantic-LoRA has not been trained yet in pre-Stage-3 checkpoints; skip zero branch cleanly
             effective_detail_scale = 0.0
+
+        eff_tile = (
+            int(getattr(self.config, "INFERENCE_TILE_SIZE", 512) or 0)
+            if tile_size is None
+            else int(tile_size)
+        )
+        eff_overlap = (
+            int(getattr(self.config, "INFERENCE_TILE_OVERLAP", 96) or 0)
+            if tile_overlap is None
+            else int(tile_overlap)
+        )
+        if eff_tile > 0 and (h > eff_tile or w > eff_tile):
+            print(
+                f"Restoring {w}x{h} image via seamless {eff_tile}x{eff_tile} tiles "
+                f"(overlap={eff_overlap}px)..."
+            )
 
         use_amp = (self.device.type == "cuda") and self.config.USE_AMP
         with torch.amp.autocast("cuda", enabled=use_amp):
@@ -128,6 +158,8 @@ class ControllableInferencer:
                 fidelity_scale=fidelity_scale,
                 detail_scale=effective_detail_scale,
                 return_trajectory=return_trajectory,
+                tile_size=eff_tile,
+                tile_overlap=eff_overlap,
             )
 
         if return_trajectory:
@@ -175,6 +207,18 @@ def main():
     parser.add_argument("--fidelity-scale", type=float, default=None, help="Pixel-Faithful LoRA scale (default: 1.0)")
     parser.add_argument("--detail-scale", type=float, default=None, help="Semantic-Detail LoRA scale (0.0=conservative, 1.0=crisp)")
     parser.add_argument("--steps", type=int, default=1, help="Number of Rectified Flow Euler steps (1 to 4)")
+    parser.add_argument(
+        "--tile-size",
+        type=int,
+        default=None,
+        help="Seamless tile size in pixels for high-res 2K/4K photos (default: 512, 0=disable tiling)",
+    )
+    parser.add_argument(
+        "--tile-overlap",
+        type=int,
+        default=None,
+        help="Overlap margin in pixels between adjacent tiles (default: 96)",
+    )
     parser.add_argument("--save-trajectory", action="store_true", help="Save intermediate multi-step frames")
     parser.add_argument("--mock", action="store_true", help="Run with offline mock_tiny backbones")
     args = parser.parse_args()
@@ -204,6 +248,8 @@ def main():
         fidelity_scale=args.fidelity_scale,
         detail_scale=args.detail_scale,
         return_trajectory=args.save_trajectory,
+        tile_size=args.tile_size,
+        tile_overlap=args.tile_overlap,
     )
 
     out_dir = Path(args.output_dir)

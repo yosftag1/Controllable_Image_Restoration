@@ -211,6 +211,18 @@ def test_model_and_stages_mock():
         "Unmasked right half (action=0) must remain 100% untouched!"
     )
 
+    # Seamless High-Res Tiled Inference Check (exact preservation on unmasked half across tile seams)
+    big_src = torch.rand(1, 3, 100, 110)
+    big_act = torch.zeros(1, cfg.NUM_ACTIONS, 100, 110)
+    big_act[:, :, :, :50] = 1.0
+    tiled_out, tiled_traj = model.sample(
+        big_src, big_act, steps=2, tile_size=64, tile_overlap=16, return_trajectory=True
+    )
+    assert tiled_out.shape == (1, 3, 100, 110) and len(tiled_traj) == 3
+    assert torch.allclose(tiled_out[:, :, :, 50:], big_src[:, :, :, 50:], atol=1e-6), (
+        "Tiled inference must preserve zero-action regions bit-for-bit!"
+    )
+
     # 1-Click Semantic Object Mask Check
     mask_2d = extract_one_click_semantic_mask(model.semantic_encoder, src[:1], point_xy=(0.5, 0.5))
     assert mask_2d.shape == (64, 64) and 0.0 <= float(mask_2d.min()) and float(mask_2d.max()) <= 1.0

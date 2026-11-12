@@ -195,6 +195,7 @@ class SkipConnectedVAE(nn.Module):
         enc_skips: List[torch.Tensor],
         action_map: torch.Tensor,
         skip_scale: float = 1.0,
+        release_skips: bool = False,
     ) -> torch.Tensor:
         """Decode latents back to [0, 1] RGB using explicit encoder skips & 1x1 action overlay."""
         dec = self.vae.decoder
@@ -214,22 +215,32 @@ class SkipConnectedVAE(nn.Module):
         skip_indices = [3, 2, 1]
         for idx, up_block in enumerate(dec.up_blocks):
             if idx < 3 and skip_scale > 0.0:
-                enc_skip = enc_skips[skip_indices[idx]]
+                s_idx = skip_indices[idx]
+                enc_skip = enc_skips[s_idx]
+                if release_skips and not use_ckpt:
+                    enc_skips[s_idx] = None
                 bridged = (
                     grad_checkpoint(self.up_skip_bridges[idx], h, enc_skip, action_map, use_reentrant=False)
                     if use_ckpt
                     else self.up_skip_bridges[idx](h, enc_skip, action_map)
                 )
+                del enc_skip
                 h = h + skip_scale * (bridged - h)
+                del bridged
             h = grad_checkpoint(up_block, h, use_reentrant=False) if use_ckpt else up_block(h)
 
         if skip_scale > 0.0:
+            full_skip = enc_skips[0]
+            if release_skips and not use_ckpt:
+                enc_skips[0] = None
             bridged_full = (
-                grad_checkpoint(self.fullres_skip_bridge, h, enc_skips[0], action_map, use_reentrant=False)
+                grad_checkpoint(self.fullres_skip_bridge, h, full_skip, action_map, use_reentrant=False)
                 if use_ckpt
-                else self.fullres_skip_bridge(h, enc_skips[0], action_map)
+                else self.fullres_skip_bridge(h, full_skip, action_map)
             )
+            del full_skip
             h = h + skip_scale * (bridged_full - h)
+            del bridged_full
 
         h = dec.conv_norm_out(h)
         h = dec.conv_act(h)
