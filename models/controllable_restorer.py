@@ -335,12 +335,40 @@ class ControllableRestorer(nn.Module):
         return out
 
     def load_trainable_state_dict(self, state_dict: Dict[str, torch.Tensor], strict: bool = False):
-        """Load lightweight adapter/LoRA/skip/overlay weights on top of frozen pretrained backbones."""
+        """Load lightweight adapter/LoRA/skip/overlay weights directly (bypasses frozen HF custom _load_from_state_dict hooks)."""
         if any(k.startswith("module.") for k in state_dict.keys()):
             state_dict = {k.replace("module.", "", 1): v for k, v in state_dict.items()}
-        missing, unexpected = self.load_state_dict(state_dict, strict=False)
-        if strict and unexpected:
-            raise RuntimeError(f"Unexpected keys when loading controllable adapters: {unexpected}")
+
+        groups = self.get_stage_parameter_groups()
+        trainable_ids = {id(p) for group in groups.values() for p in group}
+        param_map = dict(self.named_parameters())
+        buffer_map = dict(self.named_buffers())
+
+        loaded_keys = set()
+        unexpected: List[str] = []
+
+        with torch.no_grad():
+            for name, tensor in state_dict.items():
+                if name in param_map:
+                    dst = param_map[name]
+                    dst.copy_(tensor.to(device=dst.device, dtype=dst.dtype))
+                    loaded_keys.add(name)
+                elif name in buffer_map:
+                    dst = buffer_map[name]
+                    dst.copy_(tensor.to(device=dst.device, dtype=dst.dtype))
+                    loaded_keys.add(name)
+                else:
+                    unexpected.append(name)
+
+        missing = [
+            name
+            for name, param in param_map.items()
+            if id(param) in trainable_ids and name not in loaded_keys
+        ]
+        if strict and (missing or unexpected):
+            raise RuntimeError(
+                f"Error loading controllable adapters (missing={missing}, unexpected={unexpected})"
+            )
         return missing, unexpected
 
     def _predict_velocity(

@@ -554,6 +554,10 @@ def train(config: Config, resume_path: str = None, debug: bool = False, batch_si
                 resumed_stage = ckpt.get("stage")
                 resumed_opt_state = ckpt.get("optimizer_state_dict")
                 resumed_sched_state = ckpt.get("scheduler_state_dict")
+                del ckpt
+                if resumed_stage != determine_epoch_stage(start_epoch, config):
+                    resumed_opt_state = None
+                    resumed_sched_state = None
                 if is_main:
                     print(
                         f"Resumed trainable adapters (starting at Epoch {start_epoch}, best PSNR={best_psnr:.2f} dB)",
