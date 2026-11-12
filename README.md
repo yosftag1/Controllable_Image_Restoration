@@ -1,6 +1,6 @@
 # Controllable Pretrained Image Restoration
 
-An **action-conditioned, spatially controllable image restoration framework** that repurposes pretrained **Semantic Vision Foundation Models** (`nvidia/C-RADIOv2-B` / `nvidia/C-RADIOv3-B` or `DINOv3 / DINOv2-Registers + SigLIP 2`) and **Fast Pretrained Diffusion/Flow Generators** (`stabilityai/sd-turbo` or `segmind/tiny-sd`)—without forcing images back to a single blind "base state."
+An **action-conditioned, spatially controllable image restoration framework** that repurposes pretrained **Semantic Vision Foundation Models** (`nvidia/C-RADIOv3-B` default, `nvidia/C-RADIOv2-B`, or `DINOv3 / DINOv2-Registers + SigLIP 2`) and **Fast Pretrained Diffusion/Flow Generators** (`stabilityai/sd-turbo` or `segmind/tiny-sd`)—without forcing images back to a single blind "base state."
 
 Instead of wiping out intentional motion blur, bokeh, film grain, or mood lighting, you pass a **Spatial Action Overlay** $\mathbf{A} \in [0, 1]^{8 \times H \times W}$ (via global sliders, custom masks, or **1-click semantic object selection**) plus **Dual-LoRA Fidelity/Detail dials** ($\lambda_{\text{pix}}, \lambda_{\text{sem}}$) to control *exactly what* gets fixed, *where*, and *how conservatively vs. generatively*.
 
@@ -9,7 +9,7 @@ Instead of wiping out intentional motion blur, bokeh, film grain, or mood lighti
 ## Core Architecture
 
 1. **Semantic "Eyes" (`SemanticEncoder` + Self-Teacher LoRA)**:
-   - Supports **`nvidia/C-RADIOv2-B`** / **`nvidia/C-RADIOv3-B`** (~90M unified distillation of `DINO` + `SigLIP` + `SAM`, default) or **`DINOv3 / DINOv2-Registers` + `SigLIP 2-Base`**.
+   - Defaults to **`nvidia/C-RADIOv3-B`** (~90M unified *FeatSharp* distillation of `DINO` + `SigLIP` + `SAM`; also supports `nvidia/C-RADIOv2-B` or **`DINOv3 / DINOv2-Registers` + `SigLIP 2-Base`**).
    - **Zero-Extra-VRAM Self-Teacher Alignment**: Frozen base weights act as the clean teacher (`LoRA OFF` on clean $x_0$) while lightweight `SwitchableLoRALinear` detours (`LoRA ON` on degraded $x_{\text{src}}$) learn to extract clean semantic tokens through heavy compound noise, dark gamma, and blur.
 2. **Generative "Hands" (`SkipConnectedVAE` + Dual-LoRA `UNet2DConditionModel`)**:
    - Supports **`stabilityai/sd-turbo`** (peak 1-step generative quality) and **`segmind/tiny-sd` / `nota-ai/bk-sdm-tiny`** (~323M ultra-lightweight UNet), dropping the 123M–350M CLIP text encoder completely.

@@ -90,10 +90,10 @@ class SemanticEncoder(nn.Module):
         if self.encoder_type == "c_radio":
             from transformers import AutoConfig, AutoModel
 
-            radio_id = getattr(config, "RADIO_MODEL_ID", "nvidia/C-RADIOv2-B")
+            radio_id = getattr(config, "RADIO_MODEL_ID", "nvidia/C-RADIOv3-B")
             if radio_id == "nvidia/C-RADIOv2.5-B":
-                radio_id = "nvidia/C-RADIOv2-B"
-            alt_radio_id = getattr(config, "RADIO_ALT_MODEL_ID", "nvidia/C-RADIOv3-B")
+                radio_id = "nvidia/C-RADIOv3-B"
+            alt_radio_id = getattr(config, "RADIO_ALT_MODEL_ID", "nvidia/C-RADIOv2-B")
 
             try:
                 try:
