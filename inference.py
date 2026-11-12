@@ -10,6 +10,9 @@ import cv2
 import numpy as np
 import torch
 
+if "/kaggle/working/Controllable_Image_Restoration" not in sys.path:
+    sys.path.insert(0, "/kaggle/working/Controllable_Image_Restoration")
+
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
@@ -41,8 +44,10 @@ class ControllableInferencer:
                     setattr(self.config, key, val)
 
         self.model = ControllableRestorer(self.config).to(self.device)
-        if ckpt is not None and "trainable_state_dict" in ckpt:
-            self.model.load_trainable_state_dict(ckpt["trainable_state_dict"])
+        if ckpt is not None:
+            adapter_state = ckpt.get("trainable_state_dict") or ckpt.get("model_state_dict")
+            if adapter_state is not None:
+                self.model.load_trainable_state_dict(adapter_state)
 
         if self.device.type == "cuda" and self.config.USE_AMP:
             cast_frozen_base_to_fp16(self.model)
@@ -133,7 +138,7 @@ class ControllableInferencer:
 
 def main():
     parser = argparse.ArgumentParser(description="Controllable Pretrained Image Restoration CLI")
-    parser.add_argument("--model", type=str, required=False, default=None, help="Path to controllable_*.pt adapter checkpoint")
+    parser.add_argument("--model", type=str, required=False, default=None, help="Path to model_best.pt / model_latest.pt checkpoint")
     parser.add_argument("--image", type=str, required=True, help="Path to input image")
     parser.add_argument("--output-dir", type=str, default="./restored", help="Directory to save restored result")
     parser.add_argument(

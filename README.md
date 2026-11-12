@@ -59,10 +59,16 @@ python tests/smoke_test.py
 ```
 
 ### 2. 3-Phase Training (Supports Single-GPU & Multi-GPU e.g. Kaggle 2× T4)
-Checkpoints only store the lightweight trainable LoRA / Skip-VAE / Overlay weights (**~45 MB** instead of 4 GB):
+Checkpoints only store the lightweight trainable LoRA / Skip-VAE / Overlay weights (**~45 MB** instead of 4 GB) as `model_latest.pt` and `model_best.pt`:
 
 ```bash
-# Default: C-RADIOv2.5-B + sd-turbo (3-phase staged training)
+# Kaggle DF2K-OST notebook workflow (safe on both fresh Epoch 1 runs & resumed sessions)
+%run train.py \
+  --train-root /kaggle/input/datasets/thaihoa1476050/df2k-ost/train \
+  --val-root /kaggle/input/datasets/thaihoa1476050/df2k-ost/test/DIV2K_valid \
+  --resume ./checkpoints/model_latest.pt
+
+# Default local DIV2K: C-RADIOv2.5-B + sd-turbo (3-phase staged training)
 python train.py --data-root ./data/DIV2K
 
 # Ultra-lightweight generator + DINOv3+SigLIP2 vision encoders
@@ -77,7 +83,7 @@ python train.py --debug --data-root ./data/DIV2K
 ```bash
 # A) Selective Global Control: Remove 100% noise & brighten exposure 70%, KEEP motion blur untouched!
 python inference.py \
-    --model checkpoints/controllable_best.pt \
+    --model checkpoints/model_best.pt \
     --image sample.jpg \
     --action "noise=1.0,exposure=0.7,motion=0.0" \
     --detail-scale 0.75
@@ -85,7 +91,7 @@ python inference.py \
 # B) 1-Click Localized Object Control: Click subject at (x=0.5, y=0.45) to deblur & denoise subject,
 #    while keeping background panning motion blur intact (only denoising background)!
 python inference.py \
-    --model checkpoints/controllable_best.pt \
+    --model checkpoints/model_best.pt \
     --image panning_car.jpg \
     --point-mask "0.5,0.45" \
     --action "noise=1.0,motion=1.0" \
@@ -93,6 +99,6 @@ python inference.py \
     --detail-scale 1.0
 
 # C) Conservative Pixel-Exact Mode vs. High-Detail Mode (PiSA-SR Dual-LoRA dial, zero retraining)
-python inference.py --model checkpoints/controllable_best.pt --image blurry.jpg --action "all" --detail-scale 0.0
-python inference.py --model checkpoints/controllable_best.pt --image blurry.jpg --action "all" --detail-scale 1.2 --steps 2
+python inference.py --model checkpoints/model_best.pt --image blurry.jpg --action "all" --detail-scale 0.0
+python inference.py --model checkpoints/model_best.pt --image blurry.jpg --action "all" --detail-scale 1.2 --steps 2
 ```

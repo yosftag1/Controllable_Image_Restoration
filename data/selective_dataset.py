@@ -440,8 +440,19 @@ class ControllableRestorationDataset(_TorchDataset):
             crop = np.ascontiguousarray(crop)
         return crop
 
+    def _load_crop_with_retry(self, idx: int, max_attempts: int = 5) -> np.ndarray:
+        n = len(self.image_paths)
+        last_err = None
+        for attempt in range(max_attempts):
+            cand_idx = (idx + attempt) % n
+            try:
+                return self._load_crop(self.image_paths[cand_idx])
+            except Exception as err:
+                last_err = err
+        raise RuntimeError(f"Failed to read valid image after {max_attempts} attempts: {last_err}")
+
     def __getitem__(self, idx):
-        clean_u8 = self._load_crop(self.image_paths[idx])
+        clean_u8 = self._load_crop_with_retry(idx)
         if self.is_train:
             rng = np.random.default_rng()
         else:
@@ -467,39 +478,76 @@ class ControllableRestorationDataset(_TorchDataset):
 
 
 def _collect_images(folder: Path):
+    """Recursively collect image files (following symlinks for Kaggle /kaggle/input mounts)."""
     exts = {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
-    if not folder.exists():
+    folder_str = str(folder)
+    if not os.path.exists(folder_str):
         return []
-    return sorted(p for p in folder.rglob("*") if p.is_file() and p.suffix.lower() in exts)
+    found = []
+    for root_dir, _dirs, files in os.walk(folder_str, followlinks=True):
+        for fname in files:
+            if os.path.splitext(fname)[1].lower() in exts:
+                found.append(Path(os.path.join(root_dir, fname)))
+    return sorted(set(found))
 
 
-def create_controllable_dataset(config, is_train=True):
-    """Discover DIV2K or arbitrary folder images and construct ControllableRestorationDataset."""
-    explicit_dir = config.TRAIN_DATASET_PATH if is_train else config.VAL_DATASET_PATH
+def create_controllable_dataset(config, is_train=True, dataset_path=None):
+    """Discover DIV2K, DF2K-OST, or arbitrary recursive image folders (matching Kaggle workflow)."""
+    split_name = "train" if is_train else "val"
+    explicit_dir = dataset_path or (config.TRAIN_DATASET_PATH if is_train else config.VAL_DATASET_PATH)
+
     if explicit_dir:
-        paths = _collect_images(Path(explicit_dir))
-        if not paths:
-            raise FileNotFoundError(f"No images found in {explicit_dir}")
+        target_root = Path(explicit_dir)
+        div2k_sub = target_root / ("DIV2K_train_HR" if is_train else "DIV2K_valid_HR")
+        # Support both direct DIV2K root and multi-subfolder Kaggle datasets (e.g. df2k-ost/train, test/DIV2K_valid)
+        all_paths = _collect_images(target_root)
+        if not all_paths:
+            raise FileNotFoundError(
+                f"No images found in {target_root}. Verify --{'train' if is_train else 'val'}-root path."
+            )
+        # Only restrict to DIV2K_*_HR if user passed the same shared parent folder for both train and val
+        same_shared_root = (
+            config.TRAIN_DATASET_PATH
+            and config.VAL_DATASET_PATH
+            and os.path.abspath(str(config.TRAIN_DATASET_PATH)) == os.path.abspath(str(config.VAL_DATASET_PATH))
+        )
+        if same_shared_root and div2k_sub.exists():
+            paths = _collect_images(div2k_sub)
+        elif same_shared_root:
+            rng = random.Random(config.SEED)
+            shuffled = list(all_paths)
+            rng.shuffle(shuffled)
+            split_idx = max(1, int(len(shuffled) * 0.9))
+            paths = shuffled[:split_idx] if is_train else shuffled[split_idx:]
+        else:
+            paths = all_paths
+        source_desc = str(target_root)
     else:
         root = Path(config.DATASET_PATH)
         sub = root / ("DIV2K_train_HR" if is_train else "DIV2K_valid_HR")
         if sub.exists():
             paths = _collect_images(sub)
+            source_desc = str(sub)
         else:
+            print(f"No DIV2K folder found at {sub}, falling back to recursive image search in {root}.")
             all_paths = _collect_images(root)
             if not all_paths:
                 raise FileNotFoundError(
-                    f"No images found in {root}. Pass --data-root pointing to DIV2K or an image folder."
+                    f"No images found in {root}. Pass --train-root / --val-root or --data-root."
                 )
             rng = random.Random(config.SEED)
-            rng.shuffle(all_paths)
-            split = max(1, int(len(all_paths) * 0.9))
-            paths = all_paths[:split] if is_train else all_paths[split:]
+            shuffled = list(all_paths)
+            rng.shuffle(shuffled)
+            split_idx = max(1, int(len(shuffled) * 0.9))
+            paths = shuffled[:split_idx] if is_train else shuffled[split_idx:]
+            source_desc = str(root)
 
     limit = config.TRAIN_IMAGES_COUNT if is_train else config.VAL_IMAGES_COUNT
     if limit and 0 < limit < len(paths):
-        paths = paths[:limit]
+        rng = random.Random(config.SEED + (0 if is_train else 1))
+        shuffled = list(paths)
+        rng.shuffle(shuffled)
+        paths = sorted(shuffled[:limit])
 
-    split_name = "train" if is_train else "val"
-    print(f"[{split_name}] Loaded {len(paths)} clean reference images.")
+    print(f"[{split_name}] Using {len(paths)} clean reference images from {source_desc}")
     return ControllableRestorationDataset(paths, config, is_train=is_train)

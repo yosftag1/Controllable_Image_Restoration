@@ -93,7 +93,36 @@ def test_selective_pipeline():
         assert err_zero == 0.0, f"{deg_name}: a=1.0 must reach exact clean image!"
         assert err_full > err_half > 0.0, f"{deg_name}: partial removal a=0.5 must lie strictly between full & clean!"
 
-    print("[PASS] Seed-synchronized selective degradation pipeline (all 8 operators, false-positive safety & masks) verified.")
+    # 6. Kaggle DF2K-OST nested subfolder + symlink dataset discovery check
+    import cv2
+    import tempfile
+    from data.selective_dataset import create_controllable_dataset
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        real_ost = tmp_path / "external_ost" / "outdoor"
+        real_ost.mkdir(parents=True)
+        train_root = tmp_path / "df2k-ost" / "train"
+        (train_root / "DIV2K").mkdir(parents=True)
+        (train_root / "Flickr2K").mkdir(parents=True)
+        val_root = tmp_path / "df2k-ost" / "test" / "DIV2K_valid"
+        val_root.mkdir(parents=True)
+
+        cv2.imwrite(str(train_root / "DIV2K" / "0001.png"), clean)
+        cv2.imwrite(str(train_root / "Flickr2K" / "0002.jpg"), clean)
+        cv2.imwrite(str(real_ost / "0003.png"), clean)
+        os.symlink(str(real_ost), str(train_root / "OST_link"))
+        cv2.imwrite(str(val_root / "0801.png"), clean)
+
+        ds_cfg = Config()
+        ds_cfg.TRAIN_DATASET_PATH = str(train_root)
+        ds_cfg.VAL_DATASET_PATH = str(val_root)
+        train_ds = create_controllable_dataset(ds_cfg, is_train=True)
+        val_ds = create_controllable_dataset(ds_cfg, is_train=False)
+        assert len(train_ds) == 3, f"Expected all 3 nested+symlinked train images, got {len(train_ds)}"
+        assert len(val_ds) == 1, f"Expected 1 val image, got {len(val_ds)}"
+
+    print("[PASS] Seed-synchronized selective degradation pipeline & Kaggle DF2K-OST loader verified.")
 
 
 def test_model_and_stages_mock():

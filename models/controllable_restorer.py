@@ -208,7 +208,7 @@ class ControllableRestorer(nn.Module):
             cross_attn_dim = int(cross_attn_dim)
 
         self.spatial_mod_params: List[nn.Parameter] = []
-        self._attach_unet_spatial_overlays(config)
+        self._attach_unet_spatial_overlays(config, cross_attn_dim=cross_attn_dim)
 
         # 6. Action & Semantic Token Encoder
         self.action_overlay = ActionOverlayEncoder(
@@ -227,20 +227,47 @@ class ControllableRestorer(nn.Module):
         nn.init.zeros_(self.velocity_zero_conv.weight)
         nn.init.zeros_(self.velocity_zero_conv.bias)
 
-    def _attach_unet_spatial_overlays(self, config):
-        """Wrap UNet mid_block and up_blocks with DataParallel-safe 1x1 spatial modulators."""
+    def _attach_unet_spatial_overlays(self, config, cross_attn_dim: int):
+        """Probe exact runtime UNet block output channels and wrap with 1x1 spatial modulators."""
         num_actions = config.NUM_ACTIONS
         mod_hidden = getattr(config, "SPATIAL_MOD_HIDDEN_DIM", 64)
-        block_channels = list(getattr(self.unet.config, "block_out_channels", (320, 640, 1280, 1280)))
 
-        mid_ch = block_channels[-1]
+        in_ch = int(getattr(self.unet.config, "in_channels", 4))
+        first_param = next(self.unet.parameters())
+        unet_dev = first_param.device
+        unet_dtype = first_param.dtype
+
+        probed_channels: Dict[str, int] = {}
+        hooks = []
+
+        def _make_probe_hook(stage_key: str):
+            def _hook(_module, _inputs, output):
+                sample = output[0] if isinstance(output, tuple) else output
+                probed_channels[stage_key] = int(sample.shape[1])
+
+            return _hook
+
+        hooks.append(self.unet.mid_block.register_forward_hook(_make_probe_hook("mid")))
+        for idx, blk in enumerate(self.unet.up_blocks):
+            hooks.append(blk.register_forward_hook(_make_probe_hook(f"up_{idx}")))
+
+        try:
+            with torch.no_grad():
+                dummy_lat = torch.zeros(1, in_ch, 32, 32, device=unet_dev, dtype=unet_dtype)
+                dummy_t = torch.tensor([500], device=unet_dev, dtype=torch.long)
+                dummy_enc = torch.zeros(1, 4, cross_attn_dim, device=unet_dev, dtype=unet_dtype)
+                self.unet(dummy_lat, dummy_t, encoder_hidden_states=dummy_enc)
+        finally:
+            for handle in hooks:
+                handle.remove()
+
+        mid_ch = probed_channels["mid"]
         wrapped_mid = _SpatialModulatedUNetStage(self.unet.mid_block, mid_ch, num_actions, mod_hidden)
         self.unet.mid_block = wrapped_mid
         self.spatial_mod_params.extend(list(wrapped_mid.spatial_mod.parameters()))
 
-        rev_channels = list(reversed(block_channels))
         for idx in range(len(self.unet.up_blocks)):
-            out_ch = rev_channels[min(idx, len(rev_channels) - 1)]
+            out_ch = probed_channels[f"up_{idx}"]
             wrapped_up = _SpatialModulatedUNetStage(self.unet.up_blocks[idx], out_ch, num_actions, mod_hidden)
             self.unet.up_blocks[idx] = wrapped_up
             self.spatial_mod_params.extend(list(wrapped_up.spatial_mod.parameters()))
@@ -302,6 +329,8 @@ class ControllableRestorer(nn.Module):
 
     def load_trainable_state_dict(self, state_dict: Dict[str, torch.Tensor], strict: bool = False):
         """Load lightweight adapter/LoRA/skip/overlay weights on top of frozen pretrained backbones."""
+        if any(k.startswith("module.") for k in state_dict.keys()):
+            state_dict = {k.replace("module.", "", 1): v for k, v in state_dict.items()}
         missing, unexpected = self.load_state_dict(state_dict, strict=False)
         if strict and unexpected:
             raise RuntimeError(f"Unexpected keys when loading controllable adapters: {unexpected}")
@@ -407,7 +436,7 @@ class ControllableRestorer(nn.Module):
 
         return {
             "pred": pred_rgb,
-            "align_loss": align_loss,
+            "align_loss": align_loss.reshape(1),
             "t": t_vec,
         }
 

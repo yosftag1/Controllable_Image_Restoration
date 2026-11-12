@@ -8,6 +8,9 @@ from pathlib import Path
 import random
 import sys
 
+# Kaggle notebook %run path fix & CUDA memory fragmentation prevention
+if "/kaggle/working/Controllable_Image_Restoration" not in sys.path:
+    sys.path.insert(0, "/kaggle/working/Controllable_Image_Restoration")
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import cv2
@@ -40,16 +43,50 @@ def unwrap_model(model: torch.nn.Module) -> ControllableRestorer:
     return model.module if isinstance(model, torch.nn.DataParallel) else model
 
 
-def cast_frozen_base_to_fp16(raw_model: ControllableRestorer):
-    """Keep all trainable adapter/LoRA parameters in FP32 (for GradScaler) while halving frozen base VRAM."""
+def cast_frozen_base_to_fp16(raw_model: ControllableRestorer, force_unet_fp16: bool = False):
+    """Keep norm/custom Vision & VAE layers in FP32 so AMP autocast runs without Float/Half clashes."""
+    if not force_unet_fp16:
+        return
     groups = raw_model.get_stage_parameter_groups()
     trainable_ids = {id(p) for g in groups.values() for p in g}
-    for p in raw_model.parameters():
-        if id(p) not in trainable_ids and p.is_floating_point():
-            p.data = p.data.half()
-    for b in raw_model.buffers():
-        # Keep normalization mean/std buffers in FP32 for numerical precision
-        pass
+    for mod in raw_model.unet.modules():
+        if isinstance(mod, (torch.nn.Conv2d, torch.nn.Linear)):
+            for p in mod.parameters(recurse=False):
+                if id(p) not in trainable_ids and p.is_floating_point():
+                    p.data = p.data.half()
+
+
+def format_gpu_postfix() -> str:
+    """Compact live VRAM readout across all CUDA GPUs for tqdm."""
+    if not torch.cuda.is_available():
+        return "CPU"
+    parts = []
+    for idx in range(torch.cuda.device_count()):
+        try:
+            free_b, total_b = torch.cuda.mem_get_info(idx)
+            used_gb = (total_b - free_b) / (1024 ** 3)
+            total_gb = total_b / (1024 ** 3)
+            parts.append(f"G{idx}:{used_gb:.1f}/{total_gb:.0f}G")
+        except Exception:
+            alloc_gb = torch.cuda.memory_reserved(idx) / (1024 ** 3)
+            parts.append(f"G{idx}:{alloc_gb:.1f}G")
+    return " ".join(parts)
+
+
+def print_gpu_usage(header: str = "GPU Status"):
+    if not torch.cuda.is_available():
+        print(f"[{header}] Running on CPU")
+        return
+    print(f"── {header} ──")
+    for idx in range(torch.cuda.device_count()):
+        name = torch.cuda.get_device_name(idx)
+        try:
+            free_b, total_b = torch.cuda.mem_get_info(idx)
+            used_gb = (total_b - free_b) / (1024 ** 3)
+            total_gb = total_b / (1024 ** 3)
+            print(f"  GPU {idx} ({name}): {used_gb:.2f} / {total_gb:.2f} GB VRAM used")
+        except Exception:
+            print(f"  GPU {idx} ({name})")
 
 
 def determine_epoch_stage(epoch_1based: int, config: Config) -> str:
@@ -94,7 +131,7 @@ def compute_psnr(pred_01: torch.Tensor, tgt_01: torch.Tensor) -> float:
 
 
 @torch.no_grad()
-def evaluate_validation(model, loss_fn, val_loader, device, config, stage: str):
+def evaluate_validation(model, val_loader, device, config, stage: str):
     raw_model = unwrap_model(model)
     raw_model.eval()
     use_amp = config.USE_AMP and (device.type == "cuda")
@@ -104,10 +141,10 @@ def evaluate_validation(model, loss_fn, val_loader, device, config, stage: str):
     total_l1 = 0.0
     count = 0
 
-    for batch in val_loader:
-        src = batch["source"].to(device)
-        tgt = batch["target"].to(device)
-        act = batch["action_map"].to(device)
+    for batch in tqdm(val_loader, desc="Validation", leave=False):
+        src = batch["source"].to(device, non_blocking=True)
+        tgt = batch["target"].to(device, non_blocking=True)
+        act = batch["action_map"].to(device, non_blocking=True)
 
         with torch.amp.autocast("cuda", enabled=use_amp):
             pred = raw_model.sample(
@@ -144,7 +181,7 @@ def save_controllable_validation_grid(model, val_dataset, device, config, epoch:
     rows_canvas = []
 
     for idx in range(num_imgs):
-        clean_u8 = val_dataset._load_crop(val_dataset.image_paths[idx])
+        clean_u8 = val_dataset._load_crop_with_retry(idx)
         h, w = clean_u8.shape[:2]
         rng = np.random.default_rng(config.SEED + 1000 + idx)
         params = pipeline.sample_params(h, w, rng=rng)
@@ -217,7 +254,17 @@ def save_controllable_validation_grid(model, val_dataset, device, config, epoch:
     return str(save_path)
 
 
-def save_checkpoint(raw_model: ControllableRestorer, optimizer, epoch: int, stage: str, best_psnr: float, config: Config, filename: str):
+def save_checkpoint(
+    raw_model: ControllableRestorer,
+    optimizer,
+    scheduler,
+    epoch: int,
+    stage: str,
+    best_psnr: float,
+    config: Config,
+    filename: str,
+):
+    """Save lightweight unwrapped adapter checkpoint (~45 MB) for seamless resuming & inference."""
     ckpt_dir = Path(config.CHECKPOINT_DIR)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     path = ckpt_dir / filename
@@ -226,7 +273,8 @@ def save_checkpoint(raw_model: ControllableRestorer, optimizer, epoch: int, stag
         "stage": stage,
         "best_psnr": best_psnr,
         "trainable_state_dict": raw_model.trainable_state_dict(),
-        "optimizer_state_dict": optimizer.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict() if optimizer is not None else None,
+        "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
         "model_config": {
             "SEMANTIC_ENCODER_TYPE": config.SEMANTIC_ENCODER_TYPE,
             "GENERATOR_BACKBONE": config.GENERATOR_BACKBONE,
@@ -239,10 +287,30 @@ def save_checkpoint(raw_model: ControllableRestorer, optimizer, epoch: int, stag
         },
     }
     torch.save(payload, str(path))
+    print(f"Checkpoint saved to {path}")
     return str(path)
 
 
-def train(config: Config, resume_path: str = None):
+def _wrap_multi_gpu_safely(raw_model: ControllableRestorer, num_gpus: int, device: torch.device, use_amp: bool):
+    """Wrap with DataParallel across GPUs and verify replica compatibility."""
+    device_ids = list(range(num_gpus))
+    dp_model = torch.nn.DataParallel(raw_model, device_ids=device_ids)
+    try:
+        raw_model.eval()
+        with torch.no_grad(), torch.amp.autocast("cuda", enabled=use_amp):
+            dummy_img = torch.zeros(num_gpus, 3, 64, 64, device=device)
+            dummy_act = torch.ones(num_gpus, raw_model.config.NUM_ACTIONS, 64, 64, device=device) * 0.5
+            _ = dp_model(dummy_img, dummy_act, tgt_01=dummy_img, clean_01=dummy_img, fidelity_scale=1.0, detail_scale=0.0)
+        raw_model.train()
+        print(f"✓ Multi-GPU DataParallel ENABLED across {num_gpus} GPUs {device_ids}")
+        return dp_model
+    except Exception as exc:
+        raw_model.train()
+        print(f"[Note] External HF backbone prefers single-device execution ({exc}); running on {device}.")
+        return raw_model
+
+
+def train(config: Config, resume_path: str = None, debug: bool = False, batch_size_overridden: bool = False):
     set_seed(config.SEED)
     gc.collect()
     if torch.cuda.is_available():
@@ -253,8 +321,16 @@ def train(config: Config, resume_path: str = None):
     use_multi_gpu = config.MULTI_GPU and num_gpus > 1
     use_amp = config.USE_AMP and (device.type == "cuda")
 
-    print(f"Device: {device} (GPUs: {num_gpus}) | Backbone: {config.GENERATOR_BACKBONE} | Vision: {config.SEMANTIC_ENCODER_TYPE}")
+    if num_gpus == 1 and not batch_size_overridden and config.BATCH_SIZE >= 8 and not debug:
+        config.BATCH_SIZE = 4
 
+    print(
+        f"Device: {device} (GPUs: {num_gpus}) | Batch Size: {config.BATCH_SIZE} | "
+        f"Backbone: {config.GENERATOR_BACKBONE} | Vision: {config.SEMANTIC_ENCODER_TYPE} | "
+        f"AMP: {'ENABLED' if use_amp else 'DISABLED'}"
+    )
+
+    print("Loading datasets...")
     train_dataset = create_controllable_dataset(config, is_train=True)
     val_dataset = create_controllable_dataset(config, is_train=False)
 
@@ -275,9 +351,6 @@ def train(config: Config, resume_path: str = None):
     )
 
     raw_model = ControllableRestorer(config).to(device)
-    if use_amp:
-        cast_frozen_base_to_fp16(raw_model)
-
     groups = raw_model.get_stage_parameter_groups()
     print(
         f"Trainable Adapter Breakdown -> Vision LoRA: {sum(p.numel() for p in groups['vision_lora']):,} | "
@@ -287,26 +360,42 @@ def train(config: Config, resume_path: str = None):
 
     start_epoch = 1
     best_psnr = -1.0
-    if resume_path:
-        ckpt = torch.load(resume_path, map_location=device)
-        raw_model.load_trainable_state_dict(ckpt["trainable_state_dict"])
-        start_epoch = int(ckpt.get("epoch", 0)) + 1
-        best_psnr = float(ckpt.get("best_psnr", -1.0))
-        print(f"Resumed trainable adapters from {resume_path} (starting at epoch {start_epoch})")
+    resumed_stage = None
+    resumed_opt_state = None
+    resumed_sched_state = None
 
-    model = (
-        torch.nn.DataParallel(raw_model, device_ids=list(range(num_gpus)))
-        if use_multi_gpu
-        else raw_model
-    )
+    if resume_path:
+        if os.path.exists(resume_path):
+            print(f"Resuming from {resume_path}")
+            ckpt = torch.load(resume_path, map_location=device)
+            adapter_state = ckpt.get("trainable_state_dict") or ckpt.get("model_state_dict")
+            if adapter_state is not None:
+                raw_model.load_trainable_state_dict(adapter_state)
+            start_epoch = int(ckpt.get("epoch", 0)) + 1
+            best_psnr = float(ckpt.get("best_psnr", -1.0))
+            resumed_stage = ckpt.get("stage")
+            resumed_opt_state = ckpt.get("optimizer_state_dict")
+            resumed_sched_state = ckpt.get("scheduler_state_dict")
+            print(f"Resumed trainable adapters (starting at Epoch {start_epoch}, best PSNR={best_psnr:.2f} dB)")
+        else:
+            print(f"No checkpoint found at {resume_path} — starting fresh training from Epoch 1.")
+
+    model = _wrap_multi_gpu_safely(raw_model, num_gpus, device, use_amp) if use_multi_gpu else raw_model
     loss_fn = ControllableRestorationLoss(config).to(device)
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp) if device.type == "cuda" else None
+    print_gpu_usage("Pre-Training GPU & VRAM Check")
 
     current_stage = None
     optimizer = None
     scheduler = None
     os.makedirs(config.LOG_DIR, exist_ok=True)
+    history_file = Path(config.LOG_DIR) / "training_history.json"
     history = []
+    if start_epoch > 1 and history_file.exists():
+        try:
+            history = json.loads(history_file.read_text(encoding="utf-8"))
+        except Exception:
+            history = []
 
     for epoch in range(start_epoch, config.EPOCHS + 1):
         stage = determine_epoch_stage(epoch, config)
@@ -317,9 +406,21 @@ def train(config: Config, resume_path: str = None):
             scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=remaining, eta_min=1e-6)
             print(f"\n=== Entering Stage '{stage}' at Epoch {epoch}/{config.EPOCHS} ({active_params:,} active params) ===")
 
+            # Restore optimizer & scheduler momentum if resuming within the exact same stage
+            if epoch == start_epoch and resumed_stage == stage and resumed_opt_state is not None:
+                try:
+                    optimizer.load_state_dict(resumed_opt_state)
+                    if resumed_sched_state is not None:
+                        scheduler.load_state_dict(resumed_sched_state)
+                    print(f"Restored optimizer & scheduler states for stage '{stage}'.")
+                except Exception as exc:
+                    print(f"[Note] Optimizer state re-initialized cleanly for stage '{stage}' ({exc}).")
+                resumed_opt_state = None
+                resumed_sched_state = None
+
         model.train()
         running = {}
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch:03d} [{stage}]")
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch:03d}/{config.EPOCHS} [{stage}]")
 
         for step_idx, batch in enumerate(pbar, start=1):
             clean = batch["clean"].to(device, non_blocking=True)
@@ -335,11 +436,7 @@ def train(config: Config, resume_path: str = None):
                     loss = align_out.float().mean()
                 metrics = {"align": float(loss.detach().item()), "total": float(loss.detach().item())}
             else:
-                # Sample detail_scale dynamically during semantic/joint stages so user slider generalizes across [0, 1.3]
-                if stage == "pixel_stage":
-                    d_scale = 0.0
-                else:
-                    d_scale = float(random.uniform(0.4, 1.25))
+                d_scale = 0.0 if stage == "pixel_stage" else float(random.uniform(0.4, 1.25))
 
                 with torch.amp.autocast("cuda", enabled=use_amp):
                     out = model(
@@ -381,8 +478,11 @@ def train(config: Config, resume_path: str = None):
             if step_idx % config.LOG_INTERVAL == 0 or step_idx == len(train_loader):
                 avg_tot = running["total"] / step_idx
                 avg_al = running.get("align", 0.0) / step_idx
-                pbar.set_postfix({"loss": f"{avg_tot:.4f}", "align": f"{avg_al:.4f}"})
+                pbar.set_postfix(
+                    {"loss": f"{avg_tot:.4f}", "align": f"{avg_al:.4f}", "gpu": format_gpu_postfix()}
+                )
 
+        # Step scheduler BEFORE saving checkpoints so resumed runs have the exact next-epoch LR
         if scheduler is not None:
             scheduler.step()
 
@@ -390,25 +490,28 @@ def train(config: Config, resume_path: str = None):
         epoch_summary["epoch"] = epoch
         epoch_summary["stage"] = stage
 
-        if stage != "align_warmup" and (epoch % config.VAL_EPOCH_INTERVAL == 0):
-            val_metrics = evaluate_validation(model, loss_fn, val_loader, device, config, stage)
+        if stage != "align_warmup" and (epoch % max(1, config.VAL_EPOCH_INTERVAL) == 0 or epoch == config.EPOCHS):
+            val_metrics = evaluate_validation(model, val_loader, device, config, stage)
             epoch_summary.update(val_metrics)
             grid_path = save_controllable_validation_grid(model, val_dataset, device, config, epoch, stage)
             print(
                 f"Epoch {epoch:03d} | train_loss={epoch_summary['total']:.4f} | "
-                f"val_psnr={val_metrics['val_psnr']:.2f} dB | sweep={grid_path}"
+                f"val_psnr={val_metrics['val_psnr']:.2f} dB | val_l1={val_metrics['val_l1']:.4f} | sweep={grid_path}"
             )
 
             if val_metrics["val_psnr"] > best_psnr:
                 best_psnr = val_metrics["val_psnr"]
-                save_checkpoint(raw_model, optimizer, epoch, stage, best_psnr, config, "controllable_best.pt")
+                save_checkpoint(raw_model, optimizer, scheduler, epoch, stage, best_psnr, config, "model_best.pt")
 
-        save_checkpoint(raw_model, optimizer, epoch, stage, best_psnr, config, "controllable_latest.pt")
+        # Always save model_latest.pt after every epoch for seamless Kaggle resuming
+        save_checkpoint(raw_model, optimizer, scheduler, epoch, stage, best_psnr, config, "model_latest.pt")
         if epoch % config.CHECKPOINT_EVERY_N_EPOCHS == 0:
-            save_checkpoint(raw_model, optimizer, epoch, stage, best_psnr, config, f"controllable_epoch_{epoch:03d}.pt")
+            save_checkpoint(
+                raw_model, optimizer, scheduler, epoch, stage, best_psnr, config, f"model_epoch_{epoch:03d}.pt"
+            )
 
         history.append(epoch_summary)
-        with open(Path(config.LOG_DIR) / "training_history.json", "w", encoding="utf-8") as f:
+        with open(history_file, "w", encoding="utf-8") as f:
             json.dump(history, f, indent=2)
 
 
@@ -417,16 +520,19 @@ def main():
     parser.add_argument("--debug", action="store_true", help="Use DebugConfig for quick verification")
     parser.add_argument("--mock", action="store_true", help="Use offline mock_tiny backbones (no HF downloads)")
     parser.add_argument("--data-root", type=str, default=None, help="Dataset root (DIV2K or image folder)")
-    parser.add_argument("--train-root", type=str, default=None, help="Explicit training image folder")
-    parser.add_argument("--val-root", type=str, default=None, help="Explicit validation image folder")
+    parser.add_argument("--train-root", type=str, default=None, help="Explicit training image folder (e.g. Kaggle df2k-ost/train)")
+    parser.add_argument("--val-root", type=str, default=None, help="Explicit validation image folder (e.g. Kaggle DIV2K_valid)")
     parser.add_argument("--output-dir", type=str, default=None, help="Output directory for sweep grids")
     parser.add_argument("--checkpoint-dir", type=str, default=None, help="Directory for adapter checkpoints")
-    parser.add_argument("--resume", type=str, default=None, help="Path to controllable_*.pt checkpoint")
+    parser.add_argument("--log-dir", type=str, default=None, help="Directory for training logs")
+    parser.add_argument("--resume", type=str, default=None, help="Path to model_latest.pt / model_best.pt checkpoint")
     parser.add_argument("--backbone", type=str, choices=["sd-turbo", "tiny-sd", "bk-sdm-tiny", "mock_tiny"], default=None)
     parser.add_argument("--vision-encoder", type=str, choices=["c_radio", "dinov3_siglip2", "mock_tiny"], default=None)
     parser.add_argument("--training-mode", type=str, choices=["staged", "joint"], default=None)
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--epochs", type=int, default=None)
+    parser.add_argument("--align-epochs", type=int, default=None, help="Override Phase-1 Vision LoRA warmup epochs")
+    parser.add_argument("--pixel-epochs", type=int, default=None, help="Override Phase-2 Pixel-LoRA stage epochs")
     parser.add_argument("--num-workers", type=int, default=None)
     args = parser.parse_args()
 
@@ -450,14 +556,25 @@ def main():
         config.OUTPUT_DIR = args.output_dir
     if args.checkpoint_dir:
         config.CHECKPOINT_DIR = args.checkpoint_dir
+    if args.log_dir:
+        config.LOG_DIR = args.log_dir
     if args.batch_size:
         config.BATCH_SIZE = args.batch_size
     if args.epochs:
         config.EPOCHS = args.epochs
+    if args.align_epochs is not None:
+        config.ALIGN_WARMUP_EPOCHS = args.align_epochs
+    if args.pixel_epochs is not None:
+        config.PIXEL_STAGE_EPOCHS = args.pixel_epochs
     if args.num_workers is not None:
         config.NUM_WORKERS = args.num_workers
 
-    train(config, resume_path=args.resume)
+    train(
+        config,
+        resume_path=args.resume,
+        debug=args.debug,
+        batch_size_overridden=(args.batch_size is not None),
+    )
 
 
 if __name__ == "__main__":
