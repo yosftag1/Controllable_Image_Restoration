@@ -9,9 +9,8 @@ Supports:
 
 from contextlib import contextmanager
 import math
-import threading
 import types
-from typing import Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -109,48 +108,108 @@ def make_module_dataparallel_safe(root: nn.Module) -> nn.Module:
     return root
 
 
-_THREAD_STATE = threading.local()
+_DEFAULT_VISION_LORA_ENABLED: bool = True
+_VISION_LORA_BY_DEVICE: Dict[str, bool] = {}
+
+_DEFAULT_LORA_STATE: Tuple[Optional[torch.Tensor], float, float] = (None, 1.0, 0.75)
+_LORA_STATE_BY_DEVICE: Dict[str, Tuple[Optional[torch.Tensor], float, float]] = {}
 
 
-def _get_vision_lora_enabled() -> bool:
-    return getattr(_THREAD_STATE, "vision_lora_enabled", True)
+def _resolve_device_key(
+    device: Optional[torch.device] = None,
+    tensor: Optional[torch.Tensor] = None,
+) -> Optional[str]:
+    """Normalize a torch.device (e.g. 'cuda' -> 'cuda:0') so forward and C++ autograd threads match."""
+    dev = device if device is not None else (tensor.device if tensor is not None else None)
+    if dev is None:
+        return None
+    if isinstance(dev, str):
+        dev = torch.device(dev)
+    if dev.type == "cuda":
+        idx = torch.cuda.current_device() if dev.index is None else dev.index
+        return f"cuda:{idx}"
+    return dev.type
 
 
-def _get_generator_lora_state() -> Tuple[Optional[torch.Tensor], float, float]:
-    return (
-        getattr(_THREAD_STATE, "gen_action_cond", None),
-        getattr(_THREAD_STATE, "gen_lambda_pix", 1.0),
-        getattr(_THREAD_STATE, "gen_lambda_sem", 0.75),
-    )
+def _get_vision_lora_enabled(device: Optional[torch.device] = None) -> bool:
+    if device is not None:
+        key = _resolve_device_key(device=device)
+        if key is not None and key in _VISION_LORA_BY_DEVICE:
+            return _VISION_LORA_BY_DEVICE[key]
+    return _DEFAULT_VISION_LORA_ENABLED
+
+
+def _get_generator_lora_state(
+    device: Optional[torch.device] = None,
+) -> Tuple[Optional[torch.Tensor], float, float]:
+    if device is not None:
+        key = _resolve_device_key(device=device)
+        if key is not None and key in _LORA_STATE_BY_DEVICE:
+            return _LORA_STATE_BY_DEVICE[key]
+    return _DEFAULT_LORA_STATE
 
 
 @contextmanager
-def vision_lora_context(enabled: bool):
+def vision_lora_context(enabled: bool, device: Optional[torch.device] = None):
     """Toggle Vision Encoder LoRA detours on (student) or off (clean self-teacher)."""
-    prev = getattr(_THREAD_STATE, "vision_lora_enabled", True)
-    _THREAD_STATE.vision_lora_enabled = bool(enabled)
-    try:
-        yield
-    finally:
-        _THREAD_STATE.vision_lora_enabled = prev
+    global _DEFAULT_VISION_LORA_ENABLED
+    flag = bool(enabled)
+    key = _resolve_device_key(device=device)
+    if key is not None:
+        had_key = key in _VISION_LORA_BY_DEVICE
+        prev_val = _VISION_LORA_BY_DEVICE.get(key, True)
+        _VISION_LORA_BY_DEVICE[key] = flag
+        try:
+            yield
+        finally:
+            if had_key:
+                _VISION_LORA_BY_DEVICE[key] = prev_val
+            else:
+                _VISION_LORA_BY_DEVICE.pop(key, None)
+    else:
+        prev_default = _DEFAULT_VISION_LORA_ENABLED
+        prev_map = dict(_VISION_LORA_BY_DEVICE)
+        _VISION_LORA_BY_DEVICE.clear()
+        _DEFAULT_VISION_LORA_ENABLED = flag
+        try:
+            yield
+        finally:
+            _VISION_LORA_BY_DEVICE.clear()
+            _VISION_LORA_BY_DEVICE.update(prev_map)
+            _DEFAULT_VISION_LORA_ENABLED = prev_default
 
 
 def set_generator_lora_state(
     action_cond: Optional[torch.Tensor],
     lambda_pix: float = 1.0,
     lambda_sem: float = 0.75,
+    device: Optional[torch.device] = None,
 ) -> None:
-    """Persist thread-local action conditioning across forward + gradient-checkpointed backward."""
-    _THREAD_STATE.gen_action_cond = action_cond
-    _THREAD_STATE.gen_lambda_pix = float(lambda_pix)
-    _THREAD_STATE.gen_lambda_sem = float(lambda_sem)
+    """Persist device-scoped action conditioning across forward + CUDA autograd backward recomputation.
+
+    NOTE: Do NOT use `threading.local()` here — PyTorch's C++ CUDA autograd engine executes
+    non-reentrant checkpoint `unpack_hook` recomputation on a dedicated per-GPU worker thread
+    distinct from the Python main thread that ran `forward()`.
+    """
+    global _DEFAULT_LORA_STATE
+    state = (action_cond, float(lambda_pix), float(lambda_sem))
+    key = _resolve_device_key(device=device, tensor=action_cond)
+    if key is not None:
+        _LORA_STATE_BY_DEVICE[key] = state
+    else:
+        _DEFAULT_LORA_STATE = state
 
 
-def clear_generator_lora_state() -> None:
-    """Release thread-local action conditioning tensor references after backward completes."""
-    _THREAD_STATE.gen_action_cond = None
-    _THREAD_STATE.gen_lambda_pix = 1.0
-    _THREAD_STATE.gen_lambda_sem = 0.75
+def clear_generator_lora_state(device: Optional[torch.device] = None) -> None:
+    """Release device-scoped action conditioning tensor references after backward completes."""
+    global _DEFAULT_LORA_STATE
+    if device is not None:
+        key = _resolve_device_key(device=device)
+        if key is not None:
+            _LORA_STATE_BY_DEVICE.pop(key, None)
+            return
+    _LORA_STATE_BY_DEVICE.clear()
+    _DEFAULT_LORA_STATE = (None, 1.0, 0.75)
 
 
 @contextmanager
@@ -158,19 +217,34 @@ def generator_lora_context(
     action_cond: Optional[torch.Tensor],
     lambda_pix: float = 1.0,
     lambda_sem: float = 0.75,
+    device: Optional[torch.device] = None,
 ):
-    """Provide thread-local action conditioning & Dual-LoRA scales."""
-    prev_cond = getattr(_THREAD_STATE, "gen_action_cond", None)
-    prev_pix = getattr(_THREAD_STATE, "gen_lambda_pix", 1.0)
-    prev_sem = getattr(_THREAD_STATE, "gen_lambda_sem", 0.75)
-
-    set_generator_lora_state(action_cond, lambda_pix=lambda_pix, lambda_sem=lambda_sem)
-    try:
-        yield
-    finally:
-        _THREAD_STATE.gen_action_cond = prev_cond
-        _THREAD_STATE.gen_lambda_pix = prev_pix
-        _THREAD_STATE.gen_lambda_sem = prev_sem
+    """Provide device-scoped action conditioning & Dual-LoRA scales."""
+    global _DEFAULT_LORA_STATE
+    state = (action_cond, float(lambda_pix), float(lambda_sem))
+    key = _resolve_device_key(device=device, tensor=action_cond)
+    if key is not None:
+        had_key = key in _LORA_STATE_BY_DEVICE
+        prev_val = _LORA_STATE_BY_DEVICE.get(key)
+        _LORA_STATE_BY_DEVICE[key] = state
+        try:
+            yield
+        finally:
+            if had_key and prev_val is not None:
+                _LORA_STATE_BY_DEVICE[key] = prev_val
+            else:
+                _LORA_STATE_BY_DEVICE.pop(key, None)
+    else:
+        prev_default = _DEFAULT_LORA_STATE
+        prev_map = dict(_LORA_STATE_BY_DEVICE)
+        _LORA_STATE_BY_DEVICE.clear()
+        _DEFAULT_LORA_STATE = state
+        try:
+            yield
+        finally:
+            _LORA_STATE_BY_DEVICE.clear()
+            _LORA_STATE_BY_DEVICE.update(prev_map)
+            _DEFAULT_LORA_STATE = prev_default
 
 
 class SwitchableLoRALinear(nn.Module):
@@ -213,7 +287,7 @@ class SwitchableLoRALinear(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         base_out = self.base(x)
-        if not _get_vision_lora_enabled():
+        if not _get_vision_lora_enabled(x.device):
             return base_out
         x_in = x if torch.is_autocast_enabled() else x.to(self.lora_A.weight.dtype)
         delta = self.lora_B(self.lora_A(self.dropout(x_in))) * self.scaling
@@ -305,7 +379,7 @@ class ActionDualLoRALinear(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         out = self.base(x)
-        action_cond, lam_pix, lam_sem = _get_generator_lora_state()
+        action_cond, lam_pix, lam_sem = _get_generator_lora_state(x.device)
         if abs(lam_pix) < 1e-6 and abs(lam_sem) < 1e-6:
             return out
 
@@ -375,7 +449,7 @@ class ActionDualLoRAConv2d(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         out = self.base(x)
-        action_cond, lam_pix, lam_sem = _get_generator_lora_state()
+        action_cond, lam_pix, lam_sem = _get_generator_lora_state(x.device)
         if abs(lam_pix) < 1e-6 and abs(lam_sem) < 1e-6:
             return out
 

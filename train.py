@@ -546,7 +546,10 @@ def train(config: Config, resume_path: str = None, debug: bool = False, batch_si
             if os.path.exists(resume_path):
                 if is_main:
                     print(f"Resuming from {resume_path}", flush=True)
-                ckpt = torch.load(resume_path, map_location=device)
+                try:
+                    ckpt = torch.load(resume_path, map_location=device, weights_only=False)
+                except TypeError:
+                    ckpt = torch.load(resume_path, map_location=device)
                 adapter_state = ckpt.get("trainable_state_dict") or ckpt.get("model_state_dict")
                 if adapter_state is not None:
                     raw_model.load_trainable_state_dict(adapter_state)
@@ -625,6 +628,8 @@ def train(config: Config, resume_path: str = None, debug: bool = False, batch_si
                 optimizer, active_params = build_stage_optimizer(raw_model, stage, config)
                 remaining = max(1, config.EPOCHS - epoch + 1)
                 scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=remaining, eta_min=1e-6)
+                if device.type == "cuda":
+                    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
                 if is_main:
                     print(
                         f"\n=== Entering Stage '{stage}' at Epoch {epoch}/{config.EPOCHS} "

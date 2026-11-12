@@ -38,7 +38,10 @@ class ControllableInferencer:
 
         ckpt = None
         if checkpoint_path:
-            ckpt = torch.load(checkpoint_path, map_location=self.device)
+            try:
+                ckpt = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
+            except TypeError:
+                ckpt = torch.load(checkpoint_path, map_location=self.device)
             if "model_config" in ckpt:
                 for key, val in ckpt["model_config"].items():
                     setattr(self.config, key, val)

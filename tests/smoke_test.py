@@ -153,16 +153,34 @@ def test_model_and_stages_mock():
     assert any(p.grad is not None for p in groups["vision_lora"]), "Vision LoRA must receive gradients in Stage 1!"
     assert all(p.grad is None for p in groups["pixel_stage"]), "Pixel stage must be frozen in Stage 1!"
 
-    # Stage 2: Pixel-Faithful Stage
+    # Stage 2: Pixel-Faithful Stage (including cross-thread backward recomputation check for CUDA C++ autograd parity)
+    import threading
+
+    def _backward_on_worker_thread(loss_tensor):
+        err_holder = []
+
+        def _worker():
+            try:
+                loss_tensor.backward()
+            except BaseException as exc:
+                err_holder.append(exc)
+
+        worker = threading.Thread(target=_worker)
+        worker.start()
+        worker.join()
+        if err_holder:
+            raise err_holder[0]
+
     model.zero_grad(set_to_none=True)
     model.set_training_stage("pixel_stage")
     out_s2 = model(src, act_map, tgt_01=tgt, clean_01=clean, fidelity_scale=1.0, detail_scale=0.0)
     loss_s2, _ = loss_fn(out_s2["pred"], tgt, act_map, out_s2["align_loss"], stage="pixel_stage", t_vec=out_s2["t"])
-    loss_s2.backward()
+    _backward_on_worker_thread(loss_s2)
+    model.clear_runtime_contexts()
     assert any(p.grad is not None for p in groups["pixel_stage"]), "Pixel stage must receive gradients in Stage 2!"
     assert all(p.grad is None for p in groups["semantic_stage"]), "Semantic LoRA must stay frozen in Stage 2!"
 
-    # Stage 3: Semantic-Detail Stage
+    # Stage 3: Semantic-Detail Stage (cross-thread backward recomputation check)
     model.zero_grad(set_to_none=True)
     model.set_training_stage("semantic_stage")
     out_s3 = model(src, act_map, tgt_01=tgt, clean_01=clean, fidelity_scale=1.0, detail_scale=1.0)
@@ -175,7 +193,8 @@ def test_model_and_stages_mock():
         t_vec=out_s3["t"],
         semantic_encoder=model.semantic_encoder,
     )
-    loss_s3.backward()
+    _backward_on_worker_thread(loss_s3)
+    model.clear_runtime_contexts()
     assert any(p.grad is not None for p in groups["semantic_stage"]), "Semantic LoRA must receive gradients in Stage 3!"
     assert all(p.grad is None for p in groups["pixel_stage"]), "Pixel stage must stay frozen in Stage 3!"
 

@@ -274,7 +274,7 @@ class SemanticEncoder(nn.Module):
 
     def forward(self, rgb_01: torch.Tensor, use_lora: bool = True) -> Dict[str, torch.Tensor]:
         """Extract semantic features with LoRA switch enabled (degraded input) or disabled (clean teacher)."""
-        with vision_lora_context(enabled=use_lora):
+        with vision_lora_context(enabled=use_lora, device=rgb_01.device):
             global_vec, spatial_tokens, spatial_grid = self._forward_raw(rgb_01)
         return {
             "global": global_vec,

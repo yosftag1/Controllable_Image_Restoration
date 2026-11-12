@@ -10,15 +10,16 @@ Combines:
 """
 
 from contextlib import contextmanager
-import threading
 from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as grad_checkpoint
 
 from .action_overlay import ActionOverlayEncoder, PointwiseSpatialModulator
 from .lora_layers import (
+    _resolve_device_key,
     clear_generator_lora_state,
     generator_lora_context,
     infer_module_device,
@@ -30,27 +31,77 @@ from .semantic_encoder import SemanticEncoder, load_hf_public_safe
 from .skip_vae import SkipConnectedVAE, _MockTinyVAE
 
 
-_SPATIAL_OVERLAY_STATE = threading.local()
+_DEFAULT_SPATIAL_ACTION_MAP: Optional[torch.Tensor] = None
+_SPATIAL_MAP_BY_DEVICE: Dict[str, Optional[torch.Tensor]] = {}
 
 
-def set_spatial_action_map(action_map: Optional[torch.Tensor]) -> None:
-    """Persist thread-local spatial action map across forward + gradient-checkpointed backward."""
-    _SPATIAL_OVERLAY_STATE.action_map = action_map
+def set_spatial_action_map(
+    action_map: Optional[torch.Tensor],
+    device: Optional[torch.device] = None,
+) -> None:
+    """Persist device-scoped spatial action map across forward + CUDA autograd backward recomputation.
+
+    NOTE: Do NOT use `threading.local()` here — PyTorch's C++ CUDA autograd engine executes
+    non-reentrant checkpoint `unpack_hook` recomputation on a dedicated per-GPU worker thread
+    distinct from the Python main thread that ran `forward()`.
+    """
+    global _DEFAULT_SPATIAL_ACTION_MAP
+    key = _resolve_device_key(device=device, tensor=action_map)
+    if key is not None:
+        _SPATIAL_MAP_BY_DEVICE[key] = action_map
+    else:
+        _DEFAULT_SPATIAL_ACTION_MAP = action_map
 
 
-def clear_spatial_action_map() -> None:
-    """Release thread-local spatial action map tensor reference after backward completes."""
-    _SPATIAL_OVERLAY_STATE.action_map = None
+def _get_spatial_action_map(device: Optional[torch.device] = None) -> Optional[torch.Tensor]:
+    if device is not None:
+        key = _resolve_device_key(device=device)
+        if key is not None and key in _SPATIAL_MAP_BY_DEVICE:
+            return _SPATIAL_MAP_BY_DEVICE[key]
+    return _DEFAULT_SPATIAL_ACTION_MAP
+
+
+def clear_spatial_action_map(device: Optional[torch.device] = None) -> None:
+    """Release device-scoped spatial action map tensor references after backward completes."""
+    global _DEFAULT_SPATIAL_ACTION_MAP
+    if device is not None:
+        key = _resolve_device_key(device=device)
+        if key is not None:
+            _SPATIAL_MAP_BY_DEVICE.pop(key, None)
+            return
+    _SPATIAL_MAP_BY_DEVICE.clear()
+    _DEFAULT_SPATIAL_ACTION_MAP = None
 
 
 @contextmanager
-def _spatial_action_context(action_map: Optional[torch.Tensor]):
-    prev = getattr(_SPATIAL_OVERLAY_STATE, "action_map", None)
-    set_spatial_action_map(action_map)
-    try:
-        yield
-    finally:
-        _SPATIAL_OVERLAY_STATE.action_map = prev
+def _spatial_action_context(
+    action_map: Optional[torch.Tensor],
+    device: Optional[torch.device] = None,
+):
+    global _DEFAULT_SPATIAL_ACTION_MAP
+    key = _resolve_device_key(device=device, tensor=action_map)
+    if key is not None:
+        had_key = key in _SPATIAL_MAP_BY_DEVICE
+        prev_val = _SPATIAL_MAP_BY_DEVICE.get(key)
+        _SPATIAL_MAP_BY_DEVICE[key] = action_map
+        try:
+            yield
+        finally:
+            if had_key:
+                _SPATIAL_MAP_BY_DEVICE[key] = prev_val
+            else:
+                _SPATIAL_MAP_BY_DEVICE.pop(key, None)
+    else:
+        prev_default = _DEFAULT_SPATIAL_ACTION_MAP
+        prev_map = dict(_SPATIAL_MAP_BY_DEVICE)
+        _SPATIAL_MAP_BY_DEVICE.clear()
+        _DEFAULT_SPATIAL_ACTION_MAP = action_map
+        try:
+            yield
+        finally:
+            _SPATIAL_MAP_BY_DEVICE.clear()
+            _SPATIAL_MAP_BY_DEVICE.update(prev_map)
+            _DEFAULT_SPATIAL_ACTION_MAP = prev_default
 
 
 class _SpatialModulatedUNetStage(nn.Module):
@@ -76,20 +127,15 @@ class _SpatialModulatedUNetStage(nn.Module):
 
     def forward(self, *args, **kwargs):
         out = self.orig_block(*args, **kwargs)
-        action_map = getattr(_SPATIAL_OVERLAY_STATE, "action_map", None)
+        sample = out[0] if isinstance(out, tuple) else out
+        action_map = _get_spatial_action_map(sample.device)
         if action_map is None:
             return out
 
-        if isinstance(out, tuple):
-            sample = out[0]
-            if action_map.device != sample.device:
-                action_map = action_map.to(sample.device)
-            mod_sample = self.spatial_mod(sample, action_map)
-            return (mod_sample,) + out[1:]
-
-        if action_map.device != out.device:
-            action_map = action_map.to(out.device)
-        return self.spatial_mod(out, action_map)
+        if action_map.device != sample.device:
+            action_map = action_map.to(sample.device)
+        mod_sample = self.spatial_mod(sample, action_map)
+        return (mod_sample,) + out[1:] if isinstance(out, tuple) else mod_sample
 
 
 class _MockTinyUNetBlock(nn.Module):
@@ -98,6 +144,7 @@ class _MockTinyUNetBlock(nn.Module):
     def __init__(self, in_ch: int, out_ch: int, cross_dim: int, stride: int = 1, upsample: bool = False):
         super().__init__()
         self.has_cross_attention = True
+        self.gradient_checkpointing = False
         self.upsample = nn.Upsample(scale_factor=2, mode="nearest") if upsample else None
         self.conv1 = nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=stride, padding=1)
         self.norm1 = nn.GroupNorm(min(8, out_ch), out_ch)
@@ -111,7 +158,7 @@ class _MockTinyUNetBlock(nn.Module):
         self.to_v = nn.Linear(cross_dim, out_ch)
         self.to_out = nn.Linear(out_ch, out_ch)
 
-    def forward(self, x: torch.Tensor, temb: torch.Tensor, encoder_hidden_states: torch.Tensor) -> torch.Tensor:
+    def _forward_impl(self, x: torch.Tensor, temb: torch.Tensor, encoder_hidden_states: torch.Tensor) -> torch.Tensor:
         if self.upsample is not None:
             x = self.upsample(x)
         h = F.silu(self.norm1(self.conv1(x)))
@@ -126,6 +173,11 @@ class _MockTinyUNetBlock(nn.Module):
         attn = F.scaled_dot_product_attention(q, k, v)
         seq_out = self.to_out(attn)
         return h + seq_out.transpose(1, 2).reshape(b, c, hh, ww)
+
+    def forward(self, x: torch.Tensor, temb: torch.Tensor, encoder_hidden_states: torch.Tensor) -> torch.Tensor:
+        if self.gradient_checkpointing and self.training and torch.is_grad_enabled():
+            return grad_checkpoint(self._forward_impl, x, temb, encoder_hidden_states, use_reentrant=False)
+        return self._forward_impl(x, temb, encoder_hidden_states)
 
 
 class _MockTinyUNet(nn.Module):
@@ -165,6 +217,11 @@ class _MockTinyUNet(nn.Module):
             ]
         )
         self.conv_out = nn.Conv2d(c0, 4, kernel_size=3, padding=1)
+
+    def enable_gradient_checkpointing(self, gradient_checkpointing_kwargs=None):
+        for mod in self.modules():
+            if isinstance(mod, _MockTinyUNetBlock):
+                mod.gradient_checkpointing = True
 
     def forward(self, sample: torch.Tensor, timestep: torch.Tensor, encoder_hidden_states: torch.Tensor, return_dict: bool = True):
         if timestep.ndim == 0:
@@ -392,7 +449,7 @@ class ControllableRestorer(nn.Module):
 
     @staticmethod
     def clear_runtime_contexts() -> None:
-        """Clear thread-local LoRA & spatial overlay references after backward() finishes."""
+        """Clear device-scoped LoRA & spatial overlay references after backward() finishes."""
         clear_generator_lora_state()
         clear_spatial_action_map()
 
@@ -418,8 +475,13 @@ class ControllableRestorer(nn.Module):
         if self.training and torch.is_grad_enabled() and not z_in.requires_grad:
             z_in = z_in.detach().requires_grad_(True)
 
-        with generator_lora_context(global_action_cond, lambda_pix=fidelity_scale, lambda_sem=detail_scale):
-            with _spatial_action_context(action_map):
+        with generator_lora_context(
+            global_action_cond,
+            lambda_pix=fidelity_scale,
+            lambda_sem=detail_scale,
+            device=z_in.device,
+        ):
+            with _spatial_action_context(action_map, device=z_in.device):
                 raw_pred = self.unet(
                     z_in,
                     t_unet,
@@ -477,13 +539,21 @@ class ControllableRestorer(nn.Module):
         )
         z_tgt = None
         if use_bridge:
-            with torch.no_grad(), generator_lora_context(None, lambda_pix=0.0, lambda_sem=0.0):
+            with torch.no_grad(), generator_lora_context(
+                None, lambda_pix=0.0, lambda_sem=0.0, device=tgt_01.device
+            ):
                 z_tgt = self.skip_vae.encode_target_latents(tgt_01)
 
-        # 3. Persist thread-local Dual-LoRA & Spatial Overlay state across forward + backward
-        # so gradient-checkpointed UNet and Skip-VAE blocks recompute with identical conditioning.
-        set_generator_lora_state(global_action_cond, lambda_pix=fidelity_scale, lambda_sem=detail_scale)
-        set_spatial_action_map(action_map)
+        # 3. Persist device-scoped Dual-LoRA & Spatial Overlay state across forward + backward
+        # so gradient-checkpointed UNet and Skip-VAE blocks recompute with identical conditioning
+        # even when PyTorch executes CUDA backward hooks on a separate C++ autograd worker thread.
+        set_generator_lora_state(
+            global_action_cond,
+            lambda_pix=fidelity_scale,
+            lambda_sem=detail_scale,
+            device=src_01.device,
+        )
+        set_spatial_action_map(action_map, device=src_01.device)
 
         z_src, enc_skips = self.skip_vae.encode_with_skips(src_01)
 
@@ -561,7 +631,12 @@ class ControllableRestorer(nn.Module):
             act_padded, sem_out["tokens"], sem_out["global"]
         )
 
-        with generator_lora_context(global_action_cond, lambda_pix=fidelity_scale, lambda_sem=detail_scale):
+        with generator_lora_context(
+            global_action_cond,
+            lambda_pix=fidelity_scale,
+            lambda_sem=detail_scale,
+            device=src_padded.device,
+        ):
             z_cur, enc_skips = self.skip_vae.encode_with_skips(src_padded)
 
         t_schedule = torch.linspace(1.0, 0.0, steps + 1, device=src_01.device)
@@ -656,15 +731,27 @@ class _GeneratorParallelStage(nn.Module):
         bsz = src_01.shape[0]
         cross_tokens, global_action_cond = self.action_overlay(action_map, sem_tokens, sem_global)
 
-        with generator_lora_context(global_action_cond, lambda_pix=fidelity_scale, lambda_sem=detail_scale):
-            z_src, enc_skips = self.skip_vae.encode_with_skips(src_01)
-
         use_bridge = torch.rand(1, device=src_01.device).item() < getattr(
             self.config, "MULTI_STEP_TRAIN_PROB", 0.30
         )
+        z_tgt = None
         if use_bridge:
-            with torch.no_grad():
+            with torch.no_grad(), generator_lora_context(
+                None, lambda_pix=0.0, lambda_sem=0.0, device=tgt_01.device
+            ):
                 z_tgt = self.skip_vae.encode_target_latents(tgt_01)
+
+        set_generator_lora_state(
+            global_action_cond,
+            lambda_pix=fidelity_scale,
+            lambda_sem=detail_scale,
+            device=src_01.device,
+        )
+        set_spatial_action_map(action_map, device=src_01.device)
+
+        z_src, enc_skips = self.skip_vae.encode_with_skips(src_01)
+
+        if use_bridge and z_tgt is not None:
             t_vec = torch.empty(bsz, device=src_01.device).uniform_(0.25, 1.0)
             t_4d = t_vec.view(bsz, 1, 1, 1)
             z_t = (1.0 - t_4d) * z_tgt + t_4d * z_src
@@ -675,11 +762,19 @@ class _GeneratorParallelStage(nn.Module):
 
         t_unet = (t_vec.float() * 999.0).round().long().clamp(1, 999)
         unet_dtype = infer_module_dtype(self.unet, fallback=z_t.dtype)
+        z_in = z_t.to(unet_dtype)
+        if self.training and torch.is_grad_enabled() and not z_in.requires_grad:
+            z_in = z_in.detach().requires_grad_(True)
 
-        with generator_lora_context(global_action_cond, lambda_pix=fidelity_scale, lambda_sem=detail_scale):
-            with _spatial_action_context(action_map):
+        with generator_lora_context(
+            global_action_cond,
+            lambda_pix=fidelity_scale,
+            lambda_sem=detail_scale,
+            device=z_in.device,
+        ):
+            with _spatial_action_context(action_map, device=z_in.device):
                 raw_pred = self.unet(
-                    z_t.to(unet_dtype),
+                    z_in,
                     t_unet,
                     encoder_hidden_states=cross_tokens.to(unet_dtype),
                 ).sample.float()

@@ -135,12 +135,6 @@ class SkipConnectedVAE(nn.Module):
             enc_skips[0].shape[1], dec_channels[3], num_actions, mod_hidden
         )
 
-        if self.gradient_checkpointing and hasattr(self.vae, "enable_gradient_checkpointing"):
-            try:
-                self.vae.enable_gradient_checkpointing(gradient_checkpointing_kwargs={"use_reentrant": False})
-            except TypeError:
-                self.vae.enable_gradient_checkpointing()
-
     def _raw_encode(self, x_minus1_to_1: torch.Tensor) -> Tuple[torch.Tensor, List[torch.Tensor]]:
         enc = self.vae.encoder
         vae_dtype = infer_module_dtype(enc, fallback=x_minus1_to_1.dtype)
