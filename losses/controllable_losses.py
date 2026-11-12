@@ -55,30 +55,81 @@ class MultiLayerVGGPerceptual(nn.Module):
         self,
         pred_01: torch.Tensor,
         target_01: torch.Tensor,
+        src_01: Optional[torch.Tensor] = None,
+        spatial_weight: Optional[torch.Tensor] = None,
         sample_weights: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+        active_change_gate: Optional[torch.Tensor] = None,
+        return_contrast: bool = False,
+    ):
         x = (pred_01.float() - self.mean) / self.std
-        y = (target_01.float() - self.mean) / self.std
+        with torch.no_grad():
+            y_in = (target_01.float() - self.mean) / self.std
+            if src_01 is not None and return_contrast:
+                s_in = (src_01.float() - self.mean) / self.std
+                ys_cat = torch.cat([y_in, s_in], dim=0)
+            else:
+                ys_cat = y_in
 
-        total = pred_01.new_zeros((), dtype=torch.float32)
+        total_pos = pred_01.new_zeros((), dtype=torch.float32)
+        total_contrast = pred_01.new_zeros((), dtype=torch.float32)
+        has_src = src_01 is not None and return_contrast
+
         for block in self.slices:
             x = block(x)
             with torch.no_grad():
-                y = block(y)
-            y_det = y.detach()
+                ys_cat = block(ys_cat)
+            if has_src:
+                y_det, s_det = ys_cat.detach().chunk(2, dim=0)
+            else:
+                y_det, s_det = ys_cat.detach(), None
+
+            if spatial_weight is not None:
+                w_l = F.adaptive_avg_pool2d(spatial_weight.float(), output_size=x.shape[-2:])
+                w_l = w_l / w_l.mean(dim=(2, 3), keepdim=True).clamp(min=1e-4)
+            else:
+                w_l = None
 
             # LPIPS unit channel normalization equalizes high-res edge (`relu1_2`) & deep semantic (`relu4_4`) scales
-            x_unit = x / torch.sqrt(torch.sum(x * x, dim=1, keepdim=True) + 1e-10)
-            y_unit = y_det / torch.sqrt(torch.sum(y_det * y_det, dim=1, keepdim=True) + 1e-10)
-            lpips_dist = ((x_unit - y_unit) ** 2).sum(dim=1).mean(dim=(1, 2))
-            raw_l1 = F.l1_loss(x, y_det, reduction="none").mean(dim=(1, 2, 3))
-            diff = lpips_dist + 0.35 * raw_l1
+            x_unit = x / torch.sqrt(torch.sum(x * x, dim=1, keepdim=True) + 1e-8)
+            y_unit = y_det / torch.sqrt(torch.sum(y_det * y_det, dim=1, keepdim=True) + 1e-8)
+            lpips_map = ((x_unit - y_unit) ** 2).sum(dim=1, keepdim=True)
+            l1_map = F.l1_loss(x, y_det, reduction="none").mean(dim=1, keepdim=True)
+
+            if w_l is not None:
+                pos_dist = ((lpips_map + 0.35 * l1_map) * w_l).mean(dim=(1, 2, 3))
+            else:
+                pos_dist = (lpips_map + 0.35 * l1_map).mean(dim=(1, 2, 3))
 
             if sample_weights is not None:
-                total = total + (diff * sample_weights.float()).mean()
+                total_pos = total_pos + (pos_dist * sample_weights.float()).mean()
             else:
-                total = total + diff.mean()
-        return total / max(1, len(self.slices))
+                total_pos = total_pos + pos_dist.mean()
+
+            if s_det is not None:
+                s_unit = s_det / torch.sqrt(torch.sum(s_det * s_det, dim=1, keepdim=True) + 1e-8)
+                neg_lpips = ((x_unit - s_unit) ** 2).sum(dim=1, keepdim=True)
+                neg_l1 = F.l1_loss(x, s_det, reduction="none").mean(dim=1, keepdim=True)
+                ref_lpips = ((s_unit - y_unit) ** 2).sum(dim=1, keepdim=True)
+                ref_l1 = F.l1_loss(s_det, y_det, reduction="none").mean(dim=1, keepdim=True)
+                if w_l is not None:
+                    neg_dist = ((neg_lpips + 0.35 * neg_l1) * w_l).mean(dim=(1, 2, 3))
+                    ref_dist = ((ref_lpips + 0.35 * ref_l1) * w_l).mean(dim=(1, 2, 3))
+                else:
+                    neg_dist = (neg_lpips + 0.35 * neg_l1).mean(dim=(1, 2, 3))
+                    ref_dist = (ref_lpips + 0.35 * ref_l1).mean(dim=(1, 2, 3))
+
+                # Contrastive Restoration Ratio: equals ~2.0 at lazy identity (pred == src) regardless of
+                # whether the artifact is mild banding/blur or heavy noise, and -> 0.0 as pred -> target!
+                cr_sample = pos_dist / (neg_dist + 0.50 * ref_dist.detach() + 1e-3)
+                if active_change_gate is not None:
+                    cr_sample = cr_sample * active_change_gate.float()
+                total_contrast = total_contrast + cr_sample.mean()
+
+        n_layers = max(1, len(self.slices))
+        perc_out = total_pos / n_layers
+        if return_contrast:
+            return perc_out, total_contrast / n_layers
+        return perc_out
 
 
 class VisionAidedDiscriminator(nn.Module):
@@ -191,24 +242,40 @@ class ControllableRestorationLoss(nn.Module):
             use_pretrained=use_vgg,
         )
 
+    def _build_spatial_focus_weight(
+        self,
+        target_01: torch.Tensor,
+        action_map: torch.Tensor,
+        src_01: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Build per-sample normalized spatial focus map concentrating gradients on degraded edges & active masks."""
+        max_act = action_map.float().amax(dim=1, keepdim=True)  # [B, 1, H, W]
+        if src_01 is not None:
+            deg_mag = (target_01.float() - src_01.float()).abs().mean(dim=1, keepdim=True).detach()
+            raw_w = 0.15 + 1.25 * max_act + 8.0 * deg_mag
+            deg_sample = deg_mag.mean(dim=(1, 2, 3))  # [B]
+            active_change_gate = ((deg_sample - 0.008) / 0.020).clamp(0.0, 1.0)
+        else:
+            raw_w = 0.25 + 1.25 * max_act
+            active_change_gate = None
+
+        spatial_w = raw_w / raw_w.mean(dim=(2, 3), keepdim=True).clamp(min=1e-4)
+        return spatial_w.detach(), active_change_gate
+
     def charbonnier_with_preservation_weight(
-        self, pred: torch.Tensor, target: torch.Tensor, action_map: torch.Tensor
+        self, pred: torch.Tensor, target: torch.Tensor, spatial_weight: torch.Tensor
     ) -> torch.Tensor:
         diff_sq = (pred.float() - target.float()) ** 2
         charb = torch.sqrt(diff_sq + self.eps * self.eps)  # [B, 3, H, W]
-
-        # Focus extra supervision on actively edited regions while keeping selective preservation accurate
-        max_act = action_map.float().amax(dim=1, keepdim=True)  # [B, 1, H, W]
-        pixel_weight = 1.0 + 0.30 * max_act
-        return (charb * pixel_weight).mean()
+        return (charb * spatial_weight).mean()
 
     @staticmethod
     def multiscale_color_tone_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        """Low-pass pooled RGB + opponent chroma loss for accurate color-cast, exposure & banding removal."""
+        """Low-pass pooled RGB + opponent chroma loss for accurate color-cast, exposure & 8-bit banding removal."""
         pred_f, tgt_f = pred.float(), target.float()
         total = pred_f.new_zeros((), dtype=torch.float32)
         scales = 0
-        for pool_k in (8, 32):
+        for pool_k in (4, 16, 32):
             if pred_f.shape[-2] >= pool_k and pred_f.shape[-1] >= pool_k:
                 p_low = F.avg_pool2d(pred_f, kernel_size=pool_k, stride=pool_k)
                 t_low = F.avg_pool2d(tgt_f, kernel_size=pool_k, stride=pool_k)
@@ -220,22 +287,33 @@ class ControllableRestorationLoss(nn.Module):
         return total / max(1, scales)
 
     @staticmethod
-    def spatial_gradient_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    def spatial_gradient_loss(
+        pred: torch.Tensor, target: torch.Tensor, spatial_weight: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         pred_f, tgt_f = pred.float(), target.float()
-        dx_p = pred_f[:, :, :, 1:] - pred_f[:, :, :, :-1]
-        dx_t = tgt_f[:, :, :, 1:] - tgt_f[:, :, :, :-1]
-        dy_p = pred_f[:, :, 1:, :] - pred_f[:, :, :-1, :]
-        dy_t = tgt_f[:, :, 1:, :] - tgt_f[:, :, :-1, :]
-        return 0.5 * (F.l1_loss(dx_p, dx_t) + F.l1_loss(dy_p, dy_t))
+        dx_err = ((pred_f[:, :, :, 1:] - pred_f[:, :, :, :-1]) - (tgt_f[:, :, :, 1:] - tgt_f[:, :, :, :-1])).abs()
+        dy_err = ((pred_f[:, :, 1:, :] - pred_f[:, :, :-1, :]) - (tgt_f[:, :, 1:, :] - tgt_f[:, :, :-1, :])).abs()
+        if spatial_weight is not None:
+            wx = 0.5 * (spatial_weight[:, :, :, 1:] + spatial_weight[:, :, :, :-1])
+            wy = 0.5 * (spatial_weight[:, :, 1:, :] + spatial_weight[:, :, :-1, :])
+            return 0.5 * ((dx_err * wx).mean() + (dy_err * wy).mean())
+        return 0.5 * (dx_err.mean() + dy_err.mean())
 
     @staticmethod
     def fft_frequency_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        # Compute in FP32 to prevent FP16 complex FFT overflow
+        # Compute in FP32 to prevent FP16 complex FFT overflow.
+        # Shift-invariant log-magnitude spectrum restores crisp high-frequency deblur/SR energy instead of
+        # averaging uncertain high-freq phases to zero (blur), while anchoring coarse 8x8 layout phase.
         fp = torch.fft.rfft2(pred.float(), norm="ortho")
         ft = torch.fft.rfft2(target.float(), norm="ortho")
-        amp_loss = F.l1_loss(torch.abs(fp), torch.abs(ft))
-        real_imag_loss = F.l1_loss(torch.view_as_real(fp), torch.view_as_real(ft))
-        return 0.5 * (amp_loss + real_imag_loss)
+        log_amp_loss = F.l1_loss(torch.log1p(torch.abs(fp)), torch.log1p(torch.abs(ft)))
+        lh = min(8, fp.shape[-2])
+        lw = min(8, fp.shape[-1])
+        low_phase_loss = F.l1_loss(
+            torch.view_as_real(fp[:, :, :lh, :lw]),
+            torch.view_as_real(ft[:, :, :lh, :lw]),
+        )
+        return 0.80 * log_amp_loss + 0.20 * low_phase_loss
 
     def forward(
         self,
@@ -245,6 +323,7 @@ class ControllableRestorationLoss(nn.Module):
         align_loss: torch.Tensor,
         stage: str = "pixel_stage",
         t_vec: Optional[torch.Tensor] = None,
+        src_01: Optional[torch.Tensor] = None,
         semantic_encoder: Optional[nn.Module] = None,
         discriminator: Optional[nn.Module] = None,
         return_aux: bool = False,
@@ -253,17 +332,18 @@ class ControllableRestorationLoss(nn.Module):
         align_scalar = align_loss.float().mean()
         stage = stage.lower()
 
-        loss_l1 = self.charbonnier_with_preservation_weight(pred_01, target_01, action_map)
-        loss_grad = self.spatial_gradient_loss(pred_01, target_01)
+        spatial_w, active_change_gate = self._build_spatial_focus_weight(target_01, action_map, src_01=src_01)
+        loss_l1 = self.charbonnier_with_preservation_weight(pred_01, target_01, spatial_w)
+        loss_grad = self.spatial_gradient_loss(pred_01, target_01, spatial_weight=spatial_w)
         loss_freq = self.fft_frequency_loss(pred_01, target_01)
         loss_color = self.multiscale_color_tone_loss(pred_01, target_01)
 
         l1_weight = (
-            float(getattr(self.config, "LOSS_SEMANTIC_STAGE_L1_WEIGHT", 0.30))
+            float(getattr(self.config, "LOSS_SEMANTIC_STAGE_L1_WEIGHT", 0.25))
             if stage == "semantic_stage"
             else float(self.config.LOSS_L1_WEIGHT)
         )
-        color_weight = float(getattr(self.config, "LOSS_COLOR_TONE_WEIGHT", 0.30))
+        color_weight = float(getattr(self.config, "LOSS_COLOR_TONE_WEIGHT", 0.45))
 
         total = (
             l1_weight * loss_l1
@@ -277,6 +357,7 @@ class ControllableRestorationLoss(nn.Module):
             total = total + self.config.LOSS_ALIGN_WEIGHT * align_scalar
 
         loss_perc = pred_01.new_zeros((), dtype=torch.float32)
+        loss_contrast = pred_01.new_zeros((), dtype=torch.float32)
         loss_sem_cons = pred_01.new_zeros((), dtype=torch.float32)
         loss_gan = pred_01.new_zeros((), dtype=torch.float32)
         aux: Dict[str, torch.Tensor] = {}
@@ -286,38 +367,50 @@ class ControllableRestorationLoss(nn.Module):
         else:
             t_weights = None
 
-        pix_perc_w = float(getattr(self.config, "LOSS_PIXEL_STAGE_PERCEPTUAL_WEIGHT", 0.85))
+        perc_w = (
+            float(getattr(self.config, "LOSS_PIXEL_STAGE_PERCEPTUAL_WEIGHT", 1.25))
+            if stage == "pixel_stage"
+            else float(self.config.LOSS_PERCEPTUAL_WEIGHT)
+        )
+        contrast_w = float(getattr(self.config, "LOSS_CONTRAST_WEIGHT", 0.45))
+        sem_w = (
+            float(getattr(self.config, "LOSS_PIXEL_STAGE_SEM_WEIGHT", 0.25))
+            if stage == "pixel_stage"
+            else float(self.config.LOSS_SEM_CONSISTENCY_WEIGHT)
+        )
         gan_w = float(getattr(self.config, "LOSS_GAN_WEIGHT", 0.20))
+        use_gan = stage in ("semantic_stage", "joint") and discriminator is not None and gan_w > 0.0
 
-        if stage == "pixel_stage" and pix_perc_w > 0.0:
-            # Strong LPIPS-VGG structural supervision in Phase 2 defeats blurry L1 averages & 8-bit banding rings
-            loss_perc = self.perceptual(pred_01, target_01, sample_weights=t_weights)
-            total = total + pix_perc_w * loss_perc
-        elif stage in ("semantic_stage", "joint"):
-            loss_perc = self.perceptual(pred_01, target_01, sample_weights=t_weights)
-            total = total + self.config.LOSS_PERCEPTUAL_WEIGHT * loss_perc
-
-            need_sem = semantic_encoder is not None and (
-                self.config.LOSS_SEM_CONSISTENCY_WEIGHT > 0.0
-                or (discriminator is not None and gan_w > 0.0)
+        if perc_w > 0.0 or (contrast_w > 0.0 and src_01 is not None):
+            loss_perc, loss_contrast = self.perceptual(
+                pred_01,
+                target_01,
+                src_01=src_01 if contrast_w > 0.0 else None,
+                spatial_weight=spatial_w,
+                sample_weights=t_weights,
+                active_change_gate=active_change_gate,
+                return_contrast=True,
             )
-            if need_sem:
-                pred_sem = semantic_encoder(pred_01, use_lora=False)
-                with torch.no_grad():
-                    tgt_sem = semantic_encoder(target_01, use_lora=False)
+            total = total + perc_w * loss_perc + contrast_w * loss_contrast
 
-                if self.config.LOSS_SEM_CONSISTENCY_WEIGHT > 0.0:
-                    p_tok = F.normalize(pred_sem["tokens"].float(), dim=-1)
-                    g_tok = F.normalize(tgt_sem["tokens"].float().detach(), dim=-1)
-                    loss_sem_cons = (1.0 - (p_tok * g_tok).sum(dim=-1)).mean()
-                    total = total + self.config.LOSS_SEM_CONSISTENCY_WEIGHT * loss_sem_cons
+        need_sem = semantic_encoder is not None and (sem_w > 0.0 or use_gan)
+        if need_sem:
+            pred_sem = semantic_encoder(pred_01, use_lora=False)
+            with torch.no_grad():
+                tgt_sem = semantic_encoder(target_01, use_lora=False)
 
-                if discriminator is not None and gan_w > 0.0:
-                    logits_rgb, logits_sem = discriminator(pred_01, pred_sem["grid"], action_map)
-                    loss_gan = VisionAidedDiscriminator.generator_hinge_loss(logits_rgb, logits_sem, action_map)
-                    total = total + gan_w * loss_gan
-                    aux["pred_grid"] = pred_sem["grid"].detach()
-                    aux["tgt_grid"] = tgt_sem["grid"].detach()
+            if sem_w > 0.0:
+                p_tok = F.normalize(pred_sem["tokens"].float(), dim=-1)
+                g_tok = F.normalize(tgt_sem["tokens"].float().detach(), dim=-1)
+                loss_sem_cons = (1.0 - (p_tok * g_tok).sum(dim=-1)).mean()
+                total = total + sem_w * loss_sem_cons
+
+            if use_gan:
+                logits_rgb, logits_sem = discriminator(pred_01, pred_sem["grid"], action_map)
+                loss_gan = VisionAidedDiscriminator.generator_hinge_loss(logits_rgb, logits_sem, action_map)
+                total = total + gan_w * loss_gan
+                aux["pred_grid"] = pred_sem["grid"].detach()
+                aux["tgt_grid"] = tgt_sem["grid"].detach()
 
         metrics = {
             "l1": float(loss_l1.detach().item()),
@@ -326,6 +419,7 @@ class ControllableRestorationLoss(nn.Module):
             "color": float(loss_color.detach().item()),
             "align": float(align_scalar.detach().item()),
             "perc": float(loss_perc.detach().item()),
+            "contrast": float(loss_contrast.detach().item()),
             "sem_cons": float(loss_sem_cons.detach().item()),
             "gan": float(loss_gan.detach().item()),
             "total": float(total.detach().item()),

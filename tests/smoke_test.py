@@ -42,9 +42,10 @@ def test_selective_pipeline():
         + cfg.ACTION_DIST_IDENTITY
     )
     assert abs(dist_sum - 1.0) < 1e-6, f"Action distribution must sum to 1.0, got {dist_sum}"
-    assert cfg.RESTORATION_MAX_TIMESTEP == 999 and cfg.INITIAL_VELOCITY_SCALE == 1.0
+    assert cfg.RESTORATION_MAX_TIMESTEP == 499 and cfg.INITIAL_VELOCITY_SCALE == 1.0
     assert cfg.MULTI_STEP_TRAIN_PROB == 0.0 and cfg.PROMPT_SEQ_LEN == 77
-    assert "relu1_2" in cfg.PERCEPTUAL_LAYERS and cfg.LOSS_PIXEL_STAGE_PERCEPTUAL_WEIGHT >= 0.5
+    assert "relu1_2" in cfg.PERCEPTUAL_LAYERS and cfg.LOSS_PIXEL_STAGE_PERCEPTUAL_WEIGHT >= 1.0
+    assert cfg.LOSS_CONTRAST_WEIGHT > 0.0 and cfg.LOSS_PIXEL_STAGE_SEM_WEIGHT > 0.0
     pipe = SelectiveDegradationPipeline(cfg)
     rng = np.random.default_rng(123)
 
@@ -237,7 +238,17 @@ def test_model_and_stages_mock():
     model.zero_grad(set_to_none=True)
     model.set_training_stage("pixel_stage")
     out_s2 = model(src, act_map, tgt_01=tgt, clean_01=clean, fidelity_scale=1.0, detail_scale=0.0)
-    loss_s2, _ = loss_fn(out_s2["pred"], tgt, act_map, out_s2["align_loss"], stage="pixel_stage", t_vec=out_s2["t"])
+    loss_s2, metrics_s2 = loss_fn(
+        out_s2["pred"],
+        tgt,
+        act_map,
+        out_s2["align_loss"],
+        stage="pixel_stage",
+        t_vec=out_s2["t"],
+        src_01=src,
+        semantic_encoder=model.semantic_encoder,
+    )
+    assert metrics_s2["contrast"] > 0.0 and metrics_s2["sem_cons"] >= 0.0
     _backward_on_worker_thread(loss_s2)
     model.clear_runtime_contexts()
     assert all(p.grad is not None for p in groups["pixel_stage"]), (
@@ -258,6 +269,7 @@ def test_model_and_stages_mock():
         out_s3["align_loss"],
         stage="semantic_stage",
         t_vec=out_s3["t"],
+        src_01=src,
         semantic_encoder=model.semantic_encoder,
         discriminator=disc,
         return_aux=True,

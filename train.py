@@ -295,8 +295,9 @@ def save_controllable_validation_grid(
             ]
         elif scenario_id == 1:
             # Row 1: Defocus Blur + 8-bit Color Banding + Warm Color Cast
-            params.rgb_gains = np.array([1.25, 1.02, 0.76], dtype=np.float32)
-            params.saturation_scale = 0.88
+            params.color_gains_unit = np.array([0.85, 0.15, -0.75], dtype=np.float32)
+            params.hue_shift_unit = 0.25
+            params.sat_loss_frac = 0.45
             s_demo[pipeline.type_to_idx["defocus_blur"]] = 0.80
             s_demo[pipeline.type_to_idx["color_banding"]] = 0.82
             s_demo[pipeline.type_to_idx["color_degradation"]] = 0.85
@@ -751,14 +752,14 @@ def train(
                         elif resumed_stage == "semantic_stage":
                             eff_rem_pix = 0
                         else:
-                            eff_rem_pix = 4
+                            eff_rem_pix = 3
                     if eff_extra is None and not epochs_overridden:
                         if resumed_stage == "pixel_stage":
-                            eff_extra = int(eff_rem_pix or 0) + 5
+                            eff_extra = int(eff_rem_pix or 0) + 6
                         elif resumed_stage == "semantic_stage":
-                            eff_extra = 4
+                            eff_extra = 5
                         else:
-                            eff_extra = int(eff_rem_pix or 4) + 5
+                            eff_extra = int(eff_rem_pix or 3) + 6
 
                 if eff_rem_pix is not None:
                     config.ALIGN_WARMUP_EPOCHS = min(config.ALIGN_WARMUP_EPOCHS, max(0, last_epoch))
@@ -791,7 +792,7 @@ def train(
                 if speedrun:
                     if not pixel_epochs_overridden:
                         config.ALIGN_WARMUP_EPOCHS = 1
-                        config.PIXEL_STAGE_EPOCHS = 4
+                        config.PIXEL_STAGE_EPOCHS = 3
                     if not epochs_overridden:
                         config.EPOCHS = 10
                 if is_main:
@@ -1016,9 +1017,8 @@ def train(
                                 align_loss=out["align_loss"],
                                 stage=stage,
                                 t_vec=out["t"],
-                                semantic_encoder=(
-                                    raw_model.semantic_encoder if stage in ("semantic_stage", "joint") else None
-                                ),
+                                src_01=src,
+                                semantic_encoder=raw_model.semantic_encoder,
                                 discriminator=raw_disc,
                                 return_aux=True,
                             )
@@ -1096,12 +1096,20 @@ def train(
                         elif stage == "pixel_stage":
                             avg_l1 = running.get("l1", 0.0) / step_idx
                             avg_perc = running.get("perc", 0.0) / step_idx
-                            loss_parts = f"loss={avg_tot:.4f} l1={avg_l1:.4f} perc={avg_perc:.4f} align={avg_al:.4f}"
+                            avg_cr = running.get("contrast", 0.0) / step_idx
+                            loss_parts = (
+                                f"loss={avg_tot:.4f} l1={avg_l1:.4f} perc={avg_perc:.4f} "
+                                f"cr={avg_cr:.3f} align={avg_al:.4f}"
+                            )
                         else:
                             avg_l1 = running.get("l1", 0.0) / step_idx
                             avg_perc = running.get("perc", 0.0) / step_idx
+                            avg_cr = running.get("contrast", 0.0) / step_idx
                             avg_d = running.get("d_loss", 0.0) / step_idx
-                            loss_parts = f"loss={avg_tot:.4f} l1={avg_l1:.4f} perc={avg_perc:.4f} d={avg_d:.3f}"
+                            loss_parts = (
+                                f"loss={avg_tot:.4f} l1={avg_l1:.4f} perc={avg_perc:.4f} "
+                                f"cr={avg_cr:.3f} d={avg_d:.3f}"
+                            )
                         print(
                             f"[Epoch {epoch:03d}/{config.EPOCHS} | {stage}] "
                             f"{step_idx:0{step_width}d}/{num_steps} ({pct:5.1f}%) | "
@@ -1278,7 +1286,7 @@ def main():
         config.SAMPLE_EVERY_N_STEPS = 200
         if not args.resume:
             config.ALIGN_WARMUP_EPOCHS = 1
-            config.PIXEL_STAGE_EPOCHS = 4
+            config.PIXEL_STAGE_EPOCHS = 3
             config.EPOCHS = 10
     if args.epochs:
         config.EPOCHS = args.epochs

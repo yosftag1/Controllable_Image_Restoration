@@ -452,13 +452,10 @@ class ControllableRestorer(nn.Module):
             base_prompt_embeds=base_prompt_embeds,
         )
 
-        # 7. Native Euler/DDPM Step Scale + Zero-Init Residual Head
+        # 7. Native DDPM Step Scale (no linear shortcut outside UNet — 100% of restoration flows through UNet+LoRA!)
         latent_ch = int(getattr(self.unet.config, "out_channels", 4))
         init_scale = float(getattr(config, "INITIAL_VELOCITY_SCALE", 1.0))
         self.velocity_scale = nn.Parameter(torch.full((1, latent_ch, 1, 1), init_scale))
-        self.velocity_zero_conv = nn.Conv2d(latent_ch, latent_ch, kernel_size=1)
-        nn.init.zeros_(self.velocity_zero_conv.weight)
-        nn.init.zeros_(self.velocity_zero_conv.bias)
 
     def _attach_unet_spatial_overlays(self, config, cross_attn_dim: int, prompt_seq_len: int = 77):
         """Probe exact runtime UNet block & `temb` dimensions and wrap with action modulators."""
@@ -493,7 +490,7 @@ class ControllableRestorer(nn.Module):
         try:
             with torch.no_grad():
                 dummy_lat = torch.zeros(1, in_ch, 32, 32, device=unet_dev, dtype=unet_dtype)
-                dummy_t = torch.tensor([int(getattr(config, "RESTORATION_MAX_TIMESTEP", 999))], device=unet_dev, dtype=torch.long)
+                dummy_t = torch.tensor([int(getattr(config, "RESTORATION_MAX_TIMESTEP", 499))], device=unet_dev, dtype=torch.long)
                 dummy_enc = torch.zeros(1, prompt_seq_len, cross_attn_dim, device=unet_dev, dtype=unet_dtype)
                 self.unet(dummy_lat, dummy_t, encoder_hidden_states=dummy_enc)
         finally:
@@ -535,7 +532,6 @@ class ControllableRestorer(nn.Module):
             + list(self.action_overlay.parameters())
             + list(self.spatial_mod_params)
             + [self.velocity_scale]
-            + list(self.velocity_zero_conv.parameters())
         )
         semantic_params = (
             list(self.unet_sem_lora_params)
@@ -643,13 +639,13 @@ class ControllableRestorer(nn.Module):
         fidelity_scale: float,
         detail_scale: float,
     ) -> torch.Tensor:
-        """Predict clean target latent `hat_z_0` via Pix2Pix-Turbo / S3Diff 1-step DDPM formulation."""
+        """Predict clean target latent `hat_z_0` at SD-Turbo's native ADD mid-timestep (default t=499)."""
         if t_cont.ndim == 0:
             t_cont = t_cont.unsqueeze(0)
         if t_cont.shape[0] == 1 and z_t.shape[0] > 1:
             t_cont = t_cont.expand(z_t.shape[0])
 
-        max_t = int(getattr(self.config, "RESTORATION_MAX_TIMESTEP", 999))
+        max_t = int(getattr(self.config, "RESTORATION_MAX_TIMESTEP", 499))
         num_sched = int(self.alphas_cumprod.numel())
         t_unet = (t_cont.float() * float(max_t)).round().long().clamp(1, num_sched - 1)
 
@@ -659,12 +655,11 @@ class ControllableRestorer(nn.Module):
             else self.alphas_cumprod.to(z_t.device)
         )
         alpha_bar = abar_table.index_select(0, t_unet).view(-1, 1, 1, 1).float()
-        sqrt_alpha_bar = torch.sqrt(alpha_bar.clamp(min=1e-6))        # = 0.068265 at t=999
-        sqrt_one_minus = torch.sqrt((1.0 - alpha_bar).clamp(min=0.0))  # = 0.997667 at t=999
+        sqrt_alpha_bar = torch.sqrt(alpha_bar.clamp(min=1e-6))        # = 0.5269 at t=499
+        sqrt_one_minus = torch.sqrt((1.0 - alpha_bar).clamp(min=0.0))  # = 0.8499 at t=499
 
         unet_dtype = infer_module_dtype(self.unet, fallback=z_t.dtype)
-        # Pix2Pix-Turbo / S3Diff: feed unit-variance encoded latent `z_t` UN-ATTENUATED at t=999!
-        # (`DDPMScheduler.scale_model_input` is identity; z_src already has variance ~1.0 matching N(0, I))
+        # Feed unit-variance encoded latent `z_t` directly into VP-DDPM UNet at t=499
         z_in = z_t.to(unet_dtype)
         if self.training and torch.is_grad_enabled() and not z_in.requires_grad:
             z_in = z_in.detach().requires_grad_(True)
@@ -682,18 +677,15 @@ class ControllableRestorer(nn.Module):
                     encoder_hidden_states=cross_tokens.to(unet_dtype),
                 ).sample.float()
 
-        t_4d = t_cont.float().view(-1, 1, 1, 1)
-        zero_res = t_4d * self.velocity_zero_conv(z_t.float()).float()
         if self.prediction_type == "v_prediction":
-            return sqrt_alpha_bar * z_t.float() - sqrt_one_minus * (self.velocity_scale * raw_pred) - zero_res
+            return sqrt_alpha_bar * z_t.float() - sqrt_one_minus * (self.velocity_scale * raw_pred)
         if self.prediction_type == "sample":
-            return z_t.float() + self.velocity_scale * (raw_pred - z_t.float()) - zero_res
+            return z_t.float() + self.velocity_scale * (raw_pred - z_t.float())
 
         # Default ("epsilon", e.g. sd-turbo / tiny-sd / bk-sdm-tiny):
-        # Exact FP32 `DDPMScheduler.step` 1-step jump (t=999 -> prev_t=-1):
-        # hat_z_0 = (z_enc - sqrt(1 - alpha_bar_t) * eps_theta) / sqrt(alpha_bar_t)
+        # Exact FP32 `DDPMScheduler.step` 1-step jump from t=499 -> 0 (1/sqrt_abar = 1.90x, sigma = 1.61x):
         eps_pred = self.velocity_scale * raw_pred
-        return (z_t.float() - sqrt_one_minus * eps_pred) / sqrt_alpha_bar - zero_res
+        return (z_t.float() - sqrt_one_minus * eps_pred) / sqrt_alpha_bar
 
     def _apply_zero_action_lock(
         self, src_01: torch.Tensor, pred_01: torch.Tensor, action_map: torch.Tensor
@@ -1082,7 +1074,6 @@ class _GeneratorParallelStage(nn.Module):
         self.skip_vae = restorer.skip_vae
         self.unet = restorer.unet
         self.velocity_scale = restorer.velocity_scale
-        self.velocity_zero_conv = restorer.velocity_zero_conv
 
     def forward(
         self,

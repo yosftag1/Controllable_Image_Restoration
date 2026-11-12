@@ -314,12 +314,13 @@ class SelectiveDegradationPipeline:
 
         elif u < p_sel + p_part:
             for idx in active_indices:
-                if rng.random() < 0.80:
-                    action[idx] = float(rng.uniform(0.15, 0.90))
+                if rng.random() < 0.85:
+                    action[idx] = float(rng.uniform(0.25, 0.90))
 
         elif u < p_sel + p_part + p_full:
-            if rng.random() < 0.50:
-                # Explicitly include global 'all' ([1, 1, ..., 1]) so '--action all' stays strictly in-distribution
+            if rng.random() < 0.20:
+                # Keep global 'all' ([1, 1, ..., 1]) in-distribution (20% of FULL) without flooding
+                # inactive sliders with 2:1 false-positive no-op supervision!
                 action[:] = 1.0
             else:
                 for idx in active_indices:
