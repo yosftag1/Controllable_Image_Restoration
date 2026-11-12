@@ -508,7 +508,17 @@ def inject_generator_dual_lora(
     alpha: float = 16.0,
     include_conv: bool = True,
     linear_keywords: Iterable[str] = ("to_q", "to_k", "to_v", "to_out", "proj_in", "proj_out", "ff.net"),
-    conv_keywords: Iterable[str] = ("conv1", "conv2", "proj_in", "proj_out"),
+    conv_keywords: Iterable[str] = (
+        "conv_in",
+        "conv_out",
+        "conv_shortcut",
+        "conv1",
+        "conv2",
+        "downsamplers",
+        "upsamplers",
+        "proj_in",
+        "proj_out",
+    ),
 ) -> Tuple[List[nn.Parameter], List[nn.Parameter]]:
     """Freeze `model` and inject ActionDualLoRA into attention/FFN linears and ResNet convs.
 

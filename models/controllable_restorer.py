@@ -10,7 +10,9 @@ Combines:
 """
 
 from contextlib import contextmanager
+import gc
 import math
+import os
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -117,6 +119,48 @@ def _build_default_alphas_cumprod(
     ) ** 2
     alphas = 1.0 - betas
     return torch.cumprod(alphas, dim=0).float()
+
+
+def _precompute_openclip_prompt_embeds(
+    repo_id: str,
+    prompt: str,
+    cross_attn_dim: int,
+    prompt_seq_len: int = 77,
+) -> torch.Tensor:
+    """Precompute native CLIP/OpenCLIP prompt tokens once on CPU (0 MB runtime text-encoder GPU VRAM)."""
+    is_rank0 = os.environ.get("RANK", "0") == "0"
+    try:
+        from transformers import AutoTokenizer, CLIPTextModel
+
+        tokenizer = load_hf_public_safe(AutoTokenizer.from_pretrained, repo_id, subfolder="tokenizer")
+        text_encoder = load_hf_public_safe(CLIPTextModel.from_pretrained, repo_id, subfolder="text_encoder")
+        text_encoder.eval()
+        max_len = int(getattr(tokenizer, "model_max_length", prompt_seq_len) or prompt_seq_len)
+        if max_len <= 0 or max_len > 256:
+            max_len = prompt_seq_len
+        with torch.no_grad():
+            text_inputs = tokenizer(
+                [prompt],
+                padding="max_length",
+                max_length=max_len,
+                truncation=True,
+                return_tensors="pt",
+            )
+            out = text_encoder(text_inputs.input_ids)
+            embeds = (out[0] if isinstance(out, (tuple, list)) else out.last_hidden_state).detach().clone().float().cpu()
+        del text_encoder, tokenizer, out, text_inputs
+        gc.collect()
+        if embeds.ndim == 3 and embeds.shape[-1] == cross_attn_dim:
+            if is_rank0:
+                print(
+                    f"[PromptAnchor] Precomputed native CLIP prompt {tuple(embeds.shape)} on CPU (0 MB text-encoder VRAM)",
+                    flush=True,
+                )
+            return embeds
+    except Exception as exc:
+        if is_rank0:
+            print(f"[PromptAnchor] Fallback zero prompt anchor ({exc})", flush=True)
+    return torch.zeros(1, prompt_seq_len, cross_attn_dim, dtype=torch.float32)
 
 
 class _ActionModulatedTimeEmbedding(nn.Module):
@@ -321,12 +365,14 @@ class ControllableRestorer(nn.Module):
         # 1. Pretrained Vision Semantic Encoder + Self-Teacher LoRA
         self.semantic_encoder = SemanticEncoder(config)
 
-        # 2. Load Pretrained AutoencoderKL, UNet2DConditionModel & native DDPM/Euler schedule
+        # 2. Load Pretrained AutoencoderKL, UNet2DConditionModel & native DDPM 1-step schedule
         alphas_cumprod = _build_default_alphas_cumprod()
         prediction_type = "epsilon"
+        repo_id = None
         if backbone_key == "mock_tiny":
             raw_vae = _MockTinyVAE(base_ch=32)
             raw_unet = _MockTinyUNet()
+            prediction_type = "sample"  # Keep random-init unit test mock well-scaled without t=999 1/sqrt(alpha_bar)
         else:
             from diffusers import AutoencoderKL, DDPMScheduler, UNet2DConditionModel
 
@@ -344,10 +390,10 @@ class ControllableRestorer(nn.Module):
         self.prediction_type = prediction_type
         self.register_buffer("alphas_cumprod", alphas_cumprod, persistent=False)
 
-        # 3. Wrap VAE with Action-Suppressed Skip Bridges + Encoder Dual-LoRA
+        # 3. Wrap VAE with Action-Suppressed Skip Bridges + Encoder & Decoder Dual-LoRA
         self.skip_vae = SkipConnectedVAE(raw_vae, config)
 
-        # 4. Inject Action-Modulated Dual-LoRA (Pixel-LoRA + Semantic-LoRA) into UNet
+        # 4. Inject Action-Modulated Dual-LoRA (Pixel-LoRA + Semantic-LoRA, incl. conv_in/conv_out) into UNet
         self.unet = raw_unet
         self.unet_pix_lora_params, self.unet_sem_lora_params = inject_generator_dual_lora(
             self.unet,
@@ -371,18 +417,39 @@ class ControllableRestorer(nn.Module):
         else:
             cross_attn_dim = int(cross_attn_dim)
 
+        prompt_seq_len = int(getattr(config, "PROMPT_SEQ_LEN", 77))
+        if repo_id is not None:
+            pos_prompt = str(
+                getattr(
+                    config,
+                    "DEFAULT_POS_PROMPT",
+                    "a high-resolution, sharp, clean, natural photograph, detailed texture, smooth gradients, accurate colors, crisp focus",
+                )
+            )
+            base_prompt_embeds = _precompute_openclip_prompt_embeds(
+                repo_id=repo_id,
+                prompt=pos_prompt,
+                cross_attn_dim=cross_attn_dim,
+                prompt_seq_len=prompt_seq_len,
+            )
+            prompt_seq_len = int(base_prompt_embeds.shape[1])
+        else:
+            base_prompt_embeds = torch.zeros(1, prompt_seq_len, cross_attn_dim, dtype=torch.float32)
+
         self.spatial_mod_params: List[nn.Parameter] = []
         self.temb_pix_params: List[nn.Parameter] = []
         self.temb_sem_params: List[nn.Parameter] = []
-        self._attach_unet_spatial_overlays(config, cross_attn_dim=cross_attn_dim)
+        self._attach_unet_spatial_overlays(config, cross_attn_dim=cross_attn_dim, prompt_seq_len=prompt_seq_len)
 
-        # 6. Action & Semantic Token Encoder
+        # 6. Action & Semantic Token Encoder anchored on SD-Turbo's 77-token OpenCLIP prompt embedding
         self.action_overlay = ActionOverlayEncoder(
             num_actions=config.NUM_ACTIONS,
             sem_spatial_dim=self.semantic_encoder.spatial_dim,
             sem_global_dim=self.semantic_encoder.global_dim,
             cross_attn_dim=cross_attn_dim,
             action_hidden_dim=config.ACTION_HIDDEN_DIM,
+            prompt_seq_len=prompt_seq_len,
+            base_prompt_embeds=base_prompt_embeds,
         )
 
         # 7. Native Euler/DDPM Step Scale + Zero-Init Residual Head
@@ -393,7 +460,7 @@ class ControllableRestorer(nn.Module):
         nn.init.zeros_(self.velocity_zero_conv.weight)
         nn.init.zeros_(self.velocity_zero_conv.bias)
 
-    def _attach_unet_spatial_overlays(self, config, cross_attn_dim: int):
+    def _attach_unet_spatial_overlays(self, config, cross_attn_dim: int, prompt_seq_len: int = 77):
         """Probe exact runtime UNet block & `temb` dimensions and wrap with action modulators."""
         num_actions = config.NUM_ACTIONS
         mod_hidden = getattr(config, "SPATIAL_MOD_HIDDEN_DIM", 64)
@@ -426,8 +493,8 @@ class ControllableRestorer(nn.Module):
         try:
             with torch.no_grad():
                 dummy_lat = torch.zeros(1, in_ch, 32, 32, device=unet_dev, dtype=unet_dtype)
-                dummy_t = torch.tensor([249], device=unet_dev, dtype=torch.long)
-                dummy_enc = torch.zeros(1, 4, cross_attn_dim, device=unet_dev, dtype=unet_dtype)
+                dummy_t = torch.tensor([int(getattr(config, "RESTORATION_MAX_TIMESTEP", 999))], device=unet_dev, dtype=torch.long)
+                dummy_enc = torch.zeros(1, prompt_seq_len, cross_attn_dim, device=unet_dev, dtype=unet_dtype)
                 self.unet(dummy_lat, dummy_t, encoder_hidden_states=dummy_enc)
         finally:
             for handle in hooks:
@@ -576,25 +643,29 @@ class ControllableRestorer(nn.Module):
         fidelity_scale: float,
         detail_scale: float,
     ) -> torch.Tensor:
-        """Predict clean target latent `hat_z_0` using native `sd-turbo` Euler/DDPM preconditioning."""
+        """Predict clean target latent `hat_z_0` via Pix2Pix-Turbo / S3Diff 1-step DDPM formulation."""
         if t_cont.ndim == 0:
             t_cont = t_cont.unsqueeze(0)
         if t_cont.shape[0] == 1 and z_t.shape[0] > 1:
             t_cont = t_cont.expand(z_t.shape[0])
 
-        max_t = int(getattr(self.config, "RESTORATION_MAX_TIMESTEP", 249))
+        max_t = int(getattr(self.config, "RESTORATION_MAX_TIMESTEP", 999))
         num_sched = int(self.alphas_cumprod.numel())
         t_unet = (t_cont.float() * float(max_t)).round().long().clamp(1, num_sched - 1)
 
-        abar_table = self.alphas_cumprod if self.alphas_cumprod.device == z_t.device else self.alphas_cumprod.to(z_t.device)
+        abar_table = (
+            self.alphas_cumprod
+            if self.alphas_cumprod.device == z_t.device
+            else self.alphas_cumprod.to(z_t.device)
+        )
         alpha_bar = abar_table.index_select(0, t_unet).view(-1, 1, 1, 1).float()
-        sqrt_alpha_bar = torch.sqrt(alpha_bar.clamp(min=1e-6))        # = 0.8218 at t=249
-        sqrt_one_minus = torch.sqrt((1.0 - alpha_bar).clamp(min=0.0))  # = 0.5698 at t=249
-        sigma_t = sqrt_one_minus / sqrt_alpha_bar                     # = 0.6932 at t=249
+        sqrt_alpha_bar = torch.sqrt(alpha_bar.clamp(min=1e-6))        # = 0.068265 at t=999
+        sqrt_one_minus = torch.sqrt((1.0 - alpha_bar).clamp(min=0.0))  # = 0.997667 at t=999
 
         unet_dtype = infer_module_dtype(self.unet, fallback=z_t.dtype)
-        # Match EulerDiscreteScheduler.scale_model_input (`sample / sqrt(sigma^2 + 1) == sqrt(alpha_bar) * sample`)
-        z_in = (z_t.float() * sqrt_alpha_bar).to(unet_dtype)
+        # Pix2Pix-Turbo / S3Diff: feed unit-variance encoded latent `z_t` UN-ATTENUATED at t=999!
+        # (`DDPMScheduler.scale_model_input` is identity; z_src already has variance ~1.0 matching N(0, I))
+        z_in = z_t.to(unet_dtype)
         if self.training and torch.is_grad_enabled() and not z_in.requires_grad:
             z_in = z_in.detach().requires_grad_(True)
 
@@ -612,17 +683,17 @@ class ControllableRestorer(nn.Module):
                 ).sample.float()
 
         t_4d = t_cont.float().view(-1, 1, 1, 1)
-        zero_res = t_4d * self.velocity_zero_conv(z_t.float())
+        zero_res = t_4d * self.velocity_zero_conv(z_t.float()).float()
         if self.prediction_type == "v_prediction":
-            step_delta = sqrt_one_minus * self.velocity_scale * raw_pred + zero_res
-            return z_t.float() - step_delta
+            return sqrt_alpha_bar * z_t.float() - sqrt_one_minus * (self.velocity_scale * raw_pred) - zero_res
         if self.prediction_type == "sample":
             return z_t.float() + self.velocity_scale * (raw_pred - z_t.float()) - zero_res
 
         # Default ("epsilon", e.g. sd-turbo / tiny-sd / bk-sdm-tiny):
-        # Exact Euler/DDPM `pred_original_sample` = (z_in - sqrt_one_minus * eps) / sqrt_alpha_bar = z_t - sigma_t * eps
-        step_delta = sigma_t * self.velocity_scale * raw_pred + zero_res
-        return z_t.float() - step_delta
+        # Exact FP32 `DDPMScheduler.step` 1-step jump (t=999 -> prev_t=-1):
+        # hat_z_0 = (z_enc - sqrt(1 - alpha_bar_t) * eps_theta) / sqrt(alpha_bar_t)
+        eps_pred = self.velocity_scale * raw_pred
+        return (z_t.float() - sqrt_one_minus * eps_pred) / sqrt_alpha_bar - zero_res
 
     def _apply_zero_action_lock(
         self, src_01: torch.Tensor, pred_01: torch.Tensor, action_map: torch.Tensor
@@ -666,9 +737,9 @@ class ControllableRestorer(nn.Module):
             action_map, sem_out["tokens"], sem_out["global"]
         )
 
-        # 2. Sample Rectified Flow bridge target first (clean base VAE latents under no_grad)
+        # 2. Sample optional Rectified Flow bridge target (disabled by default: MULTI_STEP_TRAIN_PROB = 0.0)
         use_bridge = torch.rand(1, device=src_01.device).item() < getattr(
-            self.config, "MULTI_STEP_TRAIN_PROB", 0.30
+            self.config, "MULTI_STEP_TRAIN_PROB", 0.0
         )
         z_tgt = None
         if use_bridge:
@@ -793,62 +864,66 @@ class ControllableRestorer(nn.Module):
         # Pad non-8-divisible resolutions cleanly for the 8x latent UNet, then crop back
         pad_h = (8 - h % 8) % 8
         pad_w = (8 - w % 8) % 8
-        if pad_h > 0 or pad_w > 0:
-            src_padded = F.pad(src_01, (0, pad_w, 0, pad_h), mode="reflect")
-            act_padded = F.pad(action_map, (0, pad_w, 0, pad_h), mode="replicate")
-        else:
-            src_padded = src_01
-            act_padded = action_map
-
-        sem_out = self.semantic_encoder(src_padded, use_lora=True)
-        cross_tokens, global_action_cond = self.action_overlay(
-            act_padded, sem_out["tokens"], sem_out["global"]
-        )
-        del sem_out
-
-        with generator_lora_context(
-            global_action_cond,
-            lambda_pix=fidelity_scale,
-            lambda_sem=detail_scale,
-            device=src_padded.device,
-        ):
-            z_cur, enc_skips = self.skip_vae.encode_with_skips(src_padded)
-
-        t_schedule = torch.linspace(1.0, 0.0, steps + 1, device=src_01.device)
+        steps = max(1, int(steps))
         trajectory: List[torch.Tensor] = [src_01.clone()] if return_trajectory else []
+        cur_rgb = src_01
 
         for i in range(steps):
-            t_cur_scalar = float(t_schedule[i].item())
-            t_next_scalar = float(t_schedule[i + 1].item())
-            t_cur = t_schedule[i].expand(bsz)
-            hat_z_0 = self._predict_clean_latent(
-                z_t=z_cur,
-                t_cont=t_cur,
-                cross_tokens=cross_tokens,
-                global_action_cond=global_action_cond,
-                action_map=act_padded,
-                fidelity_scale=fidelity_scale,
-                detail_scale=detail_scale,
+            rem_scale = 1.0 if i == 0 else max(0.25, 1.0 - float(i) / float(steps))
+            act_step = action_map * rem_scale if rem_scale < 1.0 else action_map
+
+            if pad_h > 0 or pad_w > 0:
+                cur_padded = F.pad(cur_rgb, (0, pad_w, 0, pad_h), mode="reflect")
+                act_padded = F.pad(act_step, (0, pad_w, 0, pad_h), mode="replicate")
+            else:
+                cur_padded = cur_rgb
+                act_padded = act_step
+
+            sem_out = self.semantic_encoder(cur_padded, use_lora=True)
+            cross_tokens, global_action_cond = self.action_overlay(
+                act_padded, sem_out["tokens"], sem_out["global"]
             )
-            step_ratio = (t_cur_scalar - t_next_scalar) / max(1e-6, t_cur_scalar)
-            z_cur = z_cur + step_ratio * (hat_z_0 - z_cur)
-            del hat_z_0
+            del sem_out
 
-            if return_trajectory and i < steps - 1:
-                mid_rgb = self.skip_vae.decode_with_skips(z_cur, enc_skips, act_padded)[:, :, :h, :w]
-                trajectory.append(self._apply_zero_action_lock(src_01, mid_rgb, action_map))
+            # Keep generator_lora_context active across encode + UNet + decode so BOTH VAE Encoder & Decoder LoRAs fire!
+            with generator_lora_context(
+                global_action_cond,
+                lambda_pix=fidelity_scale,
+                lambda_sem=detail_scale,
+                device=cur_padded.device,
+            ):
+                z_enc, enc_skips = self.skip_vae.encode_with_skips(cur_padded)
+                t_ones = torch.ones(bsz, device=cur_padded.device, dtype=torch.float32)
+                hat_z_0 = self._predict_clean_latent(
+                    z_t=z_enc,
+                    t_cont=t_ones,
+                    cross_tokens=cross_tokens,
+                    global_action_cond=global_action_cond,
+                    action_map=act_padded,
+                    fidelity_scale=fidelity_scale,
+                    detail_scale=detail_scale,
+                )
+                raw_rgb = self.skip_vae.decode_with_skips(
+                    hat_z_0, enc_skips, act_padded, release_skips=True
+                )[:, :, :h, :w]
 
-        del cross_tokens, global_action_cond
-        raw_rgb = self.skip_vae.decode_with_skips(
-            z_cur, enc_skips, act_padded, release_skips=True
-        )[:, :, :h, :w]
-        del z_cur, enc_skips
-        final_rgb = self._apply_zero_action_lock(src_01, raw_rgb, action_map)
+            del z_enc, hat_z_0, enc_skips, cross_tokens, global_action_cond
+            step_rgb = self._apply_zero_action_lock(src_01, raw_rgb, action_map)
+
+            if steps == 1:
+                cur_rgb = step_rgb
+            else:
+                blend = 1.0 if i == steps - 1 else min(1.0, (1.0 / float(steps - i)) + 0.35)
+                cur_rgb = self._apply_zero_action_lock(
+                    src_01, (cur_rgb + blend * (step_rgb - cur_rgb)).clamp(0.0, 1.0), action_map
+                )
+
+            if return_trajectory:
+                trajectory.append(cur_rgb)
 
         if return_trajectory:
-            trajectory.append(final_rgb)
-            return final_rgb, trajectory
-        return final_rgb
+            return cur_rgb, trajectory
+        return cur_rgb
 
     @torch.no_grad()
     def sample(
@@ -1023,7 +1098,7 @@ class _GeneratorParallelStage(nn.Module):
         cross_tokens, global_action_cond = self.action_overlay(action_map, sem_tokens, sem_global)
 
         use_bridge = torch.rand(1, device=src_01.device).item() < getattr(
-            self.config, "MULTI_STEP_TRAIN_PROB", 0.20
+            self.config, "MULTI_STEP_TRAIN_PROB", 0.0
         )
         z_tgt = None
         if use_bridge:

@@ -12,7 +12,7 @@ Implements:
 """
 
 import math
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -72,7 +72,7 @@ class PointwiseSpatialModulator(nn.Module):
 
 
 class ActionOverlayEncoder(nn.Module):
-    """Fuses spatial action overlays and semantic vision features into generator tokens."""
+    """Anchors slider & semantic tokens onto SD-Turbo's native 77-token OpenCLIP prompt manifold."""
 
     def __init__(
         self,
@@ -81,13 +81,30 @@ class ActionOverlayEncoder(nn.Module):
         sem_global_dim: int,
         cross_attn_dim: int,
         action_hidden_dim: int = 128,
-        tokens_per_action: int = 4,
+        tokens_per_action: int = 5,
+        prompt_seq_len: int = 77,
+        base_prompt_embeds: Optional[torch.Tensor] = None,
     ):
         super().__init__()
         self.num_actions = num_actions
         self.cross_attn_dim = cross_attn_dim
         self.action_hidden_dim = action_hidden_dim
-        self.tokens_per_action = max(1, int(tokens_per_action))
+
+        if base_prompt_embeds is not None:
+            prompt_seq_len = int(base_prompt_embeds.shape[1])
+            embed_buf = base_prompt_embeds.detach().clone().float()
+        else:
+            prompt_seq_len = max(num_actions + 2, int(prompt_seq_len))
+            embed_buf = torch.zeros(1, prompt_seq_len, cross_attn_dim, dtype=torch.float32)
+
+        self.prompt_seq_len = prompt_seq_len
+        self.tokens_per_action = min(
+            max(1, int(tokens_per_action)),
+            max(1, (self.prompt_seq_len - 2) // max(1, num_actions)),
+        )
+        self.op_token_count = self.num_actions * self.tokens_per_action
+        self.vis_spatial_count = max(1, self.prompt_seq_len - self.op_token_count - 1)  # 36 (6x6) when seq_len=77
+        self.register_buffer("base_prompt_embeds", embed_buf, persistent=False)
 
         # Per-operation learned identity basis + preserve/active anchors
         self.op_identity = nn.Parameter(torch.randn(num_actions, action_hidden_dim) * 0.02)
@@ -105,20 +122,32 @@ class ActionOverlayEncoder(nn.Module):
             nn.LayerNorm(action_hidden_dim),
         )
 
-        # Expand each operation into `tokens_per_action` salient cross-attention register tokens (e.g. 8*4 = 32 tokens)
-        self.op_token_proj = nn.Sequential(
-            nn.Linear(action_hidden_dim, cross_attn_dim * self.tokens_per_action),
-        )
+        # Near-zero-initialized prompt-delta heads so Step 0 starts on SD-Turbo's exact OpenCLIP manifold
+        self.op_token_proj = nn.Linear(action_hidden_dim, cross_attn_dim * self.tokens_per_action)
         self.op_token_norm = nn.LayerNorm(cross_attn_dim)
+        self.op_token_out = nn.Linear(cross_attn_dim, cross_attn_dim)
+        nn.init.normal_(self.op_token_out.weight, mean=0.0, std=1e-3)
+        nn.init.zeros_(self.op_token_out.bias)
 
-        # Project clean-aligned semantic vision patch tokens into UNet cross-attention space
         self.sem_token_proj = nn.Sequential(
             nn.LayerNorm(sem_spatial_dim),
             nn.Linear(sem_spatial_dim, cross_attn_dim),
             nn.GELU(),
-            nn.Linear(cross_attn_dim, cross_attn_dim),
             nn.LayerNorm(cross_attn_dim),
         )
+        self.sem_token_out = nn.Linear(cross_attn_dim, cross_attn_dim)
+        nn.init.normal_(self.sem_token_out.weight, mean=0.0, std=1e-3)
+        nn.init.zeros_(self.sem_token_out.bias)
+
+        self.sem_global_token_proj = nn.Sequential(
+            nn.LayerNorm(sem_global_dim),
+            nn.Linear(sem_global_dim, cross_attn_dim),
+            nn.GELU(),
+            nn.LayerNorm(cross_attn_dim),
+        )
+        self.sem_global_token_out = nn.Linear(cross_attn_dim, cross_attn_dim)
+        nn.init.normal_(self.sem_global_token_out.weight, mean=0.0, std=1e-3)
+        nn.init.zeros_(self.sem_global_token_out.bias)
 
         # Balanced Global Conditioning: dedicated slider highway + normalized semantic context
         self.action_summary_mlp = nn.Sequential(
@@ -185,13 +214,29 @@ class ActionOverlayEncoder(nn.Module):
         op_in = torch.cat([basis, f_mean, f_max, raw_stats], dim=-1)
         op_feat = self.op_feat_mlp(op_in)           # [B, K, action_hidden_dim]
 
-        op_tokens = self.op_token_proj(op_feat).view(
-            bsz, self.num_actions * self.tokens_per_action, self.cross_attn_dim
-        )
-        op_tokens = self.op_token_norm(op_tokens)   # [B, K * tokens_per_action, cross_attn_dim]
+        op_tokens = self.op_token_proj(op_feat).view(bsz, self.op_token_count, self.cross_attn_dim)
+        op_tokens = self.op_token_out(F.silu(self.op_token_norm(op_tokens)))  # [B, 40, cross_attn_dim]
 
-        vis_tokens = self.sem_token_proj(sem_tokens.float())  # [B, N_p, cross_attn_dim]
-        cross_attn_tokens = torch.cat([vis_tokens, op_tokens], dim=1)
+        # Resolution-invariant 2D pooling (e.g. 16x16 or 32x32 -> 6x6 = 36 scene tokens) so 256px train == 512px tile eval
+        n_p = sem_tokens.shape[1]
+        side = int(math.isqrt(n_p))
+        target_side = int(math.isqrt(self.vis_spatial_count))
+        if side * side == n_p and target_side * target_side == self.vis_spatial_count:
+            grid_2d = sem_tokens.float().transpose(1, 2).reshape(bsz, -1, side, side)
+            pooled_vis = F.adaptive_avg_pool2d(grid_2d, (target_side, target_side)).flatten(2).transpose(1, 2)
+        else:
+            pooled_vis = F.adaptive_avg_pool1d(sem_tokens.float().transpose(1, 2), self.vis_spatial_count).transpose(1, 2)
+
+        vis_spatial_tokens = self.sem_token_out(self.sem_token_proj(pooled_vis))  # [B, 36, cross_attn_dim]
+        vis_global_token = self.sem_global_token_out(
+            self.sem_global_token_proj(sem_global.float().unsqueeze(1))
+        )  # [B, 1, cross_attn_dim]
+
+        delta_tokens = torch.cat([vis_spatial_tokens, vis_global_token, op_tokens], dim=1)  # [B, 77, cross_attn_dim]
+        base_prompt = self.base_prompt_embeds
+        if base_prompt.device != delta_tokens.device or base_prompt.dtype != delta_tokens.dtype:
+            base_prompt = base_prompt.to(device=delta_tokens.device, dtype=delta_tokens.dtype)
+        cross_attn_tokens = base_prompt.expand(bsz, -1, -1) + delta_tokens
 
         # Direct residual highway from the 8 sliders so image content never drowns out slider values
         action_vec = self.action_summary_mlp(op_feat.reshape(bsz, -1))

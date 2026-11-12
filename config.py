@@ -46,18 +46,27 @@ class Config:
     UNET_LORA_ALPHA = 16.0
     VAE_ENC_LORA_RANK = 8
     VAE_ENC_LORA_ALPHA = 8.0
+    VAE_DEC_LORA_RANK = 8
+    VAE_DEC_LORA_ALPHA = 8.0
+
+    # Native OpenCLIP quality prompt anchor (precomputed once on CPU -> 0 MB text-encoder GPU VRAM)
+    DEFAULT_POS_PROMPT = (
+        "a high-resolution, sharp, clean, natural photograph, detailed texture, "
+        "smooth gradients, accurate colors, crisp focus"
+    )
+    PROMPT_SEQ_LEN = 77
 
     # Default inference Dual-LoRA scales
     DEFAULT_FIDELITY_SCALE = 1.0   # lambda_pix: strict structural & color accuracy
     DEFAULT_DETAIL_SCALE = 0.75    # lambda_sem: perceptual/semantic texture synthesis (0.0 = conservative)
 
-    # Latent Euler/DDPM Turbo Preconditioning & High-Res Tiled Inference
-    DEFAULT_INFERENCE_STEPS = 1    # 1 step default; supports 2-4 steps for severe compound cases
-    RESTORATION_MAX_TIMESTEP = 249 # Native sd-turbo ADD step (c_in=0.822, sigma=0.693; avoids t=999 noise collapse)
+    # Pix2Pix-Turbo / S3Diff 1-Step t=999 DDPM Generative Formulation & High-Res Tiled Inference
+    DEFAULT_INFERENCE_STEPS = 1    # 1 step default; supports 2-4 iterative refinement steps
+    RESTORATION_MAX_TIMESTEP = 999 # Full Pix2Pix-Turbo / S3Diff generative prior step (un-attenuated z_enc + DDPM step)
     INFERENCE_TILE_SIZE = 512      # Seamless overlapping tile size for 2K/4K photos (0 = untiled)
     INFERENCE_TILE_OVERLAP = 96    # Raised-cosine feather overlap in pixels between adjacent tiles
-    MULTI_STEP_TRAIN_PROB = 0.20   # 80% t=1.0 (1-step direct), 20% t~U(0.35, 1.0) (enables 2-4 step trajectory)
-    INITIAL_VELOCITY_SCALE = 1.0   # Native 1.0x Euler/DDPM step scale (previously 0.15 throttled 99% of UNet output)
+    MULTI_STEP_TRAIN_PROB = 0.0    # Pure 1-step t=999 training (matches Pix2Pix-Turbo / S3Diff; avoids mixed-t blur)
+    INITIAL_VELOCITY_SCALE = 1.0   # Native 1.0x DDPM eps prediction scale
     SKIP_DROPOUT_PROB = 0.50       # Drop encoder skips on 50% of train samples so UNet masters all 8 tasks directly
 
     # -------------------------------------------------------------------------
@@ -144,27 +153,29 @@ class Config:
     #   Phase 2 (Next PIXEL_STAGE_EPOCHS):       Train Pixel-LoRA + Skip-VAE + Action Overlay (lambda_sem=0)
     #   Phase 3 (Remaining epochs):              Freeze Pixel-LoRA & Skip-VAE; train Semantic-LoRA for crisp detail
     TRAINING_MODE = "staged"
-    EPOCHS = 24
+    EPOCHS = 20
     ALIGN_WARMUP_EPOCHS = 1
-    PIXEL_STAGE_EPOCHS = 12        # Epochs 2..13 = Pixel-Faithful Stage; Epochs 14..24 = Semantic-Detail Stage
+    PIXEL_STAGE_EPOCHS = 8         # Epochs 2..9 = Pixel-Faithful Stage; Epochs 10..20 = Semantic-Detail + GAN Stage
 
     LEARNING_RATE = 2e-4
     VISION_LORA_LR = 1e-4
+    DISC_LR = 1e-4
     WEIGHT_DECAY = 1e-4
     GRAD_CLIP_NORM = 1.0
     CHECKPOINT_EVERY_N_EPOCHS = 5
 
-    # Loss weights
+    # Loss weights (Pix2Pix-Turbo / S3Diff strong perceptual + Vision-Aided GAN calibration)
     LOSS_L1_WEIGHT = 1.0
-    LOSS_SEMANTIC_STAGE_L1_WEIGHT = 0.35  # Relax pixelwise L1 in Phase 3 so Semantic-LoRA synthesizes crisp detail
+    LOSS_SEMANTIC_STAGE_L1_WEIGHT = 0.30  # Relax pixelwise L1 in Phase 3 so Semantic-LoRA + GAN synthesize crisp detail
     LOSS_GRADIENT_WEIGHT = 0.25
     LOSS_FREQUENCY_WEIGHT = 0.10
-    LOSS_COLOR_TONE_WEIGHT = 0.25  # Multi-scale pooled RGB + chroma loss for white-balance, exposure & debanding
+    LOSS_COLOR_TONE_WEIGHT = 0.30  # Multi-scale pooled RGB + chroma loss for white-balance, exposure & debanding
     LOSS_ALIGN_WEIGHT = 0.15       # Self-Teacher vision encoder feature alignment
-    LOSS_PIXEL_STAGE_PERCEPTUAL_WEIGHT = 0.10  # Structural VGG supervision in Phase 2 to prevent blurry L1 averages
-    LOSS_PERCEPTUAL_WEIGHT = 0.35  # Strong perceptual sharpness in Phase 3 (Semantic-LoRA)
-    LOSS_SEM_CONSISTENCY_WEIGHT = 0.25  # Semantic feature match between restored & target in Phase 3
-    PERCEPTUAL_LAYERS = ["relu2_2", "relu3_4", "relu4_4"]
+    LOSS_PIXEL_STAGE_PERCEPTUAL_WEIGHT = 0.85  # Strong LPIPS-VGG supervision in Phase 2 to defeat blur & 8-bit banding
+    LOSS_PERCEPTUAL_WEIGHT = 1.50  # Strong LPIPS-VGG perceptual sharpness in Phase 3 (Semantic-LoRA)
+    LOSS_SEM_CONSISTENCY_WEIGHT = 0.35  # C-RADIO semantic patch consistency between restored & target in Phase 3
+    LOSS_GAN_WEIGHT = 0.20         # Vision-Aided Spectral-Norm PatchGAN loss in Phase 3 for realistic crisp textures
+    PERCEPTUAL_LAYERS = ["relu1_2", "relu2_2", "relu3_4", "relu4_4"]
 
     # Logging & Validation Sweeps
     # Clean line-based logging by default so Kaggle background runs / piped logs never flood with \r bars

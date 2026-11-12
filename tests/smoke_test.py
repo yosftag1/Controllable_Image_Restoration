@@ -42,7 +42,9 @@ def test_selective_pipeline():
         + cfg.ACTION_DIST_IDENTITY
     )
     assert abs(dist_sum - 1.0) < 1e-6, f"Action distribution must sum to 1.0, got {dist_sum}"
-    assert cfg.RESTORATION_MAX_TIMESTEP == 249 and cfg.INITIAL_VELOCITY_SCALE == 1.0
+    assert cfg.RESTORATION_MAX_TIMESTEP == 999 and cfg.INITIAL_VELOCITY_SCALE == 1.0
+    assert cfg.MULTI_STEP_TRAIN_PROB == 0.0 and cfg.PROMPT_SEQ_LEN == 77
+    assert "relu1_2" in cfg.PERCEPTUAL_LAYERS and cfg.LOSS_PIXEL_STAGE_PERCEPTUAL_WEIGHT >= 0.5
     pipe = SelectiveDegradationPipeline(cfg)
     rng = np.random.default_rng(123)
 
@@ -184,7 +186,7 @@ def test_selective_pipeline():
 def test_model_and_stages_mock():
     import torch
     from config import DebugConfig
-    from losses.controllable_losses import ControllableRestorationLoss
+    from losses.controllable_losses import ControllableRestorationLoss, VisionAidedDiscriminator
     from models.controllable_restorer import ControllableRestorer
     from utils.semantic_mask import extract_one_click_semantic_mask
 
@@ -195,6 +197,11 @@ def test_model_and_stages_mock():
 
     model = ControllableRestorer(cfg)
     loss_fn = ControllableRestorationLoss(cfg, use_pretrained_vgg=False)
+    disc = VisionAidedDiscriminator(sem_dim=model.semantic_encoder.spatial_dim, num_actions=cfg.NUM_ACTIONS)
+
+    assert len(model.skip_vae.vae_pix_lora_params) > 0 and len(model.skip_vae.vae_sem_lora_params) > 0, (
+        "VAE Encoder & Decoder conv_in/conv_out Dual-LoRA must be injected!"
+    )
 
     clean = torch.rand(2, 3, 64, 64)
     src = torch.rand(2, 3, 64, 64)
@@ -238,11 +245,13 @@ def test_model_and_stages_mock():
     )
     assert all(p.grad is None for p in groups["semantic_stage"]), "Semantic LoRA must stay frozen in Stage 2!"
 
-    # Stage 3: Semantic-Detail Stage (cross-thread backward recomputation + DDP full-grad check)
+    # Stage 3: Semantic-Detail + Vision-Aided GAN Stage (cross-thread backward + DDP full-grad check)
     model.zero_grad(set_to_none=True)
     model.set_training_stage("semantic_stage")
+    disc.eval()
+    disc.requires_grad_(False)
     out_s3 = model(src, act_map, tgt_01=tgt, clean_01=clean, fidelity_scale=1.0, detail_scale=1.0)
-    loss_s3, _ = loss_fn(
+    loss_s3, metrics_s3, aux_s3 = loss_fn(
         out_s3["pred"],
         tgt,
         act_map,
@@ -250,6 +259,8 @@ def test_model_and_stages_mock():
         stage="semantic_stage",
         t_vec=out_s3["t"],
         semantic_encoder=model.semantic_encoder,
+        discriminator=disc,
+        return_aux=True,
     )
     _backward_on_worker_thread(loss_s3)
     model.clear_runtime_contexts()
@@ -257,6 +268,19 @@ def test_model_and_stages_mock():
         "ALL semantic_stage parameters must participate in backward for DDP find_unused_parameters=False!"
     )
     assert all(p.grad is None for p in groups["pixel_stage"]), "Pixel stage must stay frozen in Stage 3!"
+    assert "gan" in metrics_s3 and "pred_grid" in aux_s3 and "tgt_grid" in aux_s3
+
+    # Discriminator single-concat DDP backward check
+    disc.requires_grad_(True)
+    disc.train()
+    disc.zero_grad(set_to_none=True)
+    d_loss = VisionAidedDiscriminator.discriminator_hinge_loss(
+        disc, tgt, out_s3["pred"].detach(), aux_s3["tgt_grid"], aux_s3["pred_grid"], act_map
+    )
+    d_loss.backward()
+    assert all(p.grad is not None for p in disc.parameters()), (
+        "ALL VisionAidedDiscriminator parameters must receive gradients in single-concat pass!"
+    )
 
     # Zero-Action & Localized Split-Mask Exact Preservation Check
     model.eval()

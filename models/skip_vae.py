@@ -165,16 +165,27 @@ class SkipConnectedVAE(nn.Module):
         for p in self.vae.parameters():
             p.requires_grad = False
 
-        # Inject lightweight Dual-LoRA into VAE Encoder (S3Diff-style degradation-adaptive encoding)
+        # Inject lightweight Dual-LoRA into VAE Encoder & Decoder (Pix2Pix-Turbo / S3Diff adaptive VAE)
         enc_rank = getattr(config, "VAE_ENC_LORA_RANK", 8)
         enc_alpha = getattr(config, "VAE_ENC_LORA_ALPHA", 8.0)
-        self.vae_pix_lora_params, self.vae_sem_lora_params = inject_generator_dual_lora(
+        enc_pix_params, enc_sem_params = inject_generator_dual_lora(
             self.vae.encoder,
             action_dim=config.ACTION_HIDDEN_DIM,
             rank=enc_rank,
             alpha=enc_alpha,
             include_conv=True,
         )
+        dec_rank = getattr(config, "VAE_DEC_LORA_RANK", enc_rank)
+        dec_alpha = getattr(config, "VAE_DEC_LORA_ALPHA", enc_alpha)
+        dec_pix_params, dec_sem_params = inject_generator_dual_lora(
+            self.vae.decoder,
+            action_dim=config.ACTION_HIDDEN_DIM,
+            rank=dec_rank,
+            alpha=dec_alpha,
+            include_conv=True,
+        )
+        self.vae_pix_lora_params = list(enc_pix_params) + list(dec_pix_params)
+        self.vae_sem_lora_params = list(enc_sem_params) + list(dec_sem_params)
 
         # Dynamically probe Encoder & Decoder intermediate channel dimensions
         with torch.no_grad():

@@ -65,7 +65,7 @@ class ControllableInferencer:
                 if missing_k or unexp_k:
                     print(
                         f"[Warning] Checkpoint had {len(missing_k)} missing / {len(unexp_k)} legacy adapter keys. "
-                        f"Make sure you are loading a V2 checkpoint trained after the SD-Turbo scheduler + Skip-VAE fix!"
+                        f"Make sure you are loading a V3 checkpoint trained with the Pix2Pix-Turbo (t=999 + OpenCLIP) upgrade!"
                     )
 
         if self.device.type == "cuda" and self.config.USE_AMP:
