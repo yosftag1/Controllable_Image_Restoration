@@ -12,9 +12,12 @@ class Config:
     # Options: "c_radio" (default), "dinov3_siglip2", or "mock_tiny" (offline unit tests)
     SEMANTIC_ENCODER_TYPE = "c_radio"
 
-    # Hugging Face repository IDs
-    RADIO_MODEL_ID = "nvidia/C-RADIOv2.5-B"
+    # Hugging Face repository IDs (100% public & ungated defaults)
+    # Note: RADIOv2.5-B is published on HF as "nvidia/C-RADIOv2-B" (newer v3: "nvidia/C-RADIOv3-B")
+    RADIO_MODEL_ID = "nvidia/C-RADIOv2-B"
+    RADIO_ALT_MODEL_ID = "nvidia/C-RADIOv3-B"
     DINOV3_MODEL_ID = "facebook/dinov3-vits16-pretrain-lvd1689m"
+    DINOV2_FALLBACK_MODEL_ID = "facebook/dinov2-with-registers-small"
     SIGLIP2_MODEL_ID = "google/siglip2-base-patch16-224"
 
     # Self-Teacher LoRA settings on frozen semantic vision encoder(s)

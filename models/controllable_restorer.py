@@ -19,7 +19,7 @@ import torch.nn.functional as F
 
 from .action_overlay import ActionOverlayEncoder, PointwiseSpatialModulator
 from .lora_layers import generator_lora_context, inject_generator_dual_lora
-from .semantic_encoder import SemanticEncoder
+from .semantic_encoder import SemanticEncoder, load_hf_public_safe
 from .skip_vae import SkipConnectedVAE, _MockTinyVAE
 
 
@@ -184,8 +184,8 @@ class ControllableRestorer(nn.Module):
             from diffusers import AutoencoderKL, UNet2DConditionModel
 
             repo_id = config.GENERATOR_REPO_MAP.get(backbone_key, config.GENERATOR_BACKBONE)
-            raw_vae = AutoencoderKL.from_pretrained(repo_id, subfolder="vae")
-            raw_unet = UNet2DConditionModel.from_pretrained(repo_id, subfolder="unet")
+            raw_vae = load_hf_public_safe(AutoencoderKL.from_pretrained, repo_id, subfolder="vae")
+            raw_unet = load_hf_public_safe(UNet2DConditionModel.from_pretrained, repo_id, subfolder="unet")
 
         # 3. Wrap VAE with Action-Gated Skip Bridges + Encoder Dual-LoRA
         self.skip_vae = SkipConnectedVAE(raw_vae, config)

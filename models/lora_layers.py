@@ -87,6 +87,22 @@ class SwitchableLoRALinear(nn.Module):
         nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
         nn.init.zeros_(self.lora_B.weight)
 
+    @property
+    def in_features(self) -> int:
+        return self.base.in_features
+
+    @property
+    def out_features(self) -> int:
+        return self.base.out_features
+
+    @property
+    def weight(self) -> torch.Tensor:
+        return self.base.weight
+
+    @property
+    def bias(self) -> Optional[torch.Tensor]:
+        return self.base.bias
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         base_out = self.base(x)
         if not _get_vision_lora_enabled():
@@ -161,6 +177,22 @@ class ActionDualLoRALinear(nn.Module):
         self.pix_branch = _DualLoRABranch(in_f, out_f, rank, action_dim, is_conv=False, device=device)
         self.sem_branch = _DualLoRABranch(in_f, out_f, rank, action_dim, is_conv=False, device=device)
 
+    @property
+    def in_features(self) -> int:
+        return self.base.in_features
+
+    @property
+    def out_features(self) -> int:
+        return self.base.out_features
+
+    @property
+    def weight(self) -> torch.Tensor:
+        return self.base.weight
+
+    @property
+    def bias(self) -> Optional[torch.Tensor]:
+        return self.base.bias
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         out = self.base(x)
         action_cond, lam_pix, lam_sem = _get_generator_lora_state()
@@ -216,6 +248,22 @@ class ActionDualLoRAConv2d(nn.Module):
             device=device,
         )
 
+    @property
+    def in_channels(self) -> int:
+        return self.base.in_channels
+
+    @property
+    def out_channels(self) -> int:
+        return self.base.out_channels
+
+    @property
+    def weight(self) -> torch.Tensor:
+        return self.base.weight
+
+    @property
+    def bias(self) -> Optional[torch.Tensor]:
+        return self.base.bias
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         out = self.base(x)
         action_cond, lam_pix, lam_sem = _get_generator_lora_state()
@@ -255,9 +303,10 @@ def inject_vision_lora(
     for p in model.parameters():
         p.requires_grad = False
 
+    exclude_keywords = ("patch_embed", "patch_generator", "conditioner", "adaptor")
     targets = []
     for name, mod in model.named_modules():
-        if isinstance(mod, nn.Linear):
+        if isinstance(mod, nn.Linear) and not any(ex in name.lower() for ex in exclude_keywords):
             leaf = name.split(".")[-1]
             if any(kw in leaf for kw in target_keywords):
                 targets.append((name, mod))

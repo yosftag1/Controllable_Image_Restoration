@@ -277,6 +277,7 @@ def save_checkpoint(
         "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
         "model_config": {
             "SEMANTIC_ENCODER_TYPE": config.SEMANTIC_ENCODER_TYPE,
+            "RADIO_MODEL_ID": getattr(config, "RADIO_MODEL_ID", "nvidia/C-RADIOv2-B"),
             "GENERATOR_BACKBONE": config.GENERATOR_BACKBONE,
             "UNET_LORA_RANK": config.UNET_LORA_RANK,
             "UNET_LORA_ALPHA": config.UNET_LORA_ALPHA,
@@ -298,8 +299,8 @@ def _wrap_multi_gpu_safely(raw_model: ControllableRestorer, num_gpus: int, devic
     try:
         raw_model.eval()
         with torch.no_grad(), torch.amp.autocast("cuda", enabled=use_amp):
-            dummy_img = torch.zeros(num_gpus, 3, 64, 64, device=device)
-            dummy_act = torch.ones(num_gpus, raw_model.config.NUM_ACTIONS, 64, 64, device=device) * 0.5
+            dummy_img = torch.zeros(num_gpus, 3, 128, 128, device=device)
+            dummy_act = torch.ones(num_gpus, raw_model.config.NUM_ACTIONS, 128, 128, device=device) * 0.5
             _ = dp_model(dummy_img, dummy_act, tgt_01=dummy_img, clean_01=dummy_img, fidelity_scale=1.0, detail_scale=0.0)
         raw_model.train()
         print(f"✓ Multi-GPU DataParallel ENABLED across {num_gpus} GPUs {device_ids}")
@@ -528,6 +529,7 @@ def main():
     parser.add_argument("--resume", type=str, default=None, help="Path to model_latest.pt / model_best.pt checkpoint")
     parser.add_argument("--backbone", type=str, choices=["sd-turbo", "tiny-sd", "bk-sdm-tiny", "mock_tiny"], default=None)
     parser.add_argument("--vision-encoder", type=str, choices=["c_radio", "dinov3_siglip2", "mock_tiny"], default=None)
+    parser.add_argument("--radio-id", type=str, default=None, help="Override HF repo ID for C-RADIO (e.g. nvidia/C-RADIOv3-B)")
     parser.add_argument("--training-mode", type=str, choices=["staged", "joint"], default=None)
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--epochs", type=int, default=None)
@@ -544,6 +546,8 @@ def main():
         config.GENERATOR_BACKBONE = args.backbone
     if args.vision_encoder:
         config.SEMANTIC_ENCODER_TYPE = args.vision_encoder
+    if args.radio_id:
+        config.RADIO_MODEL_ID = args.radio_id
     if args.training_mode:
         config.TRAINING_MODE = args.training_mode
     if args.data_root:

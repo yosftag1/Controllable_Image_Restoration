@@ -1,8 +1,8 @@
 """Pretrained Vision Foundation Semantic Encoders with Self-Teacher LoRA.
 
 Supports:
-- "c_radio":        NVIDIA C-RADIOv2.5-B (unified DINO + SigLIP + SAM distillation)
-- "dinov3_siglip2": Meta DINOv3-Small (geometry/parts) + Google SigLIP2-Base (appearance/color)
+- "c_radio":        NVIDIA C-RADIOv2-B / C-RADIOv3-B (unified DINO + SigLIP + SAM distillation)
+- "dinov3_siglip2": Meta DINOv3 / DINOv2-Registers (geometry) + Google SigLIP2-Base (appearance)
 - "mock_tiny":      Lightweight local ViT-patch encoder for fast offline unit testing
 """
 
@@ -13,6 +13,17 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .lora_layers import inject_vision_lora, vision_lora_context
+
+
+def load_hf_public_safe(loader_fn, repo_id: str, **kwargs):
+    """Load a Hugging Face model/config, retrying anonymously (token=False) if an env token is stale."""
+    try:
+        return loader_fn(repo_id, **kwargs)
+    except Exception as err:
+        msg = str(err)
+        if ("401" in msg or "Invalid username or password" in msg) and "token" not in kwargs:
+            return loader_fn(repo_id, token=False, **kwargs)
+        raise
 
 
 class _MockTinyVisionBackbone(nn.Module):
@@ -44,7 +55,6 @@ class _MockTinyVisionBackbone(nn.Module):
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         feat = self.patch_embed(x)  # [B, D, Hp, Wp]
-        bsz, dim, hp, wp = feat.shape
         tokens = feat.flatten(2).transpose(1, 2)  # [B, N, D]
         for blk in self.blocks:
             h = blk["norm1"](tokens)
@@ -67,6 +77,7 @@ class SemanticEncoder(nn.Module):
         self.config = config
         self.encoder_type = config.SEMANTIC_ENCODER_TYPE.lower()
         self.patch_size = 16
+        self.dino_patch_size = 16
 
         self.register_buffer("imagenet_mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
         self.register_buffer("imagenet_std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
@@ -77,20 +88,66 @@ class SemanticEncoder(nn.Module):
         self.vision_lora_params: List[nn.Parameter] = []
 
         if self.encoder_type == "c_radio":
+            from transformers import AutoConfig, AutoModel
+
+            radio_id = getattr(config, "RADIO_MODEL_ID", "nvidia/C-RADIOv2-B")
+            if radio_id == "nvidia/C-RADIOv2.5-B":
+                radio_id = "nvidia/C-RADIOv2-B"
+            alt_radio_id = getattr(config, "RADIO_ALT_MODEL_ID", "nvidia/C-RADIOv3-B")
+
+            try:
+                try:
+                    radio_cfg = load_hf_public_safe(AutoConfig.from_pretrained, radio_id, trust_remote_code=True)
+                    chosen_id = radio_id
+                except Exception:
+                    radio_cfg = load_hf_public_safe(AutoConfig.from_pretrained, alt_radio_id, trust_remote_code=True)
+                    chosen_id = alt_radio_id
+
+                # Disable internal bfloat16 autocast in RADIO config so outer PyTorch FP16 AMP runs natively on T4 GPUs
+                if isinstance(getattr(radio_cfg, "args", None), dict):
+                    radio_cfg.args["amp"] = False
+
+                self.radio = load_hf_public_safe(
+                    AutoModel.from_pretrained,
+                    chosen_id,
+                    config=radio_cfg,
+                    trust_remote_code=True,
+                )
+                self.patch_size = int(getattr(self.radio, "patch_size", 16))
+                self.radio.eval()
+                self.vision_lora_params.extend(
+                    inject_vision_lora(self.radio, rank=rank, alpha=alpha, dropout=dropout)
+                )
+                print(f"[SemanticEncoder] Loaded {chosen_id} (patch_size={self.patch_size})")
+            except ModuleNotFoundError as mod_err:
+                print(
+                    f"[Warning] {chosen_id} remote code requires '{mod_err.name}' "
+                    f"(install via: `!pip install -q open-clip-torch`). "
+                    f"Falling back automatically to public DINOv2-Registers + SigLIP2!"
+                )
+                self.encoder_type = "dinov3_siglip2"
+                config.SEMANTIC_ENCODER_TYPE = "dinov3_siglip2"
+
+        if self.encoder_type == "dinov3_siglip2":
             from transformers import AutoModel
 
-            self.radio = AutoModel.from_pretrained(config.RADIO_MODEL_ID, trust_remote_code=True)
-            self.radio.eval()
-            self.vision_lora_params.extend(
-                inject_vision_lora(self.radio, rank=rank, alpha=alpha, dropout=dropout)
-            )
+            dino_primary = getattr(config, "DINOV3_MODEL_ID", "facebook/dinov3-vits16-pretrain-lvd1689m")
+            dino_fallback = getattr(config, "DINOV2_FALLBACK_MODEL_ID", "facebook/dinov2-with-registers-small")
+            try:
+                self.dinov3 = load_hf_public_safe(AutoModel.from_pretrained, dino_primary)
+                used_dino = dino_primary
+            except Exception:
+                print(
+                    f"[SemanticEncoder] '{dino_primary}' requires gated HF login; "
+                    f"using public ungated '{dino_fallback}' instead."
+                )
+                self.dinov3 = load_hf_public_safe(AutoModel.from_pretrained, dino_fallback)
+                used_dino = dino_fallback
 
-        elif self.encoder_type == "dinov3_siglip2":
-            from transformers import AutoModel
-
-            self.dinov3 = AutoModel.from_pretrained(config.DINOV3_MODEL_ID)
-            siglip_full = AutoModel.from_pretrained(config.SIGLIP2_MODEL_ID)
+            siglip_id = getattr(config, "SIGLIP2_MODEL_ID", "google/siglip2-base-patch16-224")
+            siglip_full = load_hf_public_safe(AutoModel.from_pretrained, siglip_id)
             self.siglip2 = getattr(siglip_full, "vision_model", siglip_full)
+            self.dino_patch_size = int(getattr(getattr(self.dinov3, "config", None), "patch_size", 16))
             self.dinov3.eval()
             self.siglip2.eval()
 
@@ -100,6 +157,7 @@ class SemanticEncoder(nn.Module):
             self.vision_lora_params.extend(
                 inject_vision_lora(self.siglip2, rank=rank, alpha=alpha, dropout=dropout)
             )
+            print(f"[SemanticEncoder] Loaded {used_dino} (patch={self.dino_patch_size}) + {siglip_id}")
 
         elif self.encoder_type == "mock_tiny":
             self.mock = _MockTinyVisionBackbone(embed_dim=192, patch_size=16, depth=3)
@@ -107,15 +165,16 @@ class SemanticEncoder(nn.Module):
             self.vision_lora_params.extend(
                 inject_vision_lora(self.mock, rank=rank, alpha=alpha, dropout=dropout)
             )
-        else:
+        elif self.encoder_type != "c_radio":
             raise ValueError(
                 f"Unsupported SEMANTIC_ENCODER_TYPE='{config.SEMANTIC_ENCODER_TYPE}'. "
                 "Expected 'c_radio', 'dinov3_siglip2', or 'mock_tiny'."
             )
 
-        # Dynamically probe output feature dimensions with a tiny 64x64 pass
+        # Dynamically probe output feature dimensions
+        probe_hw = 64 if self.encoder_type == "mock_tiny" else 256
         with torch.no_grad(), vision_lora_context(enabled=False):
-            dummy = torch.zeros(1, 3, 64, 64)
+            dummy = torch.zeros(1, 3, probe_hw, probe_hw)
             glob, spat_tokens, _ = self._forward_raw(dummy)
             self.global_dim = int(glob.shape[-1])
             self.spatial_dim = int(spat_tokens.shape[-1])
@@ -138,6 +197,9 @@ class SemanticEncoder(nn.Module):
         ps = self.patch_size
         nh = max(ps, int(round(h / ps)) * ps)
         nw = max(ps, int(round(w / ps)) * ps)
+        if self.encoder_type == "c_radio" and hasattr(self, "radio") and hasattr(self.radio, "get_nearest_supported_resolution"):
+            nh, nw = self.radio.get_nearest_supported_resolution(nh, nw)
+            nh, nw = int(nh), int(nw)
         if nh != h or nw != w:
             x = F.interpolate(x, size=(nh, nw), mode="bilinear", align_corners=False)
         return x, nh // ps, nw // ps
@@ -163,11 +225,14 @@ class SemanticEncoder(nn.Module):
             spatial_tokens = spatial_tokens[:, -num_patches:, :]
 
         elif self.encoder_type == "dinov3_siglip2":
-            # 1. DINOv3: ImageNet normalized
+            # 1. DINOv3 / DINOv2-Registers: ImageNet normalized; match exact (hp, wp) token grid
             x_dino = (x_aligned - self.imagenet_mean) / self.imagenet_std
+            dino_h, dino_w = hp * self.dino_patch_size, wp * self.dino_patch_size
+            if x_dino.shape[-2:] != (dino_h, dino_w):
+                x_dino = F.interpolate(x_dino, size=(dino_h, dino_w), mode="bilinear", align_corners=False)
             dino_out = self.dinov3(pixel_values=x_dino)
             dino_seq = dino_out.last_hidden_state
-            # Slice trailing H_p * W_p patch tokens (safely skips CLS + 4 register tokens)
+            # Slice trailing H_p * W_p patch tokens (safely skips CLS + register tokens)
             dino_spatial = dino_seq[:, -num_patches:, :]
             dino_global = getattr(dino_out, "pooler_output", None)
             if dino_global is None:
@@ -178,6 +243,8 @@ class SemanticEncoder(nn.Module):
             try:
                 sig_out = self.siglip2(pixel_values=x_sig, interpolate_pos_encoding=True)
                 sig_spatial = sig_out.last_hidden_state[:, -num_patches:, :]
+                if sig_spatial.shape[1] != num_patches:
+                    raise TypeError("Fallback to explicit grid resize")
             except TypeError:
                 x_sig_224 = F.interpolate(x_sig, size=(224, 224), mode="bilinear", align_corners=False)
                 sig_out = self.siglip2(pixel_values=x_sig_224)
