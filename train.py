@@ -20,12 +20,27 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
+cv2.setNumThreads(0)
+
+try:
+    import pynvml
+
+    pynvml.nvmlInit()
+    _HAS_PYNVML = True
+except Exception:
+    _HAS_PYNVML = False
+
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 from config import Config, DebugConfig
-from data.selective_dataset import SelectiveDegradationPipeline, create_controllable_dataset
+from data.selective_dataset import (
+    SelectiveDegradationPipeline,
+    create_controllable_dataset,
+    dataloader_worker_init_fn,
+    unpack_batch_action_map,
+)
 from losses.controllable_losses import ControllableRestorationLoss
 from models.controllable_restorer import ControllableRestorer, SplitMultiGPURestorer
 from utils.semantic_mask import build_spatial_action_overlay, parse_action_spec
@@ -59,16 +74,24 @@ def cast_frozen_base_to_fp16(raw_model: ControllableRestorer, force_unet_fp16: b
 
 
 def format_gpu_postfix() -> str:
-    """Compact live VRAM readout across all CUDA GPUs for tqdm."""
+    """Compact live GPU utilization & VRAM readout across all CUDA GPUs for tqdm."""
     if not torch.cuda.is_available():
         return "CPU"
     parts = []
     for idx in range(torch.cuda.device_count()):
+        util_str = ""
+        if _HAS_PYNVML:
+            try:
+                handle = pynvml.nvmlDeviceGetHandleByIndex(idx)
+                util = pynvml.nvmlDeviceGetUtilizationRates(handle).gpu
+                util_str = f"{util}%"
+            except Exception:
+                util_str = ""
         try:
             free_b, total_b = torch.cuda.mem_get_info(idx)
             used_gb = (total_b - free_b) / (1024 ** 3)
             total_gb = total_b / (1024 ** 3)
-            parts.append(f"G{idx}:{used_gb:.1f}/{total_gb:.0f}G")
+            parts.append(f"G{idx}:{util_str}({used_gb:.1f}/{total_gb:.0f}G)" if util_str else f"G{idx}:{used_gb:.1f}/{total_gb:.0f}G")
         except Exception:
             alloc_gb = torch.cuda.memory_reserved(idx) / (1024 ** 3)
             parts.append(f"G{idx}:{alloc_gb:.1f}G")
@@ -332,19 +355,42 @@ def _wrap_multi_gpu_safely(raw_model: ControllableRestorer, num_gpus: int, devic
         return raw_model
 
 
+def _build_train_loader(train_dataset, config: Config, device: torch.device, align_only: bool) -> DataLoader:
+    """Construct high-throughput DataLoader with persistent workers, prefetching & OpenCV lock prevention."""
+    train_dataset.align_only = align_only
+    train_dataset.compact_ipc = True
+    bsz = min(32, config.BATCH_SIZE * 2) if (align_only and not getattr(config, "_debug_mode", False)) else config.BATCH_SIZE
+    nw = int(config.NUM_WORKERS)
+    loader_kwargs = {
+        "batch_size": bsz,
+        "shuffle": True,
+        "num_workers": nw,
+        "pin_memory": (device.type == "cuda"),
+        "drop_last": (len(train_dataset) >= bsz),
+    }
+    if nw > 0:
+        loader_kwargs["worker_init_fn"] = dataloader_worker_init_fn
+        loader_kwargs["persistent_workers"] = True
+        loader_kwargs["prefetch_factor"] = int(getattr(config, "DATALOADER_PREFETCH_FACTOR", 4))
+    return DataLoader(train_dataset, **loader_kwargs)
+
+
 def train(config: Config, resume_path: str = None, debug: bool = False, batch_size_overridden: bool = False):
     set_seed(config.SEED)
+    config._debug_mode = debug
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
 
     device = torch.device(config.DEVICE if torch.cuda.is_available() else "cpu")
     num_gpus = torch.cuda.device_count() if device.type == "cuda" else 0
     use_multi_gpu = config.MULTI_GPU and num_gpus > 1
     use_amp = config.USE_AMP and (device.type == "cuda")
 
-    if num_gpus == 1 and not batch_size_overridden and config.BATCH_SIZE >= 8 and not debug:
-        config.BATCH_SIZE = 4
+    if num_gpus == 1 and not batch_size_overridden and config.BATCH_SIZE >= 16 and not debug:
+        config.BATCH_SIZE = 8
 
     print(
         f"Device: {device} (GPUs: {num_gpus}) | Batch Size: {config.BATCH_SIZE} | "
@@ -353,23 +399,17 @@ def train(config: Config, resume_path: str = None, debug: bool = False, batch_si
     )
 
     print("Loading datasets...")
-    train_dataset = create_controllable_dataset(config, is_train=True)
-    val_dataset = create_controllable_dataset(config, is_train=False)
+    train_dataset = create_controllable_dataset(config, is_train=True, compact_ipc=True)
+    val_dataset = create_controllable_dataset(config, is_train=False, compact_ipc=False)
 
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=config.BATCH_SIZE,
-        shuffle=True,
-        num_workers=config.NUM_WORKERS,
-        pin_memory=(device.type == "cuda"),
-        drop_last=(len(train_dataset) >= config.BATCH_SIZE),
-    )
+    val_nw = min(2, int(config.NUM_WORKERS))
     val_loader = DataLoader(
         val_dataset,
-        batch_size=max(1, min(config.BATCH_SIZE, 4)),
+        batch_size=max(1, min(config.BATCH_SIZE, 8)),
         shuffle=False,
-        num_workers=min(2, config.NUM_WORKERS),
+        num_workers=val_nw,
         pin_memory=(device.type == "cuda"),
+        worker_init_fn=dataloader_worker_init_fn if val_nw > 0 else None,
     )
 
     raw_model = ControllableRestorer(config).to(device)
@@ -408,6 +448,8 @@ def train(config: Config, resume_path: str = None, debug: bool = False, batch_si
     print_gpu_usage("Pre-Training GPU & VRAM Check")
 
     current_stage = None
+    current_loader_align_only = None
+    train_loader = None
     optimizer = None
     scheduler = None
     os.makedirs(config.LOG_DIR, exist_ok=True)
@@ -421,6 +463,16 @@ def train(config: Config, resume_path: str = None, debug: bool = False, batch_si
 
     for epoch in range(start_epoch, config.EPOCHS + 1):
         stage = determine_epoch_stage(epoch, config)
+        need_align_only = stage == "align_warmup"
+        if train_loader is None or need_align_only != current_loader_align_only:
+            if train_loader is not None:
+                if getattr(train_loader, "_iterator", None) is not None:
+                    train_loader._iterator._shutdown_workers()
+                del train_loader
+                gc.collect()
+            current_loader_align_only = need_align_only
+            train_loader = _build_train_loader(train_dataset, config, device, align_only=need_align_only)
+
         if stage != current_stage:
             current_stage = stage
             optimizer, active_params = build_stage_optimizer(raw_model, stage, config)
@@ -447,8 +499,6 @@ def train(config: Config, resume_path: str = None, debug: bool = False, batch_si
         for step_idx, batch in enumerate(pbar, start=1):
             clean = batch["clean"].to(device, non_blocking=True)
             src = batch["source"].to(device, non_blocking=True)
-            tgt = batch["target"].to(device, non_blocking=True)
-            act_map = batch["action_map"].to(device, non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
 
@@ -458,6 +508,8 @@ def train(config: Config, resume_path: str = None, debug: bool = False, batch_si
                     loss = align_out.float().mean()
                 metrics = {"align": float(loss.detach().item()), "total": float(loss.detach().item())}
             else:
+                tgt = batch["target"].to(device, non_blocking=True)
+                act_map = unpack_batch_action_map(batch, device)
                 d_scale = 0.0 if stage == "pixel_stage" else float(random.uniform(0.4, 1.25))
 
                 with torch.amp.autocast("cuda", enabled=use_amp):
