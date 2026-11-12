@@ -625,7 +625,9 @@ def _collect_images(folder: Path):
     return sorted(set(found))
 
 
-def create_controllable_dataset(config, is_train=True, dataset_path=None, align_only: bool = False, compact_ipc: bool = False):
+def create_controllable_dataset(
+    config, is_train=True, dataset_path=None, align_only: bool = False, compact_ipc: bool = False, verbose: bool = True
+):
     """Discover DIV2K, DF2K-OST, or arbitrary recursive image folders (matching Kaggle workflow)."""
     split_name = "train" if is_train else "val"
     explicit_dir = dataset_path or (config.TRAIN_DATASET_PATH if is_train else config.VAL_DATASET_PATH)
@@ -681,7 +683,8 @@ def create_controllable_dataset(config, is_train=True, dataset_path=None, align_
         rng.shuffle(shuffled)
         paths = sorted(shuffled[:limit])
 
-    print(f"[{split_name}] Using {len(paths)} clean reference images from {source_desc}")
+    if verbose:
+        print(f"[{split_name}] Using {len(paths)} clean reference images from {source_desc}")
     return ControllableRestorationDataset(
         paths, config, is_train=is_train, align_only=align_only, compact_ipc=compact_ipc
     )

@@ -1,23 +1,28 @@
 """3-Phase Multi-GPU AMP Training Script for Controllable Pretrained Restoration."""
 
 import argparse
+from datetime import timedelta
 import gc
 import json
 import os
 from pathlib import Path
 import random
+import subprocess
 import sys
 
-# Kaggle notebook %run path fix & CUDA memory fragmentation prevention
+# Kaggle notebook %run path fix; ensure expandable_segments is NOT set (prevents multi-GPU T4 illegal address)
 if "/kaggle/working/Controllable_Image_Restoration" not in sys.path:
     sys.path.insert(0, "/kaggle/working/Controllable_Image_Restoration")
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+if os.environ.get("PYTORCH_CUDA_ALLOC_CONF") == "expandable_segments:True":
+    os.environ.pop("PYTORCH_CUDA_ALLOC_CONF", None)
 
 import cv2
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.optim as optim
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 
 cv2.setNumThreads(0)
@@ -57,7 +62,9 @@ def set_seed(seed: int):
 def unwrap_model(model: torch.nn.Module) -> ControllableRestorer:
     if isinstance(model, SplitMultiGPURestorer):
         return model.raw_model
-    return model.module if isinstance(model, torch.nn.DataParallel) else model
+    if isinstance(model, (torch.nn.DataParallel, torch.nn.parallel.DistributedDataParallel)):
+        return model.module
+    return model
 
 
 def cast_frozen_base_to_fp16(raw_model: ControllableRestorer, force_unet_fp16: bool = False):
@@ -317,299 +324,460 @@ def save_checkpoint(
     return str(path)
 
 
-def _wrap_multi_gpu_safely(raw_model: ControllableRestorer, num_gpus: int, device: torch.device, use_amp: bool):
-    """Wrap across all GPUs; try full DataParallel (Vision + Generator) first, then SplitMultiGPURestorer."""
-    device_ids = list(range(num_gpus))
-    probe_hw = 64 if raw_model.config.GENERATOR_BACKBONE.lower() == "mock_tiny" else int(raw_model.config.PATCH_SIZE)
-    dummy_img = torch.zeros(num_gpus, 3, probe_hw, probe_hw, device=device)
-    dummy_act = torch.ones(num_gpus, raw_model.config.NUM_ACTIONS, probe_hw, probe_hw, device=device) * 0.5
-
-    dp_model = torch.nn.DataParallel(raw_model, device_ids=device_ids)
-    dp_msg = ""
+def _detect_visible_gpu_count() -> int:
+    """Detect visible CUDA GPU count without initializing a CUDA context in the launcher process."""
+    vis = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if vis is not None:
+        vis = vis.strip()
+        if vis == "" or vis == "-1":
+            return 0
+        return len([x for x in vis.split(",") if x.strip()])
+    if _HAS_PYNVML:
+        try:
+            return int(pynvml.nvmlDeviceGetCount())
+        except Exception:
+            pass
     try:
-        raw_model.eval()
-        with torch.no_grad(), torch.amp.autocast("cuda", enabled=use_amp):
-            _ = dp_model(dummy_img, clean_01=dummy_img, align_only=True)
-            _ = dp_model(
-                dummy_img, dummy_act, tgt_01=dummy_img, clean_01=dummy_img, fidelity_scale=1.0, detail_scale=0.5
-            )
-        raw_model.train()
-        print(f"✓ Full Multi-GPU DataParallel ENABLED across {num_gpus} GPUs {device_ids} (Vision + SkipVAE + UNet)")
-        return dp_model
-    except Exception as dp_err:
-        dp_msg = f"{type(dp_err).__name__}: {dp_err}".splitlines()[0]
-        dp_err.__traceback__ = None
-        del dp_err
-        del dp_model
-        gc.collect()
-        torch.cuda.empty_cache()
+        return int(torch.cuda.device_count())
+    except Exception:
+        return 0
 
-    split_model = None
+
+def _launch_ddp_subprocess(num_gpus: int) -> None:
+    """Spawn isolated multi-process DistributedDataParallel workers (ideal for Kaggle %run notebooks)."""
+    sys.last_traceback = None
+    sys.last_value = None
+    gc.collect()
+
+    env = os.environ.copy()
+    env.pop("PYTORCH_CUDA_ALLOC_CONF", None)
+    env.pop("PYTORCH_ALLOC_CONF", None)
+    env["PYTHONUNBUFFERED"] = "1"
+    env["OMP_NUM_THREADS"] = "1"
+    env["MKL_NUM_THREADS"] = "1"
+    env["TOKENIZERS_PARALLELISM"] = "false"
+
+    cmd = [
+        sys.executable,
+        "-m",
+        "torch.distributed.run",
+        "--standalone",
+        "--nnodes=1",
+        f"--nproc_per_node={num_gpus}",
+        os.path.abspath(__file__),
+        *sys.argv[1:],
+    ]
+    print(f"✓ Launching {num_gpus}-GPU DistributedDataParallel (DDP) training processes...", flush=True)
+    proc = subprocess.Popen(
+        cmd,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        bufsize=0,
+    )
     try:
-        split_model = SplitMultiGPURestorer(raw_model, device_ids=device_ids)
-        raw_model.eval()
-        with torch.no_grad(), torch.amp.autocast("cuda", enabled=use_amp):
-            _ = split_model(
-                dummy_img, dummy_act, tgt_01=dummy_img, clean_01=dummy_img, fidelity_scale=1.0, detail_scale=0.5
-            )
-        raw_model.train()
-        print(
-            f"✓ Split Multi-GPU ENABLED: Vision Encoder on cuda:0 + "
-            f"Generator (SkipVAE + UNet) DataParallel across {num_gpus} GPUs {device_ids} "
-            f"(full DP note: {dp_msg})"
-        )
-        return split_model
-    except Exception as exc:
-        err_msg = f"{type(exc).__name__}: {exc}"
-        exc.__traceback__ = None
-        del exc
-        if split_model is not None:
-            del split_model
-        gc.collect()
-        torch.cuda.empty_cache()
-        raw_model.train()
-        print(f"[Note] Multi-GPU fallback to single device {device} ({err_msg}).")
-        return raw_model
+        assert proc.stdout is not None
+        fd = proc.stdout.fileno()
+        while True:
+            chunk = os.read(fd, 4096)
+            if not chunk:
+                break
+            sys.stdout.write(chunk.decode("utf-8", errors="replace"))
+            sys.stdout.flush()
+        rc = proc.wait()
+        if rc != 0:
+            raise RuntimeError(f"DistributedDataParallel training exited with code {rc}")
+    except KeyboardInterrupt:
+        print("\n[Multi-GPU] Interrupted — shutting down DDP workers cleanly...", flush=True)
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        raise
 
 
-def _build_train_loader(train_dataset, config: Config, device: torch.device, align_only: bool) -> DataLoader:
-    """Construct high-throughput DataLoader with persistent workers, prefetching & OpenCV lock prevention."""
+def _build_train_loader(
+    train_dataset,
+    config: Config,
+    device: torch.device,
+    align_only: bool,
+    is_ddp: bool = False,
+    rank: int = 0,
+    world_size: int = 1,
+):
+    """Construct high-throughput DataLoader with DistributedSampler, persistent workers & prefetching."""
     train_dataset.align_only = align_only
     train_dataset.compact_ipc = True
-    bsz = min(32, config.BATCH_SIZE * 2) if (align_only and not getattr(config, "_debug_mode", False)) else config.BATCH_SIZE
-    nw = int(config.NUM_WORKERS)
+    if world_size > 1:
+        train_dataset._cache_capacity = max(4, int(getattr(config, "DECODE_CACHE_SIZE", 16)) // world_size)
+
+    global_bsz = (
+        min(32, config.BATCH_SIZE * 2)
+        if (align_only and not getattr(config, "_debug_mode", False))
+        else config.BATCH_SIZE
+    )
+    per_gpu_bsz = max(1, global_bsz // max(1, world_size))
+    total_nw = int(config.NUM_WORKERS)
+    nw = max(1, total_nw // max(1, world_size)) if total_nw > 0 else 0
+
+    sampler = None
+    if is_ddp:
+        sampler = DistributedSampler(
+            train_dataset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=True,
+            seed=config.SEED,
+            drop_last=(len(train_dataset) >= global_bsz),
+        )
+
     loader_kwargs = {
-        "batch_size": bsz,
-        "shuffle": True,
+        "batch_size": per_gpu_bsz,
+        "shuffle": (sampler is None),
+        "sampler": sampler,
         "num_workers": nw,
         "pin_memory": (device.type == "cuda"),
-        "drop_last": (len(train_dataset) >= bsz),
+        "drop_last": (sampler is None and len(train_dataset) >= per_gpu_bsz),
     }
     if nw > 0:
         loader_kwargs["worker_init_fn"] = dataloader_worker_init_fn
         loader_kwargs["persistent_workers"] = True
         loader_kwargs["prefetch_factor"] = int(getattr(config, "DATALOADER_PREFETCH_FACTOR", 4))
-    return DataLoader(train_dataset, **loader_kwargs)
+    return DataLoader(train_dataset, **loader_kwargs), sampler
 
 
 def train(config: Config, resume_path: str = None, debug: bool = False, batch_size_overridden: bool = False):
-    set_seed(config.SEED)
-    config._debug_mode = debug
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        torch.backends.cudnn.benchmark = True
-        torch.backends.cuda.matmul.allow_tf32 = True
-
-    device = torch.device(config.DEVICE if torch.cuda.is_available() else "cpu")
-    num_gpus = torch.cuda.device_count() if device.type == "cuda" else 0
-    use_multi_gpu = config.MULTI_GPU and num_gpus > 1
-    use_amp = config.USE_AMP and (device.type == "cuda")
-
-    if num_gpus == 1 and not batch_size_overridden and config.BATCH_SIZE >= 16 and not debug:
-        config.BATCH_SIZE = 8
-
-    print(
-        f"Device: {device} (GPUs: {num_gpus}) | Batch Size: {config.BATCH_SIZE} | "
-        f"Backbone: {config.GENERATOR_BACKBONE} | Vision: {config.SEMANTIC_ENCODER_TYPE} | "
-        f"AMP: {'ENABLED' if use_amp else 'DISABLED'}"
+    is_ddp = (
+        "LOCAL_RANK" in os.environ
+        and "RANK" in os.environ
+        and int(os.environ.get("WORLD_SIZE", "1")) > 1
     )
-
-    print("Loading datasets...")
-    train_dataset = create_controllable_dataset(config, is_train=True, compact_ipc=True)
-    val_dataset = create_controllable_dataset(config, is_train=False, compact_ipc=False)
-
-    val_nw = min(2, int(config.NUM_WORKERS))
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=max(1, min(config.BATCH_SIZE, 8)),
-        shuffle=False,
-        num_workers=val_nw,
-        pin_memory=(device.type == "cuda"),
-        worker_init_fn=dataloader_worker_init_fn if val_nw > 0 else None,
-    )
-
-    raw_model = ControllableRestorer(config).to(device)
-    groups = raw_model.get_stage_parameter_groups()
-    print(
-        f"Trainable Adapter Breakdown -> Vision LoRA: {sum(p.numel() for p in groups['vision_lora']):,} | "
-        f"Pixel Stage (LoRA+SkipVAE+Overlay): {sum(p.numel() for p in groups['pixel_stage']):,} | "
-        f"Semantic LoRA: {sum(p.numel() for p in groups['semantic_stage']):,}"
-    )
-
-    start_epoch = 1
-    best_psnr = -1.0
-    resumed_stage = None
-    resumed_opt_state = None
-    resumed_sched_state = None
-
-    if resume_path:
-        if os.path.exists(resume_path):
-            print(f"Resuming from {resume_path}")
-            ckpt = torch.load(resume_path, map_location=device)
-            adapter_state = ckpt.get("trainable_state_dict") or ckpt.get("model_state_dict")
-            if adapter_state is not None:
-                raw_model.load_trainable_state_dict(adapter_state)
-            start_epoch = int(ckpt.get("epoch", 0)) + 1
-            best_psnr = float(ckpt.get("best_psnr", -1.0))
-            resumed_stage = ckpt.get("stage")
-            resumed_opt_state = ckpt.get("optimizer_state_dict")
-            resumed_sched_state = ckpt.get("scheduler_state_dict")
-            print(f"Resumed trainable adapters (starting at Epoch {start_epoch}, best PSNR={best_psnr:.2f} dB)")
-        else:
-            print(f"No checkpoint found at {resume_path} — starting fresh training from Epoch 1.")
-
-    model = _wrap_multi_gpu_safely(raw_model, num_gpus, device, use_amp) if use_multi_gpu else raw_model
-    loss_fn = ControllableRestorationLoss(config).to(device)
-    scaler = torch.amp.GradScaler("cuda", enabled=use_amp) if device.type == "cuda" else None
-    print_gpu_usage("Pre-Training GPU & VRAM Check")
-
-    current_stage = None
-    current_loader_align_only = None
-    train_loader = None
-    optimizer = None
-    scheduler = None
-    os.makedirs(config.LOG_DIR, exist_ok=True)
-    history_file = Path(config.LOG_DIR) / "training_history.json"
-    history = []
-    if start_epoch > 1 and history_file.exists():
+    if is_ddp:
+        local_rank = int(os.environ["LOCAL_RANK"])
+        rank = int(os.environ["RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+        is_main = rank == 0
+        torch.cuda.set_device(local_rank)
+        device = torch.device(f"cuda:{local_rank}")
         try:
-            history = json.loads(history_file.read_text(encoding="utf-8"))
-        except Exception:
-            history = []
+            dist.init_process_group(backend="nccl", device_id=device, timeout=timedelta(minutes=30))
+        except TypeError:
+            dist.init_process_group(backend="nccl", timeout=timedelta(minutes=30))
+    else:
+        local_rank = 0
+        rank = 0
+        world_size = 1
+        is_main = True
+        device = torch.device(config.DEVICE if torch.cuda.is_available() else "cpu")
 
-    for epoch in range(start_epoch, config.EPOCHS + 1):
-        stage = determine_epoch_stage(epoch, config)
-        need_align_only = stage == "align_warmup"
-        if train_loader is None or need_align_only != current_loader_align_only:
-            if train_loader is not None:
-                if getattr(train_loader, "_iterator", None) is not None:
-                    train_loader._iterator._shutdown_workers()
-                del train_loader
-                gc.collect()
-            current_loader_align_only = need_align_only
-            train_loader = _build_train_loader(train_dataset, config, device, align_only=need_align_only)
+    try:
+        set_seed(config.SEED)
+        config._debug_mode = debug
+        gc.collect()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+            torch.backends.cudnn.benchmark = False
+            torch.backends.cuda.matmul.allow_tf32 = True
 
-        if stage != current_stage:
-            current_stage = stage
-            optimizer, active_params = build_stage_optimizer(raw_model, stage, config)
-            remaining = max(1, config.EPOCHS - epoch + 1)
-            scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=remaining, eta_min=1e-6)
-            print(f"\n=== Entering Stage '{stage}' at Epoch {epoch}/{config.EPOCHS} ({active_params:,} active params) ===")
+        num_gpus = world_size if is_ddp else (torch.cuda.device_count() if device.type == "cuda" else 0)
+        use_amp = config.USE_AMP and (device.type == "cuda")
 
-            # Restore optimizer & scheduler momentum if resuming within the exact same stage
-            if epoch == start_epoch and resumed_stage == stage and resumed_opt_state is not None:
-                try:
-                    optimizer.load_state_dict(resumed_opt_state)
-                    if resumed_sched_state is not None:
-                        scheduler.load_state_dict(resumed_sched_state)
-                    print(f"Restored optimizer & scheduler states for stage '{stage}'.")
-                except Exception as exc:
-                    print(f"[Note] Optimizer state re-initialized cleanly for stage '{stage}' ({exc}).")
-                resumed_opt_state = None
-                resumed_sched_state = None
+        if num_gpus == 1 and not batch_size_overridden and config.BATCH_SIZE >= 16 and not debug:
+            config.BATCH_SIZE = 8
 
-        model.train()
-        running = {}
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch:03d}/{config.EPOCHS} [{stage}]")
-
-        for step_idx, batch in enumerate(pbar, start=1):
-            clean = batch["clean"].to(device, non_blocking=True)
-            src = batch["source"].to(device, non_blocking=True)
-
-            optimizer.zero_grad(set_to_none=True)
-
-            if stage == "align_warmup":
-                with torch.amp.autocast("cuda", enabled=use_amp):
-                    align_out = model(src, clean_01=clean, align_only=True)
-                    loss = align_out.float().mean()
-                metrics = {"align": float(loss.detach().item()), "total": float(loss.detach().item())}
-            else:
-                tgt = batch["target"].to(device, non_blocking=True)
-                act_map = unpack_batch_action_map(batch, device)
-                d_scale = 0.0 if stage == "pixel_stage" else float(random.uniform(0.4, 1.25))
-
-                with torch.amp.autocast("cuda", enabled=use_amp):
-                    out = model(
-                        src,
-                        act_map,
-                        tgt_01=tgt,
-                        clean_01=clean,
-                        fidelity_scale=1.0,
-                        detail_scale=d_scale,
-                    )
-                    loss, metrics = loss_fn(
-                        pred_01=out["pred"],
-                        target_01=tgt,
-                        action_map=act_map,
-                        align_loss=out["align_loss"],
-                        stage=stage,
-                        t_vec=out["t"],
-                        semantic_encoder=raw_model.semantic_encoder if stage in ("semantic_stage", "joint") else None,
-                    )
-
-            if scaler is not None and use_amp:
-                scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(
-                    [p for p in raw_model.parameters() if p.requires_grad], config.GRAD_CLIP_NORM
-                )
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(
-                    [p for p in raw_model.parameters() if p.requires_grad], config.GRAD_CLIP_NORM
-                )
-                optimizer.step()
-
-            for k, v in metrics.items():
-                running[k] = running.get(k, 0.0) + v
-
-            if step_idx % config.LOG_INTERVAL == 0 or step_idx == len(train_loader):
-                avg_tot = running["total"] / step_idx
-                avg_al = running.get("align", 0.0) / step_idx
-                pbar.set_postfix(
-                    {"loss": f"{avg_tot:.4f}", "align": f"{avg_al:.4f}", "gpu": format_gpu_postfix()}
-                )
-
-        # Step scheduler BEFORE saving checkpoints so resumed runs have the exact next-epoch LR
-        if scheduler is not None:
-            scheduler.step()
-
-        epoch_summary = {k: v / max(1, len(train_loader)) for k, v in running.items()}
-        epoch_summary["epoch"] = epoch
-        epoch_summary["stage"] = stage
-
-        if stage != "align_warmup" and (epoch % max(1, config.VAL_EPOCH_INTERVAL) == 0 or epoch == config.EPOCHS):
-            val_metrics = evaluate_validation(model, val_loader, device, config, stage)
-            epoch_summary.update(val_metrics)
-            grid_path = save_controllable_validation_grid(model, val_dataset, device, config, epoch, stage)
+        if is_main:
+            mode_tag = f"DDP ({world_size} GPUs)" if is_ddp else f"{device} (GPUs: {num_gpus})"
             print(
-                f"Epoch {epoch:03d} | train_loss={epoch_summary['total']:.4f} | "
-                f"val_psnr={val_metrics['val_psnr']:.2f} dB | val_l1={val_metrics['val_l1']:.4f} | sweep={grid_path}"
+                f"Device: {mode_tag} | Global Batch Size: {config.BATCH_SIZE} "
+                f"({max(1, config.BATCH_SIZE // max(1, world_size))}/GPU) | "
+                f"Backbone: {config.GENERATOR_BACKBONE} | Vision: {config.SEMANTIC_ENCODER_TYPE} | "
+                f"AMP: {'ENABLED' if use_amp else 'DISABLED'}",
+                flush=True,
+            )
+            print("Loading datasets...", flush=True)
+
+        train_dataset = create_controllable_dataset(config, is_train=True, compact_ipc=True, verbose=is_main)
+        val_dataset = None
+        val_loader = None
+        if is_main:
+            val_dataset = create_controllable_dataset(config, is_train=False, compact_ipc=False, verbose=True)
+            val_nw = min(2, int(config.NUM_WORKERS))
+            val_loader = DataLoader(
+                val_dataset,
+                batch_size=max(1, min(config.BATCH_SIZE, 8)),
+                shuffle=False,
+                num_workers=val_nw,
+                pin_memory=(device.type == "cuda"),
+                worker_init_fn=dataloader_worker_init_fn if val_nw > 0 else None,
             )
 
-            if val_metrics["val_psnr"] > best_psnr:
-                best_psnr = val_metrics["val_psnr"]
-                save_checkpoint(raw_model, optimizer, scheduler, epoch, stage, best_psnr, config, "model_best.pt")
+        # Rank 0 populates Hugging Face / torchvision disk caches first to prevent concurrent file-write races
+        if is_ddp:
+            if is_main:
+                raw_model = ControllableRestorer(config).to(device)
+                loss_fn = ControllableRestorationLoss(config).to(device)
+            dist.barrier()
+            if not is_main:
+                raw_model = ControllableRestorer(config).to(device)
+                loss_fn = ControllableRestorationLoss(config).to(device)
+            dist.barrier()
+        else:
+            raw_model = ControllableRestorer(config).to(device)
+            loss_fn = ControllableRestorationLoss(config).to(device)
 
-        # Always save model_latest.pt after every epoch for seamless Kaggle resuming
-        save_checkpoint(raw_model, optimizer, scheduler, epoch, stage, best_psnr, config, "model_latest.pt")
-        if epoch % config.CHECKPOINT_EVERY_N_EPOCHS == 0:
-            save_checkpoint(
-                raw_model, optimizer, scheduler, epoch, stage, best_psnr, config, f"model_epoch_{epoch:03d}.pt"
+        if is_main:
+            groups = raw_model.get_stage_parameter_groups()
+            print(
+                f"Trainable Adapter Breakdown -> Vision LoRA: {sum(p.numel() for p in groups['vision_lora']):,} | "
+                f"Pixel Stage (LoRA+SkipVAE+Overlay): {sum(p.numel() for p in groups['pixel_stage']):,} | "
+                f"Semantic LoRA: {sum(p.numel() for p in groups['semantic_stage']):,}",
+                flush=True,
             )
 
-        history.append(epoch_summary)
-        with open(history_file, "w", encoding="utf-8") as f:
-            json.dump(history, f, indent=2)
+        start_epoch = 1
+        best_psnr = -1.0
+        resumed_stage = None
+        resumed_opt_state = None
+        resumed_sched_state = None
+
+        if resume_path:
+            if os.path.exists(resume_path):
+                if is_main:
+                    print(f"Resuming from {resume_path}", flush=True)
+                ckpt = torch.load(resume_path, map_location=device)
+                adapter_state = ckpt.get("trainable_state_dict") or ckpt.get("model_state_dict")
+                if adapter_state is not None:
+                    raw_model.load_trainable_state_dict(adapter_state)
+                start_epoch = int(ckpt.get("epoch", 0)) + 1
+                best_psnr = float(ckpt.get("best_psnr", -1.0))
+                resumed_stage = ckpt.get("stage")
+                resumed_opt_state = ckpt.get("optimizer_state_dict")
+                resumed_sched_state = ckpt.get("scheduler_state_dict")
+                if is_main:
+                    print(
+                        f"Resumed trainable adapters (starting at Epoch {start_epoch}, best PSNR={best_psnr:.2f} dB)",
+                        flush=True,
+                    )
+            elif is_main:
+                print(f"No checkpoint found at {resume_path} — starting fresh training from Epoch 1.", flush=True)
+
+        # Diversify per-rank augmentation RNG after identical model weight initialization
+        if is_ddp:
+            set_seed(config.SEED + rank * 1009)
+
+        model = raw_model
+        scaler = torch.amp.GradScaler("cuda", enabled=use_amp) if device.type == "cuda" else None
+        if is_main:
+            print_gpu_usage("Pre-Training GPU & VRAM Check")
+
+        current_stage = None
+        current_loader_align_only = None
+        train_loader = None
+        train_sampler = None
+        optimizer = None
+        scheduler = None
+        history_file = Path(config.LOG_DIR) / "training_history.json"
+        history = []
+        if is_main:
+            os.makedirs(config.LOG_DIR, exist_ok=True)
+            if start_epoch > 1 and history_file.exists():
+                try:
+                    history = json.loads(history_file.read_text(encoding="utf-8"))
+                except Exception:
+                    history = []
+
+        for epoch in range(start_epoch, config.EPOCHS + 1):
+            stage = determine_epoch_stage(epoch, config)
+            need_align_only = stage == "align_warmup"
+            if train_loader is None or need_align_only != current_loader_align_only:
+                if train_loader is not None:
+                    if getattr(train_loader, "_iterator", None) is not None:
+                        train_loader._iterator._shutdown_workers()
+                    del train_loader
+                    gc.collect()
+                current_loader_align_only = need_align_only
+                train_loader, train_sampler = _build_train_loader(
+                    train_dataset,
+                    config,
+                    device,
+                    align_only=need_align_only,
+                    is_ddp=is_ddp,
+                    rank=rank,
+                    world_size=world_size,
+                )
+
+            if train_sampler is not None:
+                train_sampler.set_epoch(epoch)
+
+            if stage != current_stage:
+                if is_ddp and model is not raw_model:
+                    del model
+                    gc.collect()
+                current_stage = stage
+                optimizer, active_params = build_stage_optimizer(raw_model, stage, config)
+                remaining = max(1, config.EPOCHS - epoch + 1)
+                scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=remaining, eta_min=1e-6)
+                if is_main:
+                    print(
+                        f"\n=== Entering Stage '{stage}' at Epoch {epoch}/{config.EPOCHS} "
+                        f"({active_params:,} active params) ===",
+                        flush=True,
+                    )
+
+                # Restore optimizer & scheduler momentum if resuming within the exact same stage
+                if epoch == start_epoch and resumed_stage == stage and resumed_opt_state is not None:
+                    try:
+                        optimizer.load_state_dict(resumed_opt_state)
+                        if resumed_sched_state is not None:
+                            scheduler.load_state_dict(resumed_sched_state)
+                        if is_main:
+                            print(f"Restored optimizer & scheduler states for stage '{stage}'.", flush=True)
+                    except Exception as exc:
+                        if is_main:
+                            print(f"[Note] Optimizer state re-initialized cleanly for stage '{stage}' ({exc}).", flush=True)
+                    resumed_opt_state = None
+                    resumed_sched_state = None
+
+                if is_ddp:
+                    model = torch.nn.parallel.DistributedDataParallel(
+                        raw_model,
+                        device_ids=[local_rank],
+                        output_device=local_rank,
+                        find_unused_parameters=True,
+                    )
+                else:
+                    model = raw_model
+
+            model.train()
+            running = {}
+            num_steps = len(train_loader)
+            pbar = (
+                tqdm(
+                    train_loader,
+                    desc=f"Epoch {epoch:03d}/{config.EPOCHS} [{stage}]",
+                    file=sys.stdout,
+                    ncols=118,
+                    mininterval=1.5,
+                )
+                if is_main
+                else train_loader
+            )
+
+            for step_idx, batch in enumerate(pbar, start=1):
+                clean = batch["clean"].to(device, non_blocking=True)
+                src = batch["source"].to(device, non_blocking=True)
+
+                optimizer.zero_grad(set_to_none=True)
+
+                if stage == "align_warmup":
+                    with torch.amp.autocast("cuda", enabled=use_amp):
+                        align_out = model(src, clean_01=clean, align_only=True)
+                        loss = align_out.float().mean()
+                    val_f = float(loss.detach().item())
+                    metrics = {"align": val_f, "total": val_f}
+                else:
+                    tgt = batch["target"].to(device, non_blocking=True)
+                    act_map = unpack_batch_action_map(batch, device)
+                    d_scale = 0.0 if stage == "pixel_stage" else float(random.uniform(0.4, 1.25))
+
+                    with torch.amp.autocast("cuda", enabled=use_amp):
+                        out = model(
+                            src,
+                            act_map,
+                            tgt_01=tgt,
+                            clean_01=clean,
+                            fidelity_scale=1.0,
+                            detail_scale=d_scale,
+                        )
+                        loss, metrics = loss_fn(
+                            pred_01=out["pred"],
+                            target_01=tgt,
+                            action_map=act_map,
+                            align_loss=out["align_loss"],
+                            stage=stage,
+                            t_vec=out["t"],
+                            semantic_encoder=raw_model.semantic_encoder if stage in ("semantic_stage", "joint") else None,
+                        )
+
+                if scaler is not None and use_amp:
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(
+                        [p for p in raw_model.parameters() if p.requires_grad], config.GRAD_CLIP_NORM
+                    )
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(
+                        [p for p in raw_model.parameters() if p.requires_grad], config.GRAD_CLIP_NORM
+                    )
+                    optimizer.step()
+
+                for k, v in metrics.items():
+                    running[k] = running.get(k, 0.0) + v
+
+                if is_main and (step_idx % config.LOG_INTERVAL == 0 or step_idx == num_steps):
+                    avg_tot = running["total"] / step_idx
+                    avg_al = running.get("align", 0.0) / step_idx
+                    pbar.set_postfix(
+                        {"loss": f"{avg_tot:.4f}", "align": f"{avg_al:.4f}", "gpu": format_gpu_postfix()}
+                    )
+
+            # Step scheduler BEFORE saving checkpoints so resumed runs have the exact next-epoch LR
+            if scheduler is not None:
+                scheduler.step()
+
+            epoch_summary = {k: v / max(1, num_steps) for k, v in running.items()}
+            if is_ddp and epoch_summary:
+                keys_sorted = sorted(epoch_summary.keys())
+                vec = torch.tensor([epoch_summary[k] for k in keys_sorted], device=device, dtype=torch.float64)
+                dist.all_reduce(vec, op=dist.ReduceOp.AVG)
+                for idx_k, k in enumerate(keys_sorted):
+                    epoch_summary[k] = float(vec[idx_k].item())
+
+            epoch_summary["epoch"] = epoch
+            epoch_summary["stage"] = stage
+
+            if is_main:
+                if stage != "align_warmup" and (epoch % max(1, config.VAL_EPOCH_INTERVAL) == 0 or epoch == config.EPOCHS):
+                    val_metrics = evaluate_validation(raw_model, val_loader, device, config, stage)
+                    epoch_summary.update(val_metrics)
+                    grid_path = save_controllable_validation_grid(raw_model, val_dataset, device, config, epoch, stage)
+                    print(
+                        f"Epoch {epoch:03d} | train_loss={epoch_summary['total']:.4f} | "
+                        f"val_psnr={val_metrics['val_psnr']:.2f} dB | val_l1={val_metrics['val_l1']:.4f} | sweep={grid_path}",
+                        flush=True,
+                    )
+
+                    if val_metrics["val_psnr"] > best_psnr:
+                        best_psnr = val_metrics["val_psnr"]
+                        save_checkpoint(raw_model, optimizer, scheduler, epoch, stage, best_psnr, config, "model_best.pt")
+
+                # Always save model_latest.pt after every epoch for seamless Kaggle resuming
+                save_checkpoint(raw_model, optimizer, scheduler, epoch, stage, best_psnr, config, "model_latest.pt")
+                if epoch % config.CHECKPOINT_EVERY_N_EPOCHS == 0:
+                    save_checkpoint(
+                        raw_model, optimizer, scheduler, epoch, stage, best_psnr, config, f"model_epoch_{epoch:03d}.pt"
+                    )
+
+                history.append(epoch_summary)
+                with open(history_file, "w", encoding="utf-8") as f:
+                    json.dump(history, f, indent=2)
+
+            if is_ddp:
+                dist.barrier()
+    finally:
+        if is_ddp and dist.is_initialized():
+            dist.destroy_process_group()
 
 
 def main():
     parser = argparse.ArgumentParser(description="Train Controllable Pretrained Image Restoration Model")
     parser.add_argument("--debug", action="store_true", help="Use DebugConfig for quick verification")
     parser.add_argument("--mock", action="store_true", help="Use offline mock_tiny backbones (no HF downloads)")
+    parser.add_argument("--no-ddp", action="store_true", help="Disable automatic multi-GPU DDP worker launch")
     parser.add_argument("--data-root", type=str, default=None, help="Dataset root (DIV2K or image folder)")
     parser.add_argument("--train-root", type=str, default=None, help="Explicit training image folder (e.g. Kaggle df2k-ost/train)")
     parser.add_argument("--val-root", type=str, default=None, help="Explicit validation image folder (e.g. Kaggle DIV2K_valid)")
@@ -623,8 +791,8 @@ def main():
     parser.add_argument("--training-mode", type=str, choices=["staged", "joint"], default=None)
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--epochs", type=int, default=None)
-    parser.add_argument("--align-epochs", type=int, default=None, help="Override Phase-1 Vision LoRA warmup epochs")
-    parser.add_argument("--pixel-epochs", type=int, default=None, help="Override Phase-2 Pixel-LoRA stage epochs")
+    parser.add_argument("--align-epochs", type=int, help="Override Phase-1 Vision LoRA warmup epochs", default=None)
+    parser.add_argument("--pixel-epochs", type=int, help="Override Phase-2 Pixel-LoRA stage epochs", default=None)
     parser.add_argument("--num-workers", type=int, default=None)
     args = parser.parse_args()
 
@@ -662,6 +830,13 @@ def main():
         config.PIXEL_STAGE_EPOCHS = args.pixel_epochs
     if args.num_workers is not None:
         config.NUM_WORKERS = args.num_workers
+
+    in_ddp_worker = "LOCAL_RANK" in os.environ and "RANK" in os.environ
+    if not in_ddp_worker and not args.no_ddp and config.MULTI_GPU and config.DEVICE == "cuda":
+        visible_gpus = _detect_visible_gpu_count()
+        if visible_gpus > 1:
+            _launch_ddp_subprocess(visible_gpus)
+            return
 
     train(
         config,

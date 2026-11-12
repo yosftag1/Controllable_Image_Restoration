@@ -6,13 +6,14 @@ Supports:
 - "mock_tiny":      Lightweight local ViT-patch encoder for fast offline unit testing
 """
 
+import os
 from typing import Dict, List, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .lora_layers import inject_vision_lora, make_module_dataparallel_safe, vision_lora_context
+from .lora_layers import inject_vision_lora, vision_lora_context
 
 
 def load_hf_public_safe(loader_fn, repo_id: str, **kwargs):
@@ -118,8 +119,8 @@ class SemanticEncoder(nn.Module):
                 self.vision_lora_params.extend(
                     inject_vision_lora(self.radio, rank=rank, alpha=alpha, dropout=dropout)
                 )
-                make_module_dataparallel_safe(self.radio)
-                print(f"[SemanticEncoder] Loaded {chosen_id} (patch_size={self.patch_size})")
+                if os.environ.get("RANK", "0") == "0":
+                    print(f"[SemanticEncoder] Loaded {chosen_id} (patch_size={self.patch_size})")
             except ModuleNotFoundError as mod_err:
                 print(
                     f"[Warning] {chosen_id} remote code requires '{mod_err.name}' "
@@ -158,9 +159,8 @@ class SemanticEncoder(nn.Module):
             self.vision_lora_params.extend(
                 inject_vision_lora(self.siglip2, rank=rank, alpha=alpha, dropout=dropout)
             )
-            make_module_dataparallel_safe(self.dinov3)
-            make_module_dataparallel_safe(self.siglip2)
-            print(f"[SemanticEncoder] Loaded {used_dino} (patch={self.dino_patch_size}) + {siglip_id}")
+            if os.environ.get("RANK", "0") == "0":
+                print(f"[SemanticEncoder] Loaded {used_dino} (patch={self.dino_patch_size}) + {siglip_id}")
 
         elif self.encoder_type == "mock_tiny":
             self.mock = _MockTinyVisionBackbone(embed_dim=192, patch_size=16, depth=3)
@@ -168,7 +168,6 @@ class SemanticEncoder(nn.Module):
             self.vision_lora_params.extend(
                 inject_vision_lora(self.mock, rank=rank, alpha=alpha, dropout=dropout)
             )
-            make_module_dataparallel_safe(self.mock)
         elif self.encoder_type != "c_radio":
             raise ValueError(
                 f"Unsupported SEMANTIC_ENCODER_TYPE='{config.SEMANTIC_ENCODER_TYPE}'. "

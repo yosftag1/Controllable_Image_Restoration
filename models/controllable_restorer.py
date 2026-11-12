@@ -23,7 +23,6 @@ from .lora_layers import (
     infer_module_device,
     infer_module_dtype,
     inject_generator_dual_lora,
-    make_module_dataparallel_safe,
 )
 from .semantic_encoder import SemanticEncoder, load_hf_public_safe
 from .skip_vae import SkipConnectedVAE, _MockTinyVAE
@@ -279,8 +278,6 @@ class ControllableRestorer(nn.Module):
             wrapped_up = _SpatialModulatedUNetStage(self.unet.up_blocks[idx], out_ch, num_actions, mod_hidden)
             self.unet.up_blocks[idx] = wrapped_up
             self.spatial_mod_params.extend(list(wrapped_up.spatial_mod.parameters()))
-
-        make_module_dataparallel_safe(self.unet)
 
     def get_stage_parameter_groups(self) -> Dict[str, List[nn.Parameter]]:
         """Return cleanly separated parameter groups for 3-phase staged or joint training."""

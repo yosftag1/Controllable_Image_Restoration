@@ -12,7 +12,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .action_overlay import PointwiseSpatialModulator
-from .lora_layers import infer_module_dtype, inject_generator_dual_lora, make_module_dataparallel_safe
+from .lora_layers import infer_module_dtype, inject_generator_dual_lora
 
 
 class _ActionZeroSkipBridge(nn.Module):
@@ -110,7 +110,6 @@ class SkipConnectedVAE(nn.Module):
             alpha=enc_alpha,
             include_conv=True,
         )
-        make_module_dataparallel_safe(self.vae)
 
         # Dynamically probe Encoder & Decoder intermediate channel dimensions
         with torch.no_grad():
