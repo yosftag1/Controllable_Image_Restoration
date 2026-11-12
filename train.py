@@ -27,7 +27,7 @@ if PROJECT_ROOT not in sys.path:
 from config import Config, DebugConfig
 from data.selective_dataset import SelectiveDegradationPipeline, create_controllable_dataset
 from losses.controllable_losses import ControllableRestorationLoss
-from models.controllable_restorer import ControllableRestorer
+from models.controllable_restorer import ControllableRestorer, SplitMultiGPURestorer
 from utils.semantic_mask import build_spatial_action_overlay, parse_action_spec
 
 
@@ -40,6 +40,8 @@ def set_seed(seed: int):
 
 
 def unwrap_model(model: torch.nn.Module) -> ControllableRestorer:
+    if isinstance(model, SplitMultiGPURestorer):
+        return model.raw_model
     return model.module if isinstance(model, torch.nn.DataParallel) else model
 
 
@@ -293,21 +295,40 @@ def save_checkpoint(
 
 
 def _wrap_multi_gpu_safely(raw_model: ControllableRestorer, num_gpus: int, device: torch.device, use_amp: bool):
-    """Wrap with DataParallel across GPUs and verify replica compatibility."""
+    """Wrap across all GPUs; if Vision HF remote code binds methods to GPU 0, parallelize the 950M Generator across all GPUs."""
     device_ids = list(range(num_gpus))
+    dummy_img = torch.zeros(num_gpus, 3, 128, 128, device=device)
+    dummy_act = torch.ones(num_gpus, raw_model.config.NUM_ACTIONS, 128, 128, device=device) * 0.5
+
     dp_model = torch.nn.DataParallel(raw_model, device_ids=device_ids)
     try:
         raw_model.eval()
         with torch.no_grad(), torch.amp.autocast("cuda", enabled=use_amp):
-            dummy_img = torch.zeros(num_gpus, 3, 128, 128, device=device)
-            dummy_act = torch.ones(num_gpus, raw_model.config.NUM_ACTIONS, 128, 128, device=device) * 0.5
             _ = dp_model(dummy_img, dummy_act, tgt_01=dummy_img, clean_01=dummy_img, fidelity_scale=1.0, detail_scale=0.0)
         raw_model.train()
         print(f"✓ Multi-GPU DataParallel ENABLED across {num_gpus} GPUs {device_ids}")
         return dp_model
-    except Exception as exc:
+    except Exception:
+        del dp_model
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    try:
+        split_model = SplitMultiGPURestorer(raw_model, device_ids=device_ids)
+        raw_model.eval()
+        with torch.no_grad(), torch.amp.autocast("cuda", enabled=use_amp):
+            _ = split_model(dummy_img, dummy_act, tgt_01=dummy_img, clean_01=dummy_img, fidelity_scale=1.0, detail_scale=0.0)
         raw_model.train()
-        print(f"[Note] External HF backbone prefers single-device execution ({exc}); running on {device}.")
+        print(
+            f"✓ Split Multi-GPU ENABLED: Vision Encoder on cuda:0 + "
+            f"Generator (VAE+UNet) DataParallel across {num_gpus} GPUs {device_ids}"
+        )
+        return split_model
+    except Exception as exc:
+        gc.collect()
+        torch.cuda.empty_cache()
+        raw_model.train()
+        print(f"[Note] Multi-GPU fallback to single device {device} ({exc}).")
         return raw_model
 
 

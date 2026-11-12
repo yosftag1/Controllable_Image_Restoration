@@ -52,7 +52,10 @@ class _SpatialModulatedUNetStage(nn.Module):
         try:
             return super().__getattr__(name)
         except AttributeError:
-            return getattr(self._modules["orig_block"], name)
+            modules = self.__dict__.get("_modules")
+            if modules is not None and "orig_block" in modules:
+                return getattr(modules["orig_block"], name)
+            raise
 
     def forward(self, *args, **kwargs):
         out = self.orig_block(*args, **kwargs)
@@ -545,6 +548,131 @@ class ControllableRestorer(nn.Module):
                 detail_scale=d_scale,
             )
         return self.sample(
+            src_01=src_01,
+            action_input=action_input,
+            steps=steps,
+            fidelity_scale=fidelity_scale,
+            detail_scale=detail_scale,
+        )
+
+
+class _GeneratorParallelStage(nn.Module):
+    """Pure PyTorch/diffusers Generator stage (~95% of FLOPs) for multi-GPU DataParallel."""
+
+    def __init__(self, restorer: ControllableRestorer):
+        super().__init__()
+        self.config = restorer.config
+        self.action_overlay = restorer.action_overlay
+        self.skip_vae = restorer.skip_vae
+        self.unet = restorer.unet
+        self.velocity_scale = restorer.velocity_scale
+        self.velocity_zero_conv = restorer.velocity_zero_conv
+
+    def forward(
+        self,
+        src_01: torch.Tensor,
+        tgt_01: torch.Tensor,
+        action_map: torch.Tensor,
+        sem_tokens: torch.Tensor,
+        sem_global: torch.Tensor,
+        fidelity_scale: float = 1.0,
+        detail_scale: float = 0.0,
+    ) -> Dict[str, torch.Tensor]:
+        bsz = src_01.shape[0]
+        cross_tokens, global_action_cond = self.action_overlay(action_map, sem_tokens, sem_global)
+
+        with generator_lora_context(global_action_cond, lambda_pix=fidelity_scale, lambda_sem=detail_scale):
+            z_src, enc_skips = self.skip_vae.encode_with_skips(src_01)
+
+        use_bridge = torch.rand(1, device=src_01.device).item() < getattr(
+            self.config, "MULTI_STEP_TRAIN_PROB", 0.30
+        )
+        if use_bridge:
+            with torch.no_grad():
+                z_tgt = self.skip_vae.encode_target_latents(tgt_01)
+            t_vec = torch.empty(bsz, device=src_01.device).uniform_(0.25, 1.0)
+            t_4d = t_vec.view(bsz, 1, 1, 1)
+            z_t = (1.0 - t_4d) * z_tgt + t_4d * z_src
+        else:
+            t_vec = torch.ones(bsz, device=src_01.device)
+            t_4d = t_vec.view(bsz, 1, 1, 1)
+            z_t = z_src
+
+        t_unet = (t_vec.float() * 999.0).round().long().clamp(1, 999)
+        unet_dtype = next(self.unet.parameters()).dtype
+
+        with generator_lora_context(global_action_cond, lambda_pix=fidelity_scale, lambda_sem=detail_scale):
+            with _spatial_action_context(action_map):
+                raw_pred = self.unet(
+                    z_t.to(unet_dtype),
+                    t_unet,
+                    encoder_hidden_states=cross_tokens.to(unet_dtype),
+                ).sample.float()
+
+        vel = self.velocity_scale * raw_pred + self.velocity_zero_conv(z_t.float())
+        hat_z_0 = z_t - t_4d * vel
+
+        raw_rgb = self.skip_vae.decode_with_skips(hat_z_0, enc_skips, action_map)
+        thresh = max(1e-4, float(getattr(self.config, "ZERO_ACTION_LOCK_THRESHOLD", 0.03)))
+        gate = (action_map.float().amax(dim=1, keepdim=True) / thresh).clamp(0.0, 1.0)
+        pred_rgb = (src_01 + gate * (raw_rgb - src_01)).clamp(0.0, 1.0)
+        return {"pred": pred_rgb, "t": t_vec}
+
+
+class SplitMultiGPURestorer(nn.Module):
+    """Runs remote-code Vision Encoder on primary GPU and parallelizes the 950M Generator across all GPUs.
+
+    Preserves 100% identical parameter names in `raw_model.trainable_state_dict()`.
+    """
+
+    def __init__(self, raw_model: ControllableRestorer, device_ids: List[int]):
+        super().__init__()
+        self.__dict__["raw_model"] = raw_model
+        gen_stage = _GeneratorParallelStage(raw_model)
+        self.dp_generator = nn.DataParallel(gen_stage, device_ids=device_ids)
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        self.__dict__["raw_model"].train(mode)
+        return self
+
+    def forward(
+        self,
+        src_01: torch.Tensor,
+        action_input: Optional[torch.Tensor] = None,
+        tgt_01: Optional[torch.Tensor] = None,
+        clean_01: Optional[torch.Tensor] = None,
+        steps: Optional[int] = None,
+        fidelity_scale: Optional[float] = None,
+        detail_scale: Optional[float] = None,
+        align_only: bool = False,
+    ):
+        raw_model: ControllableRestorer = self.__dict__["raw_model"]
+        if align_only:
+            return raw_model.forward_align_only(src_01=src_01, clean_01=clean_01)
+        if action_input is None:
+            raise ValueError("action_input is required when align_only=False")
+        if tgt_01 is not None and clean_01 is not None:
+            _, _, h, w = src_01.shape
+            action_map = raw_model.action_overlay.ensure_spatial_map(action_input, h, w)
+            align_loss, sem_out = raw_model.semantic_encoder.compute_self_teacher_loss(src_01, clean_01)
+            f_scale = 1.0 if fidelity_scale is None else float(fidelity_scale)
+            d_scale = 0.0 if detail_scale is None else float(detail_scale)
+            gen_out = self.dp_generator(
+                src_01,
+                tgt_01,
+                action_map,
+                sem_out["tokens"],
+                sem_out["global"],
+                fidelity_scale=f_scale,
+                detail_scale=d_scale,
+            )
+            return {
+                "pred": gen_out["pred"],
+                "align_loss": align_loss.reshape(1),
+                "t": gen_out["t"],
+            }
+        return raw_model.sample(
             src_01=src_01,
             action_input=action_input,
             steps=steps,
