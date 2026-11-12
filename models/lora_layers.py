@@ -10,11 +10,103 @@ Supports:
 from contextlib import contextmanager
 import math
 import threading
+import types
 from typing import Iterable, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+def infer_module_dtype(mod: nn.Module, fallback: torch.dtype = torch.float32) -> torch.dtype:
+    """DataParallel-safe dtype lookup (works on replicas where _parameters become plain Tensor attributes)."""
+    conv_in = getattr(mod, "conv_in", None)
+    if conv_in is not None and getattr(conv_in, "weight", None) is not None:
+        return conv_in.weight.dtype
+    w = getattr(mod, "weight", None)
+    if isinstance(w, torch.Tensor):
+        return w.dtype
+    bufs = getattr(mod, "_buffers", None)
+    if bufs and bufs.get("_dp_anchor") is not None:
+        return bufs["_dp_anchor"].dtype
+    try:
+        return next(mod.parameters()).dtype
+    except StopIteration:
+        pass
+    try:
+        return next(mod.buffers()).dtype
+    except StopIteration:
+        return fallback
+
+
+def infer_module_device(mod: nn.Module) -> torch.device:
+    """DataParallel-safe device lookup (works on replicas where _parameters become plain Tensor attributes)."""
+    conv_in = getattr(mod, "conv_in", None)
+    if conv_in is not None and getattr(conv_in, "weight", None) is not None:
+        return conv_in.weight.device
+    w = getattr(mod, "weight", None)
+    if isinstance(w, torch.Tensor):
+        return w.device
+    bufs = getattr(mod, "_buffers", None)
+    if bufs and bufs.get("_dp_anchor") is not None:
+        return bufs["_dp_anchor"].device
+    try:
+        return next(mod.parameters()).device
+    except StopIteration:
+        pass
+    try:
+        return next(mod.buffers()).device
+    except StopIteration:
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def make_module_dataparallel_safe(root: nn.Module) -> nn.Module:
+    """Make Hugging Face / remote-code modules safe for multi-GPU torch.nn.DataParallel replication.
+
+    1. Registers a non-persistent `_dp_anchor` buffer so `.dtype` / `.device` / `buffers()` never raise
+       `StopIteration` on replica >= 1 (where PyTorch `replicate()` converts Parameters into Tensors).
+    2. Promotes instance-bound `types.MethodType` monkey-patches (e.g. C-RADIO `_forward_cpe`) onto a
+       dynamic subclass so `DataParallel` replicas bind `self` to each GPU's local replica instead of `cuda:0`.
+    """
+    try:
+        first_p = next(root.parameters())
+        anchor_dev, anchor_dtype = first_p.device, first_p.dtype
+    except StopIteration:
+        anchor_dev, anchor_dtype = torch.device("cpu"), torch.float32
+
+    if "_dp_anchor" not in root._buffers:
+        root.register_buffer("_dp_anchor", torch.zeros(1, device=anchor_dev, dtype=anchor_dtype), persistent=False)
+
+    for mod in root.modules():
+        bound_methods = {
+            k: v.__func__
+            for k, v in list(mod.__dict__.items())
+            if isinstance(v, types.MethodType) and v.__self__ is mod
+        }
+        has_dtype_prop = isinstance(getattr(type(mod), "dtype", None), property)
+        has_device_prop = isinstance(getattr(type(mod), "device", None), property)
+        needs_props = (has_dtype_prop or has_device_prop) and not getattr(type(mod), "_is_dp_safe_cls", False)
+
+        if needs_props and "_dp_anchor" not in mod._buffers:
+            mod.register_buffer("_dp_anchor", torch.zeros(1, device=anchor_dev, dtype=anchor_dtype), persistent=False)
+
+        if bound_methods or needs_props:
+            cls_dict = dict(bound_methods)
+            cls_dict["_is_dp_safe_cls"] = True
+            if needs_props:
+                if has_dtype_prop:
+                    cls_dict["dtype"] = property(infer_module_dtype)
+                if has_device_prop:
+                    cls_dict["device"] = property(infer_module_device)
+            try:
+                sub_cls = type(f"{type(mod).__name__}_DPSafe", (type(mod),), cls_dict)
+                mod.__class__ = sub_cls
+                for k in bound_methods:
+                    del mod.__dict__[k]
+            except TypeError:
+                pass
+
+    return root
 
 
 _THREAD_STATE = threading.local()

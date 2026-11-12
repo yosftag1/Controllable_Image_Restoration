@@ -18,7 +18,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .action_overlay import ActionOverlayEncoder, PointwiseSpatialModulator
-from .lora_layers import generator_lora_context, inject_generator_dual_lora
+from .lora_layers import (
+    generator_lora_context,
+    infer_module_device,
+    infer_module_dtype,
+    inject_generator_dual_lora,
+    make_module_dataparallel_safe,
+)
 from .semantic_encoder import SemanticEncoder, load_hf_public_safe
 from .skip_vae import SkipConnectedVAE, _MockTinyVAE
 
@@ -236,9 +242,8 @@ class ControllableRestorer(nn.Module):
         mod_hidden = getattr(config, "SPATIAL_MOD_HIDDEN_DIM", 64)
 
         in_ch = int(getattr(self.unet.config, "in_channels", 4))
-        first_param = next(self.unet.parameters())
-        unet_dev = first_param.device
-        unet_dtype = first_param.dtype
+        unet_dev = infer_module_device(self.unet)
+        unet_dtype = infer_module_dtype(self.unet)
 
         probed_channels: Dict[str, int] = {}
         hooks = []
@@ -274,6 +279,8 @@ class ControllableRestorer(nn.Module):
             wrapped_up = _SpatialModulatedUNetStage(self.unet.up_blocks[idx], out_ch, num_actions, mod_hidden)
             self.unet.up_blocks[idx] = wrapped_up
             self.spatial_mod_params.extend(list(wrapped_up.spatial_mod.parameters()))
+
+        make_module_dataparallel_safe(self.unet)
 
     def get_stage_parameter_groups(self) -> Dict[str, List[nn.Parameter]]:
         """Return cleanly separated parameter groups for 3-phase staged or joint training."""
@@ -356,7 +363,7 @@ class ControllableRestorer(nn.Module):
             t_cont = t_cont.expand(z_t.shape[0])
 
         t_unet = (t_cont.float() * 999.0).round().long().clamp(1, 999)
-        unet_dtype = next(self.unet.parameters()).dtype
+        unet_dtype = infer_module_dtype(self.unet, fallback=z_t.dtype)
 
         with generator_lora_context(global_action_cond, lambda_pix=fidelity_scale, lambda_sem=detail_scale):
             with _spatial_action_context(action_map):
@@ -381,7 +388,7 @@ class ControllableRestorer(nn.Module):
     def forward_align_only(self, src_01: torch.Tensor, clean_01: torch.Tensor) -> torch.Tensor:
         """Fast Phase-1 forward pass updating only the Vision Encoder Self-Teacher LoRA."""
         align_loss, _ = self.semantic_encoder.compute_self_teacher_loss(src_01, clean_01)
-        return align_loss
+        return align_loss.reshape(1)
 
     def forward_train(
         self,
@@ -599,7 +606,7 @@ class _GeneratorParallelStage(nn.Module):
             z_t = z_src
 
         t_unet = (t_vec.float() * 999.0).round().long().clamp(1, 999)
-        unet_dtype = next(self.unet.parameters()).dtype
+        unet_dtype = infer_module_dtype(self.unet, fallback=z_t.dtype)
 
         with generator_lora_context(global_action_cond, lambda_pix=fidelity_scale, lambda_sem=detail_scale):
             with _spatial_action_context(action_map):

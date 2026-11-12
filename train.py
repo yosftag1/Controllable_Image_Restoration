@@ -318,40 +318,57 @@ def save_checkpoint(
 
 
 def _wrap_multi_gpu_safely(raw_model: ControllableRestorer, num_gpus: int, device: torch.device, use_amp: bool):
-    """Wrap across all GPUs; if Vision HF remote code binds methods to GPU 0, parallelize the 950M Generator across all GPUs."""
+    """Wrap across all GPUs; try full DataParallel (Vision + Generator) first, then SplitMultiGPURestorer."""
     device_ids = list(range(num_gpus))
-    dummy_img = torch.zeros(num_gpus, 3, 128, 128, device=device)
-    dummy_act = torch.ones(num_gpus, raw_model.config.NUM_ACTIONS, 128, 128, device=device) * 0.5
+    probe_hw = 64 if raw_model.config.GENERATOR_BACKBONE.lower() == "mock_tiny" else int(raw_model.config.PATCH_SIZE)
+    dummy_img = torch.zeros(num_gpus, 3, probe_hw, probe_hw, device=device)
+    dummy_act = torch.ones(num_gpus, raw_model.config.NUM_ACTIONS, probe_hw, probe_hw, device=device) * 0.5
 
     dp_model = torch.nn.DataParallel(raw_model, device_ids=device_ids)
+    dp_msg = ""
     try:
         raw_model.eval()
         with torch.no_grad(), torch.amp.autocast("cuda", enabled=use_amp):
-            _ = dp_model(dummy_img, dummy_act, tgt_01=dummy_img, clean_01=dummy_img, fidelity_scale=1.0, detail_scale=0.0)
+            _ = dp_model(dummy_img, clean_01=dummy_img, align_only=True)
+            _ = dp_model(
+                dummy_img, dummy_act, tgt_01=dummy_img, clean_01=dummy_img, fidelity_scale=1.0, detail_scale=0.5
+            )
         raw_model.train()
-        print(f"✓ Multi-GPU DataParallel ENABLED across {num_gpus} GPUs {device_ids}")
+        print(f"✓ Full Multi-GPU DataParallel ENABLED across {num_gpus} GPUs {device_ids} (Vision + SkipVAE + UNet)")
         return dp_model
-    except Exception:
+    except Exception as dp_err:
+        dp_msg = f"{type(dp_err).__name__}: {dp_err}".splitlines()[0]
+        dp_err.__traceback__ = None
+        del dp_err
         del dp_model
         gc.collect()
         torch.cuda.empty_cache()
 
+    split_model = None
     try:
         split_model = SplitMultiGPURestorer(raw_model, device_ids=device_ids)
         raw_model.eval()
         with torch.no_grad(), torch.amp.autocast("cuda", enabled=use_amp):
-            _ = split_model(dummy_img, dummy_act, tgt_01=dummy_img, clean_01=dummy_img, fidelity_scale=1.0, detail_scale=0.0)
+            _ = split_model(
+                dummy_img, dummy_act, tgt_01=dummy_img, clean_01=dummy_img, fidelity_scale=1.0, detail_scale=0.5
+            )
         raw_model.train()
         print(
             f"✓ Split Multi-GPU ENABLED: Vision Encoder on cuda:0 + "
-            f"Generator (VAE+UNet) DataParallel across {num_gpus} GPUs {device_ids}"
+            f"Generator (SkipVAE + UNet) DataParallel across {num_gpus} GPUs {device_ids} "
+            f"(full DP note: {dp_msg})"
         )
         return split_model
     except Exception as exc:
+        err_msg = f"{type(exc).__name__}: {exc}"
+        exc.__traceback__ = None
+        del exc
+        if split_model is not None:
+            del split_model
         gc.collect()
         torch.cuda.empty_cache()
         raw_model.train()
-        print(f"[Note] Multi-GPU fallback to single device {device} ({exc}).")
+        print(f"[Note] Multi-GPU fallback to single device {device} ({err_msg}).")
         return raw_model
 
 

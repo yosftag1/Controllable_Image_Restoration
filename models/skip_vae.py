@@ -12,7 +12,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .action_overlay import PointwiseSpatialModulator
-from .lora_layers import inject_generator_dual_lora
+from .lora_layers import infer_module_dtype, inject_generator_dual_lora, make_module_dataparallel_safe
 
 
 class _ActionZeroSkipBridge(nn.Module):
@@ -110,6 +110,7 @@ class SkipConnectedVAE(nn.Module):
             alpha=enc_alpha,
             include_conv=True,
         )
+        make_module_dataparallel_safe(self.vae)
 
         # Dynamically probe Encoder & Decoder intermediate channel dimensions
         with torch.no_grad():
@@ -135,7 +136,7 @@ class SkipConnectedVAE(nn.Module):
 
     def _raw_encode(self, x_minus1_to_1: torch.Tensor) -> Tuple[torch.Tensor, List[torch.Tensor]]:
         enc = self.vae.encoder
-        vae_dtype = next(enc.parameters()).dtype
+        vae_dtype = infer_module_dtype(enc, fallback=x_minus1_to_1.dtype)
         h = enc.conv_in(x_minus1_to_1.to(vae_dtype))
         skips: List[torch.Tensor] = [h]  # skip[0]: full resolution (H, W)
 
@@ -158,7 +159,7 @@ class SkipConnectedVAE(nn.Module):
 
     def _probe_decoder_channels(self, z: torch.Tensor) -> List[int]:
         dec = self.vae.decoder
-        vae_dtype = next(dec.parameters()).dtype
+        vae_dtype = infer_module_dtype(dec, fallback=z.dtype)
         h = z.to(vae_dtype) / self.scaling_factor
         if getattr(self.vae, "post_quant_conv", None) is not None:
             h = self.vae.post_quant_conv(h)
@@ -192,7 +193,7 @@ class SkipConnectedVAE(nn.Module):
     ) -> torch.Tensor:
         """Decode latents back to [0, 1] RGB using explicit encoder skips & 1x1 action overlay."""
         dec = self.vae.decoder
-        vae_dtype = next(dec.parameters()).dtype
+        vae_dtype = infer_module_dtype(dec, fallback=latents.dtype)
         h = (latents / self.scaling_factor).to(vae_dtype)
         if getattr(self.vae, "post_quant_conv", None) is not None:
             h = self.vae.post_quant_conv(h)
