@@ -186,6 +186,74 @@ def _format_duration(seconds: float) -> str:
     return f"{h:d}:{m:02d}:{s:02d}" if h > 0 else f"{m:02d}:{s:02d}"
 
 
+_INLINE_IMG_PREFIX = "__INLINE_SWEEP__::"
+
+
+def _in_ipython_kernel() -> bool:
+    """Return True when running inside an active Kaggle/Jupyter IPython kernel (e.g. `%run train.py`)."""
+    try:
+        from IPython import get_ipython
+
+        ip = get_ipython()
+        if ip is None:
+            return False
+        return "IPKernelApp" in getattr(ip, "config", {}) or ip.__class__.__name__ == "ZMQInteractiveShell"
+    except Exception:
+        return False
+
+
+def _display_sweep_in_ipython(image_path: str, caption: str = "", max_width: int = 1800) -> bool:
+    """Render a saved sweep grid inline in Kaggle/Jupyter notebook logs using lightweight JPEG encoding."""
+    if not _in_ipython_kernel():
+        return False
+    try:
+        from IPython.display import HTML, Image, display
+
+        bgr = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+        if bgr is None:
+            return False
+        h, w = bgr.shape[:2]
+        if max_width > 0 and w > max_width:
+            scale = float(max_width) / float(w)
+            bgr = cv2.resize(bgr, (max_width, max(64, int(round(h * scale)))), interpolation=cv2.INTER_AREA)
+
+        ok, enc = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+        if not ok:
+            return False
+        if caption:
+            display(
+                HTML(
+                    f"<div style='margin:8px 0 3px 0;font-family:monospace;font-size:12px;"
+                    f"color:#b8f2d8;background:#1b242c;padding:4px 10px;border-radius:4px;"
+                    f"display:inline-block;'><b>{caption}</b></div>"
+                )
+            )
+        display(Image(data=enc.tobytes(), format="jpeg"))
+        return True
+    except Exception:
+        return False
+
+
+def _emit_inline_sweep(image_path: str, caption: str, config: Config) -> None:
+    """Display sweep inline in IPython directly (1-GPU) or bridge across DDP subprocess stdout (multi-GPU)."""
+    if not bool(getattr(config, "DISPLAY_INLINE_IMAGES", True)):
+        return
+    max_w = int(getattr(config, "INLINE_IMAGE_MAX_WIDTH", 1800))
+    if _in_ipython_kernel():
+        _display_sweep_in_ipython(image_path, caption=caption, max_width=max_w)
+    elif os.environ.get("AGY_PARENT_IPYTHON") == "1":
+        safe_cap = caption.replace("\n", " ").replace("\r", " ").replace("::", " - ")
+        sys.stdout.write(f"{_INLINE_IMG_PREFIX}{safe_cap}::{os.path.abspath(str(image_path))}\n")
+        sys.stdout.flush()
+
+
+def _psnr_u8_tile(pred_u8: np.ndarray, ref_u8: np.ndarray) -> float:
+    mse = float(np.mean((pred_u8.astype(np.float32) - ref_u8.astype(np.float32)) ** 2))
+    if mse <= 1e-8:
+        return 99.99
+    return float(10.0 * np.log10((255.0 * 255.0) / mse))
+
+
 @torch.no_grad()
 def evaluate_validation(model, val_loader, device, config, stage: str):
     raw_model = unwrap_model(model)
@@ -257,8 +325,9 @@ def save_controllable_validation_grid(
     epoch: int,
     stage: str,
     step: int = None,
+    return_summary: bool = False,
 ):
-    """Render visual sweep covering all 8 degradations across 3 validation rows."""
+    """Render visual sweep covering all 8 degradations across 3 validation rows with per-tile dB gains."""
     out_dir = Path(config.OUTPUT_DIR) / "controllable_sweeps"
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -269,6 +338,7 @@ def save_controllable_validation_grid(
     pipeline = SelectiveDegradationPipeline(config)
     num_imgs = min(len(val_dataset), max(1, config.EVAL_IMAGE_COUNT))
     rows_canvas = []
+    row_log_parts = []
 
     for idx in range(num_imgs):
         clean_u8 = val_dataset._load_crop_with_retry(idx)
@@ -279,7 +349,7 @@ def save_controllable_validation_grid(
         s_demo = np.zeros(config.NUM_ACTIONS, dtype=np.float32)
         scenario_id = idx % 3
         if scenario_id == 0:
-            # Row 0: Motion Blur + Sensor Noise + Dark Underexposure
+            row_tag = "Row1[Motion+Noise+Exp]"
             params.underexpose = True
             s_demo[pipeline.type_to_idx["motion_blur"]] = 0.80
             s_demo[pipeline.type_to_idx["gaussian_noise"]] = 0.75
@@ -294,7 +364,7 @@ def save_controllable_validation_grid(
                 ("Split Mask Overlay", "all", "noise=1.0,motion=0.0", "left_half", 1.0, 0.8),
             ]
         elif scenario_id == 1:
-            # Row 1: Defocus Blur + 8-bit Color Banding + Warm Color Cast
+            row_tag = "Row2[Defocus+Band+Cast]"
             params.color_gains_unit = np.array([0.85, 0.15, -0.75], dtype=np.float32)
             params.hue_shift_unit = 0.25
             params.sat_loss_frac = 0.45
@@ -311,7 +381,7 @@ def save_controllable_validation_grid(
                 ("Split Mask Overlay", "all", "banding=1.0,defocus=0.0", "left_half", 1.0, 0.8),
             ]
         else:
-            # Row 2: 4x Downsample/SR + Heavy JPEG + Bright Overexposure
+            row_tag = "Row3[4xSR+JPEG+Exp]"
             params.underexpose = False
             s_demo[pipeline.type_to_idx["downsample_upsample"]] = 0.85
             s_demo[pipeline.type_to_idx["jpeg_compression"]] = 0.78
@@ -328,15 +398,19 @@ def save_controllable_validation_grid(
 
         src_u8 = pipeline.render_with_params(clean_u8, s_demo, params)
         src_t = torch.from_numpy(src_u8.astype(np.float32) / 255.0).permute(2, 0, 1).unsqueeze(0).to(device)
+        in_db = _psnr_u8_tile(src_u8, clean_u8)
 
         left_mask = np.zeros((h, w), dtype=np.float32)
         left_mask[:, : w // 2] = 1.0
         left_mask = cv2.GaussianBlur(left_mask, (0, 0), sigmaX=5.0, sigmaY=5.0)
+        left_3d = left_mask[:, :, None]
 
         specs = [
-            ("Clean GT", clean_u8),
-            ("Degraded Input", src_u8),
+            ("Clean GT", clean_u8, "Ground Truth", (185, 200, 215)),
+            ("Degraded Input", src_u8, f"{in_db:.2f} dB (Input)", (215, 205, 175)),
         ]
+        pix_full_db = in_db
+        dual_full_db = in_db
 
         for label, fg_str, bg_str, mask_tag, f_scale, d_scale in runs:
             mask_2d = left_mask if mask_tag == "left_half" else None
@@ -354,19 +428,55 @@ def save_controllable_validation_grid(
             pred_u8 = np.clip(
                 np.round(pred_t[0].permute(1, 2, 0).detach().cpu().numpy() * 255.0), 0.0, 255.0
             ).astype(np.uint8)
-            specs.append((label, pred_u8))
+
+            if fg_str == "none":
+                max_px = float(np.max(np.abs(pred_u8.astype(np.float32) - src_u8.astype(np.float32))))
+                foot_txt = f"Max|d|={max_px:.1f}px (Lock)"
+                foot_col = (150, 235, 220)
+            else:
+                s_fg = np.clip((1.0 - fg_vec) * s_demo, 0.0, 1.0)
+                tgt_fg = clean_u8 if np.allclose(s_fg, 0.0, atol=1e-4) else pipeline.render_with_params(clean_u8, s_fg, params)
+                if mask_tag == "left_half" and bg_vec is not None:
+                    s_bg = np.clip((1.0 - bg_vec) * s_demo, 0.0, 1.0)
+                    tgt_bg = pipeline.render_with_params(clean_u8, s_bg, params)
+                    tgt_col = np.clip(np.round(left_3d * tgt_fg + (1.0 - left_3d) * tgt_bg), 0.0, 255.0).astype(np.uint8)
+                else:
+                    tgt_col = tgt_fg
+                p_db = _psnr_u8_tile(pred_u8, tgt_col)
+                base_db = _psnr_u8_tile(src_u8, tgt_col)
+                gain_db = p_db - base_db
+                foot_txt = f"{p_db:.2f} dB ({gain_db:+.2f})"
+                if gain_db >= 0.25:
+                    foot_col = (120, 245, 150)
+                elif gain_db <= -0.15:
+                    foot_col = (255, 145, 120)
+                else:
+                    foot_col = (200, 210, 220)
+
+                if label == "Full (Pixel LoRA)":
+                    pix_full_db = p_db
+                elif label == "Full (Dual LoRA)":
+                    dual_full_db = p_db
+
+            specs.append((label, pred_u8, foot_txt, foot_col))
+
+        best_row_db = dual_full_db if stage in ("semantic_stage", "joint") else pix_full_db
+        row_log_parts.append(f"{row_tag}: {in_db:.1f}->{best_row_db:.1f}dB ({best_row_db - in_db:+.2f})")
 
         pad = 6
-        header_h = 44
+        header_h = 34
+        footer_h = 24
         row_w = len(specs) * (w + pad) + pad
-        row_h = header_h + h + pad
+        row_h = header_h + h + footer_h + pad
         panel = np.full((row_h, row_w, 3), 24, dtype=np.uint8)
         font = cv2.FONT_HERSHEY_SIMPLEX
 
-        for c_idx, (col_title, tile_u8) in enumerate(specs):
+        for c_idx, (col_title, tile_u8, foot_txt, foot_col) in enumerate(specs):
             x0 = pad + c_idx * (w + pad)
-            cv2.putText(panel, col_title, (x0 + 4, header_h - 12), font, 0.39, (220, 240, 180), 1, cv2.LINE_AA)
+            cv2.putText(panel, col_title, (x0 + 4, header_h - 9), font, 0.39, (220, 240, 180), 1, cv2.LINE_AA)
             panel[header_h : header_h + h, x0 : x0 + w] = tile_u8
+            cv2.rectangle(panel, (x0, header_h + h), (x0 + w, header_h + h + footer_h - 2), (16, 18, 22), -1)
+            cv2.putText(panel, foot_txt, (x0 + 5, header_h + h + 16), font, 0.37, foot_col, 1, cv2.LINE_AA)
 
         rows_canvas.append(panel)
 
@@ -380,6 +490,8 @@ def save_controllable_validation_grid(
     cv2.imwrite(str(out_dir / "latest_preview.png"), bgr_grid)
     raw_model.clear_runtime_contexts()
     raw_model.train()
+    if return_summary:
+        return str(save_path), " | ".join(row_log_parts)
     return str(save_path)
 
 
@@ -410,7 +522,7 @@ def save_checkpoint(
             "SEMANTIC_ENCODER_TYPE": config.SEMANTIC_ENCODER_TYPE,
             "RADIO_MODEL_ID": getattr(config, "RADIO_MODEL_ID", "nvidia/C-RADIOv3-B"),
             "GENERATOR_BACKBONE": config.GENERATOR_BACKBONE,
-            "RESTORATION_MAX_TIMESTEP": getattr(config, "RESTORATION_MAX_TIMESTEP", 999),
+            "RESTORATION_MAX_TIMESTEP": getattr(config, "RESTORATION_MAX_TIMESTEP", 499),
             "PROMPT_SEQ_LEN": getattr(config, "PROMPT_SEQ_LEN", 77),
             "UNET_LORA_RANK": config.UNET_LORA_RANK,
             "UNET_LORA_ALPHA": config.UNET_LORA_ALPHA,
@@ -449,11 +561,28 @@ def _detect_visible_gpu_count() -> int:
         return 0
 
 
-def _launch_ddp_subprocess(num_gpus: int) -> None:
+def _consume_ddp_output_line(line: str, max_width: int = 1800) -> bool:
+    """Handle one DDP stdout line; returns True if intercepted as an inline sweep image marker."""
+    if line.startswith(_INLINE_IMG_PREFIX):
+        payload = line[len(_INLINE_IMG_PREFIX) :].strip()
+        caption, _, img_path = payload.partition("::")
+        if img_path:
+            _display_sweep_in_ipython(img_path, caption=caption, max_width=max_width)
+        return True
+    sys.stdout.write(line)
+    sys.stdout.flush()
+    return False
+
+
+def _launch_ddp_subprocess(num_gpus: int, config: Config = None) -> None:
     """Spawn isolated multi-process DistributedDataParallel workers (ideal for Kaggle %run notebooks)."""
     sys.last_traceback = None
     sys.last_value = None
     gc.collect()
+
+    inline_enabled = bool(getattr(config, "DISPLAY_INLINE_IMAGES", True)) if config is not None else True
+    max_width = int(getattr(config, "INLINE_IMAGE_MAX_WIDTH", 1800)) if config is not None else 1800
+    parent_ipython = inline_enabled and _in_ipython_kernel()
 
     env = os.environ.copy()
     env.pop("PYTORCH_CUDA_ALLOC_CONF", None)
@@ -463,6 +592,10 @@ def _launch_ddp_subprocess(num_gpus: int) -> None:
     env["MKL_NUM_THREADS"] = "1"
     env["TOKENIZERS_PARALLELISM"] = "false"
     env.setdefault("PYTORCH_KERNEL_CACHE_PATH", "/tmp/torch_kernels")
+    if parent_ipython:
+        env["AGY_PARENT_IPYTHON"] = "1"
+    else:
+        env.pop("AGY_PARENT_IPYTHON", None)
     if "--tqdm" not in sys.argv[1:]:
         env.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 
@@ -477,6 +610,12 @@ def _launch_ddp_subprocess(num_gpus: int) -> None:
         *sys.argv[1:],
     ]
     print(f"✓ Launching {num_gpus}-GPU DistributedDataParallel (DDP) training processes...", flush=True)
+    if inline_enabled and not parent_ipython and os.path.exists("/kaggle"):
+        print(
+            "[Tip] Running via shell (!python) prints text logs only — use '%run train.py ...' "
+            "in a Kaggle cell to render live sweep images inline in the notebook logs!",
+            flush=True,
+        )
     proc = subprocess.Popen(
         cmd,
         env=env,
@@ -487,12 +626,21 @@ def _launch_ddp_subprocess(num_gpus: int) -> None:
     try:
         assert proc.stdout is not None
         fd = proc.stdout.fileno()
+        pending = ""
         while True:
             chunk = os.read(fd, 4096)
             if not chunk:
                 break
-            sys.stdout.write(chunk.decode("utf-8", errors="replace"))
-            sys.stdout.flush()
+            text = pending + chunk.decode("utf-8", errors="replace")
+            lines = text.splitlines(keepends=True)
+            if lines and not (lines[-1].endswith("\n") or lines[-1].endswith("\r")):
+                pending = lines.pop()
+            else:
+                pending = ""
+            for line in lines:
+                _consume_ddp_output_line(line, max_width=max_width)
+        if pending:
+            _consume_ddp_output_line(pending, max_width=max_width)
         rc = proc.wait()
         if rc != 0:
             raise RuntimeError(f"DistributedDataParallel training exited with code {rc}")
@@ -1128,14 +1276,16 @@ def train(
                     if is_main and val_dataset is not None:
                         if device.type == "cuda":
                             torch.cuda.empty_cache()
-                        preview_path = save_controllable_validation_grid(
-                            raw_model, val_dataset, device, config, epoch, stage, step=step_idx
+                        preview_path, row_summary = save_controllable_validation_grid(
+                            raw_model, val_dataset, device, config, epoch, stage, step=step_idx, return_summary=True
                         )
+                        cap_str = f"Preview @ Epoch {epoch:03d}/{config.EPOCHS} Step {step_idx:0{step_width}d}/{num_steps} [{stage}]"
                         print(
-                            f"  ↳ [Preview @ Epoch {epoch:03d} Step {step_idx:0{step_width}d}/{num_steps}] "
-                            f"Saved sweep -> {preview_path}",
+                            f"  ↳ [{cap_str}] Saved sweep -> {preview_path}\n"
+                            f"    {row_summary}",
                             flush=True,
                         )
+                        _emit_inline_sweep(preview_path, caption=f"{cap_str} | {row_summary}", config=config)
                     if is_ddp:
                         dist.barrier()
 
@@ -1160,14 +1310,22 @@ def train(
                         torch.cuda.empty_cache()
                     val_metrics = evaluate_validation(raw_model, val_loader, device, config, stage)
                     epoch_summary.update(val_metrics)
-                    grid_path = save_controllable_validation_grid(raw_model, val_dataset, device, config, epoch, stage)
+                    grid_path, row_summary = save_controllable_validation_grid(
+                        raw_model, val_dataset, device, config, epoch, stage, return_summary=True
+                    )
                     rest_psnr = val_metrics.get("val_restore_psnr", val_metrics["val_psnr"])
                     rest_gain = val_metrics.get("val_restore_gain", 0.0)
                     print(
                         f"Epoch {epoch:03d} | train_loss={epoch_summary['total']:.4f} | "
                         f"restore_psnr={rest_psnr:.2f} dB ({rest_gain:+.2f} dB) | "
-                        f"val_psnr={val_metrics['val_psnr']:.2f} dB | val_l1={val_metrics['val_l1']:.4f} | sweep={grid_path}",
+                        f"val_psnr={val_metrics['val_psnr']:.2f} dB | val_l1={val_metrics['val_l1']:.4f} | sweep={grid_path}\n"
+                        f"  ↳ {row_summary}",
                         flush=True,
+                    )
+                    _emit_inline_sweep(
+                        grid_path,
+                        caption=f"Epoch {epoch:03d}/{config.EPOCHS} [{stage}] | restore_psnr={rest_psnr:.2f} dB ({rest_gain:+.2f} dB) | {row_summary}",
+                        config=config,
                     )
 
                     if rest_psnr > best_psnr:
@@ -1251,6 +1409,7 @@ def main():
     parser.add_argument("--num-workers", type=int, default=None)
     parser.add_argument("--log-interval", type=int, default=None, help="Steps between clean log lines (default: 100)")
     parser.add_argument("--sample-steps", type=int, default=None, help="Save mid-epoch sweep grid every N steps (0=disable, default: 500)")
+    parser.add_argument("--no-inline-images", action="store_true", help="Disable inline sweep image display in Kaggle/Jupyter cell logs")
     parser.add_argument("--tqdm", action="store_true", help="Use interactive tqdm progress bar instead of background-safe line logs")
     args = parser.parse_args()
 
@@ -1306,6 +1465,8 @@ def main():
         config.LOG_INTERVAL = args.log_interval
     if args.sample_steps is not None:
         config.SAMPLE_EVERY_N_STEPS = args.sample_steps
+    if args.no_inline_images:
+        config.DISPLAY_INLINE_IMAGES = False
     if args.tqdm:
         config.USE_TQDM = True
 
@@ -1313,7 +1474,7 @@ def main():
     if not in_ddp_worker and not args.no_ddp and config.MULTI_GPU and config.DEVICE == "cuda":
         visible_gpus = _detect_visible_gpu_count()
         if visible_gpus > 1:
-            _launch_ddp_subprocess(visible_gpus)
+            _launch_ddp_subprocess(visible_gpus, config=config)
             return
 
     train(

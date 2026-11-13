@@ -187,6 +187,8 @@ class Config:
     USE_TQDM = False
     LOG_INTERVAL = 100
     SAMPLE_EVERY_N_STEPS = 500     # Save mid-epoch visual sweep every N steps (0 = end-of-epoch only)
+    DISPLAY_INLINE_IMAGES = True   # Render saved sweep grids inline in Kaggle/Jupyter cell logs (use `%run train.py`)
+    INLINE_IMAGE_MAX_WIDTH = 1800  # Crisp JPEG width (~220 KB/sweep) so background `.ipynb` commits stay fast & light
     VAL_EPOCH_INTERVAL = 1
     EVAL_IMAGE_COUNT = 3
 
