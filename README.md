@@ -31,6 +31,7 @@ Controllable_Image_Restoration/
 ├── config.py                        # Hyperparameters, backbone switches, 3-phase schedule
 ├── train.py                         # 3-Phase Multi-GPU FP16 trainer + controllable sweep grids
 ├── inference.py                     # CLI for global sliders, Dual-LoRA dials & 1-click object masks
+├── app.py                           # Interactive Gradio Web UI (Kaggle / Colab / local notebook ready)
 ├── requirements.txt
 ├── data/
 │   └── selective_dataset.py         # Seed-synchronized partial & spatially localized synthesis
@@ -105,3 +106,13 @@ python inference.py \
 python inference.py --model checkpoints/model_best.pt --image blurry.jpg --action "all" --detail-scale 0.0
 python inference.py --model checkpoints/model_best.pt --image blurry.jpg --action "all" --detail-scale 1.2 --steps 2
 ```
+
+### 4. Interactive Gradio Studio (Kaggle / Colab / Jupyter Notebook)
+
+Launch an interactive web UI right inside your notebook (with live 8-slider control, Before/After drag slider, 1-click semantic object masking, checkpoint hot-swapping, and a Synthetic PSNR Test Lab):
+
+```python
+!pip install -q gradio
+%run app.py --model ./checkpoints/model_best.pt
+```
+

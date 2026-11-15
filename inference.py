@@ -45,33 +45,93 @@ class ControllableInferencer:
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
         self.config = config or Config()
 
-        self.ckpt_stage = None
-        ckpt = None
+        self.checkpoint_path: Optional[str] = None
+        self.ckpt_stage: Optional[str] = None
+        self.ckpt_epoch: Optional[int] = None
+        self.ckpt_best_psnr: Optional[float] = None
+        self._loaded_model_config: dict = {}
+
+        adapter_state = None
         if checkpoint_path:
-            try:
-                ckpt = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
-            except TypeError:
-                ckpt = torch.load(checkpoint_path, map_location=self.device)
+            ckpt = self._read_checkpoint_cpu(checkpoint_path)
+            self.checkpoint_path = str(checkpoint_path)
             self.ckpt_stage = ckpt.get("stage")
-            if "model_config" in ckpt:
-                for key, val in ckpt["model_config"].items():
+            self.ckpt_epoch = ckpt.get("epoch")
+            self.ckpt_best_psnr = ckpt.get("best_psnr")
+            if "model_config" in ckpt and isinstance(ckpt["model_config"], dict):
+                self._loaded_model_config = dict(ckpt["model_config"])
+                for key, val in self._loaded_model_config.items():
                     setattr(self.config, key, val)
+            adapter_state = ckpt.get("trainable_state_dict") or ckpt.get("model_state_dict")
+            del ckpt
+            gc.collect()
 
         self.model = ControllableRestorer(self.config).to(self.device)
-        if ckpt is not None:
-            adapter_state = ckpt.get("trainable_state_dict") or ckpt.get("model_state_dict")
-            if adapter_state is not None:
-                missing_k, unexp_k = self.model.load_trainable_state_dict(adapter_state)
-                if missing_k or unexp_k:
-                    print(
-                        f"[Warning] Checkpoint had {len(missing_k)} missing / {len(unexp_k)} legacy adapter keys. "
-                        f"Make sure you are loading a V3 checkpoint trained with the Pix2Pix-Turbo (t=999 + OpenCLIP) upgrade!"
-                    )
+        if adapter_state is not None:
+            self._apply_adapter_state(adapter_state)
+            del adapter_state
+            gc.collect()
 
         if self.device.type == "cuda" and self.config.USE_AMP:
             cast_frozen_base_to_fp16(self.model)
 
         self.model.eval()
+
+    @staticmethod
+    def _read_checkpoint_cpu(checkpoint_path: str) -> dict:
+        """Load checkpoint on CPU so optimizer/discriminator states never consume GPU VRAM."""
+        try:
+            return torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        except TypeError:
+            return torch.load(checkpoint_path, map_location="cpu")
+
+    def _apply_adapter_state(self, adapter_state: dict) -> Tuple[list, list]:
+        missing_k, unexp_k = self.model.load_trainable_state_dict(adapter_state)
+        if missing_k or unexp_k:
+            print(
+                f"[Warning] Checkpoint had {len(missing_k)} missing / {len(unexp_k)} legacy adapter keys. "
+                f"Make sure you are loading a compatible V3 checkpoint!"
+            )
+        return missing_k, unexp_k
+
+    def switch_checkpoint(self, checkpoint_path: str) -> dict:
+        """Hot-swap adapter weights in-place (~0.2s) without reloading frozen SD-Turbo/C-RADIO backbones."""
+        ckpt = self._read_checkpoint_cpu(checkpoint_path)
+        new_cfg = ckpt.get("model_config") if isinstance(ckpt.get("model_config"), dict) else {}
+        needs_rebuild = bool(self._loaded_model_config and new_cfg and new_cfg != self._loaded_model_config)
+
+        self.checkpoint_path = str(checkpoint_path)
+        self.ckpt_stage = ckpt.get("stage")
+        self.ckpt_epoch = ckpt.get("epoch")
+        self.ckpt_best_psnr = ckpt.get("best_psnr")
+        adapter_state = ckpt.get("trainable_state_dict") or ckpt.get("model_state_dict")
+        del ckpt
+        gc.collect()
+
+        if needs_rebuild:
+            for key, val in new_cfg.items():
+                setattr(self.config, key, val)
+            self._loaded_model_config = dict(new_cfg)
+            del self.model
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            self.model = ControllableRestorer(self.config).to(self.device)
+            if self.device.type == "cuda" and self.config.USE_AMP:
+                cast_frozen_base_to_fp16(self.model)
+
+        if adapter_state is not None:
+            self._apply_adapter_state(adapter_state)
+            del adapter_state
+            gc.collect()
+
+        self.model.eval()
+        return {
+            "path": self.checkpoint_path,
+            "epoch": self.ckpt_epoch,
+            "stage": self.ckpt_stage,
+            "best_psnr": self.ckpt_best_psnr,
+        }
 
     @staticmethod
     def _parse_point(point_str: str) -> Tuple[float, float]:
