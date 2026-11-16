@@ -1,17 +1,9 @@
-"""Single-Image Benchmark Suite: Raw 'As-Is' Sweep + Controlled Synthetic Artifact Stress Test.
+"""Single-Image Benchmark Suite: Raw 'As-Is' Sweep + Controlled Synthetic Artifact Stress Test (V4).
 
-Generates:
-1. `<stem>_benchmark_raw_asis.png`:
-   Runs all individual sliders, Full Pixel-LoRA, Full Dual-LoRA, Identity lock, and 1-Click
-   Semantic Mask directly on the untouched raw input image (both full-scene view and native
-   1:1 pixel center crop when the input exceeds `benchmark_size`).
-2. `<stem>_benchmark_synthetic_sweep.png`:
-   Introduces 4 controlled single/compound camera & compression artifact recipes onto the
-   image and evaluates Identity lock, Selective subset removal, 50% Partial sliders,
-   Targeted Exact sliders, Full 'all' (Pixel vs. Dual LoRA), and Split Spatial Mask with
-   exact PSNR (dB) and SSIM annotations on every panel.
-3. `<stem>_raw_fullres_restored.png` & `<stem>_benchmark_metrics.json`:
-   Full-resolution restored output + structured quantitative report.
+Evaluates all 6 orthogonal controls:
+- 4 objective [0, 1] restoration sliders (`denoise`, `deartifact`, `deblur_motion`, `sharpen_focus`)
+- 2 directional [-1, +1] tone/WB sliders (`exposure`: darken/brighten, `warmth`: cool/warm)
+- Single `detail_scale` generative texture dial (`0.0` = pixel-faithful vs. `0.70` = crisp detail)
 """
 
 import json
@@ -75,7 +67,6 @@ def _prepare_scene_and_crop(
     nw = max(64, int(round((w * scale) / 8.0)) * 8)
     scene_rgb = cv2.resize(rgb_u8, (nw, nh), interpolation=cv2.INTER_AREA)
 
-    # Extract true 1:1 native pixel center crop of matching dimensions (nw, nh) so rows align in one grid!
     ch = min(h, nh)
     cw = min(w, nw)
     y0 = max(0, (h - ch) // 2)
@@ -107,7 +98,6 @@ def _render_annotated_sheet(
 
     canvas = np.full((sheet_h, sheet_w, 3), 18, dtype=np.uint8)
 
-    # Top title bar
     cv2.rectangle(canvas, (0, 0), (sheet_w, top_title_h - 2), (28, 34, 42), -1)
     cv2.putText(
         canvas,
@@ -125,7 +115,6 @@ def _render_annotated_sheet(
 
     y_cursor = top_title_h
     for row_title, cells in rows_data:
-        # Row scenario banner
         cv2.rectangle(
             canvas,
             (pad, y_cursor),
@@ -152,7 +141,6 @@ def _render_annotated_sheet(
             if img_rgb.shape[:2] != (th, tw):
                 img_rgb = cv2.resize(img_rgb, (tw, th), interpolation=cv2.INTER_AREA)
 
-            # Column header
             cv2.rectangle(canvas, (x0, y_col_hdr), (x0 + tw, y_img), (28, 30, 35), -1)
             cv2.putText(
                 canvas,
@@ -165,10 +153,8 @@ def _render_annotated_sheet(
                 cv2.LINE_AA,
             )
 
-            # Image tile
             canvas[y_img : y_img + th, x0 : x0 + tw] = img_rgb
 
-            # Metric footer bar
             cv2.rectangle(canvas, (x0, y_foot), (x0 + tw, y_foot + footer_h), (25, 28, 34), -1)
             cv2.putText(
                 canvas,
@@ -199,31 +185,17 @@ def run_single_image_benchmark(
     seed: int = 1234,
     ckpt_stage: Optional[str] = None,
 ) -> Dict:
-    """Run both Raw As-Is and Controlled Synthetic Artifact benchmarks on a single image.
-
-    Args:
-        image_rgb_u8: Input HxWx3 uint8 RGB array.
-        config: Config object.
-        restore_fn: Callable matching ControllableInferencer.restore signature:
-            `(img_u8, action=..., bg_action=..., point_mask=..., mask_2d=..., steps=..., fidelity_scale=..., detail_scale=...) -> (pred_u8, mask_2d, traj)`
-        output_dir: Folder where benchmark sheets & metrics JSON are saved.
-        image_stem: Filename prefix for outputs.
-        user_action: Action spec used for full-resolution raw output.
-        point_xy: Optional (x, y) click for 1-click semantic object test (defaults to center (0.5, 0.5)).
-        steps: Rectified Flow steps (default 1).
-        benchmark_size: Max side for fast multi-column sweep panels (default 512; 0 = native size).
-        seed: Deterministic RNG seed for reproducible synthetic degradations across checkpoints.
-        ckpt_stage: Optional checkpoint stage string for helpful Dual-LoRA status note.
-    """
+    """Run Raw As-Is and 4-Scenario Directional + Selective Artifact benchmarks on a single image."""
     out_path = Path(output_dir)
     out_path.mkdir(parents=True, exist_ok=True)
     h_orig, w_orig = image_rgb_u8.shape[:2]
     click_pt = point_xy if point_xy is not None else (0.5, 0.5)
+    signed_types = getattr(config, "SIGNED_ACTION_TYPES", ["exposure", "warmth"])
 
     if ckpt_stage in ("align_warmup", "pixel_stage"):
         print(
             f"[Benchmark Note] Loaded checkpoint stage is '{ckpt_stage}' (Semantic-LoRA has not run Stage 3 yet); "
-            "Pixel-LoRA and Dual-LoRA columns will match until semantic_stage completes."
+            "Pixel-Faithful and Detail columns will match until semantic_stage completes."
         )
 
     scene_rgb, crop_rgb = _prepare_scene_and_crop(image_rgb_u8, benchmark_size=benchmark_size)
@@ -234,13 +206,13 @@ def run_single_image_benchmark(
     print(f"\n[1/3] Running Raw Image 'As-Is' Slider Sweep on '{image_stem}' ({w_orig}x{h_orig})...")
     raw_specs = [
         ("2. Identity (none)", "none", "none", False, 1.0, 0.0),
-        ("3. Denoise Only", "noise=1.0", "none", False, 1.0, 0.0),
-        ("4. Deblur Only", "motion=1.0,defocus=1.0", "none", False, 1.0, 0.5),
-        ("5. Exposure + Color", "exposure=1.0,color=1.0", "none", False, 1.0, 0.0),
-        ("6. DeJPEG+Band+SR", "jpeg=1.0,banding=1.0,sr=1.0", "none", False, 1.0, 0.75),
-        ("7. Full (Pixel LoRA)", "all", "none", False, 1.0, 0.0),
-        ("8. Full (Dual LoRA)", "all", "none", False, 1.0, 0.85),
-        ("9. 1-Click Obj Mask", "all", "none", True, 1.0, 0.85),
+        ("3. Denoise+Deartifact", "denoise=1.0,deartifact=1.0", "none", False, 1.0, 0.0),
+        ("4. Motion+Focus Sharp", "deblur_motion=1.0,sharpen_focus=1.0", "none", False, 1.0, 0.55),
+        ("5. Brighten + Warm", "exposure=0.40,warmth=0.35", "none", False, 1.0, 0.0),
+        ("6. Darken + Cool", "exposure=-0.35,warmth=-0.35", "none", False, 1.0, 0.0),
+        ("7. Restore All (Pixel)", "all", "none", False, 1.0, 0.0),
+        ("8. Restore All (Detail)", "all", "none", False, 1.0, 0.70),
+        ("9. 1-Click Obj Mask", "all", "none", True, 1.0, 0.70),
     ]
 
     raw_rows_visual = []
@@ -307,7 +279,6 @@ def run_single_image_benchmark(
         mask_preview_file = out_path / f"{image_stem}_benchmark_raw_mask.png"
         cv2.imwrite(str(mask_preview_file), cv2.cvtColor(saved_raw_mask_preview, cv2.COLOR_RGB2BGR))
 
-    # Full-resolution raw restoration at native (H, W)
     print(f"[2/3] Processing full-resolution raw image ({w_orig}x{h_orig}) with action='{user_action}'...")
     fullres_u8, _, _ = restore_fn(
         image_rgb_u8=image_rgb_u8,
@@ -320,13 +291,12 @@ def run_single_image_benchmark(
     cv2.imwrite(str(fullres_file), cv2.cvtColor(fullres_u8, cv2.COLOR_RGB2BGR))
 
     # =========================================================================
-    # PART 2: CONTROLLED SYNTHETIC ARTIFACT & SELECTIVE CONTROL BENCHMARK
+    # PART 2: CONTROLLED SYNTHETIC ARTIFACT & DIRECTIONAL CONTROL BENCHMARK
     # =========================================================================
-    print("[3/3] Running 4-Scenario Synthetic Artifact & Selective Disentanglement Benchmark...")
+    print("[3/3] Running 4-Scenario Synthetic Artifact, Directional Tone & Selective Control Benchmark...")
     pipeline = SelectiveDegradationPipeline(config)
     sh, sw = scene_rgb.shape[:2]
 
-    # Soft horizontal split mask (Left half = restore, Right half = preserve)
     split_mask = np.zeros((sh, sw), dtype=np.float32)
     split_mask[:, : sw // 2] = 1.0
     split_mask = cv2.GaussianBlur(split_mask, (0, 0), sigmaX=5.0, sigmaY=5.0)
@@ -335,43 +305,51 @@ def run_single_image_benchmark(
     scenarios = [
         {
             "name": "Mild Everyday",
-            "banner": "Scenario 1 [Mild Everyday]: Sensor Noise (0.35) + JPEG (0.45) + Color Cast (0.40) | Selective = Keep Cast",
-            "severities": {"gaussian_noise": 0.35, "jpeg_compression": 0.45, "color_degradation": 0.40},
-            "underexpose": None,
-            "selective_spec": "noise=1.0,jpeg=1.0,color=0.0",
+            "banner": "Scenario 1 [Mild Everyday]: Noise (0.38) + JPEG/Band (0.48) + Warm Cast (+0.55) | Selective = Keep Cast",
+            "state": {"denoise": 0.38, "deartifact": 0.48, "warmth": 0.55},
+            "focus_mode": 0,
+            "artifact_mode": 0,
+            "selective_spec": "denoise=1.0,deartifact=1.0,warmth=0.0",
             "selective_label": "4. Selective (Keep Cast)",
-            "exact_spec": "noise=1.0,jpeg=1.0,color=1.0",
-            "partial_spec": "noise=0.5,jpeg=0.5,color=0.5",
+            "exact_spec": "denoise=1.0,deartifact=1.0,warmth=-0.55",
+            "all_spec": "all,warmth=-0.55",
+            "partial_spec": "denoise=0.5,deartifact=0.5,warmth=-0.275",
         },
         {
             "name": "Night Handheld",
-            "banner": "Scenario 2 [Night Handheld]: Dark Exposure (0.65) + Heavy Noise (0.70) + Motion Blur (0.70) | Selective = Keep Blur",
-            "severities": {"exposure_issue": 0.65, "gaussian_noise": 0.70, "motion_blur": 0.70},
-            "underexpose": True,
-            "selective_spec": "noise=1.0,exposure=1.0,motion=0.0",
+            "banner": "Scenario 2 [Night Handheld]: Dark Exp (-0.68) + Heavy Noise (0.70) + Motion (0.70) | Selective = Keep Blur",
+            "state": {"exposure": -0.68, "denoise": 0.70, "deblur_motion": 0.70},
+            "focus_mode": 0,
+            "artifact_mode": 0,
+            "selective_spec": "denoise=1.0,exposure=0.68,deblur_motion=0.0",
             "selective_label": "4. Selective (Keep Blur)",
-            "exact_spec": "noise=1.0,exposure=1.0,motion=1.0",
-            "partial_spec": "noise=0.5,exposure=0.5,motion=0.5",
+            "exact_spec": "denoise=1.0,exposure=0.68,deblur_motion=1.0",
+            "all_spec": "all,exposure=0.68",
+            "partial_spec": "denoise=0.5,exposure=0.34,deblur_motion=0.5",
         },
         {
             "name": "Washout + Bokeh",
-            "banner": "Scenario 3 [Washout + Bokeh]: Bright Overexposure (0.60) + Defocus (0.65) + Banding (0.55) | Selective = Keep Bokeh",
-            "severities": {"exposure_issue": 0.60, "defocus_blur": 0.65, "color_banding": 0.55},
-            "underexpose": False,
-            "selective_spec": "exposure=1.0,banding=1.0,defocus=0.0",
+            "banner": "Scenario 3 [Washout + Bokeh]: Bright Washout (+0.65) + Defocus (0.65) + Banding (0.55) | Selective = Keep Bokeh",
+            "state": {"exposure": 0.65, "sharpen_focus": 0.65, "deartifact": 0.55},
+            "focus_mode": 0,
+            "artifact_mode": 1,
+            "selective_spec": "exposure=-0.65,deartifact=1.0,sharpen_focus=0.0",
             "selective_label": "4. Selective (Keep Bokeh)",
-            "exact_spec": "exposure=1.0,banding=1.0,defocus=1.0",
-            "partial_spec": "exposure=0.5,banding=0.5,defocus=0.5",
+            "exact_spec": "exposure=-0.65,deartifact=1.0,sharpen_focus=1.0",
+            "all_spec": "all,exposure=-0.65",
+            "partial_spec": "exposure=-0.325,deartifact=0.5,sharpen_focus=0.5",
         },
         {
             "name": "Web Compression",
-            "banner": "Scenario 4 [Web Torture]: Downsample/SR (0.65) + Heavy JPEG (0.75) + Motion (0.45) | Selective = DeJPEG Only",
-            "severities": {"downsample_upsample": 0.65, "jpeg_compression": 0.75, "motion_blur": 0.45},
-            "underexpose": None,
-            "selective_spec": "jpeg=1.0,sr=0.0,motion=0.0",
+            "banner": "Scenario 4 [Web Torture]: LowRes/SR (0.68) + Heavy JPEG (0.75) + Motion (0.45) + Cool (-0.45) | Selective = DeJPEG",
+            "state": {"sharpen_focus": 0.68, "deartifact": 0.75, "deblur_motion": 0.45, "warmth": -0.45},
+            "focus_mode": 1,
+            "artifact_mode": 0,
+            "selective_spec": "deartifact=1.0,sharpen_focus=0.0,deblur_motion=0.0,warmth=0.0",
             "selective_label": "4. Selective (DeJPEG)",
-            "exact_spec": "sr=1.0,jpeg=1.0,motion=1.0",
-            "partial_spec": "sr=0.5,jpeg=0.5,motion=0.5",
+            "exact_spec": "sharpen_focus=1.0,deartifact=1.0,deblur_motion=1.0,warmth=0.45",
+            "all_spec": "all,warmth=0.45",
+            "partial_spec": "sharpen_focus=0.5,deartifact=0.5,deblur_motion=0.5,warmth=0.225",
         },
     ]
 
@@ -381,27 +359,23 @@ def run_single_image_benchmark(
     for s_idx, sc in enumerate(scenarios):
         rng = np.random.default_rng(seed + s_idx * 97)
         params = pipeline.sample_params(sh, sw, rng=rng)
-        if sc["underexpose"] is not None:
-            params.underexpose = bool(sc["underexpose"])
-            params.brightness_frac = max(params.brightness_frac, 0.65)
-        if "color_degradation" in sc["severities"]:
-            params.color_gains_unit = np.array([0.85, 0.15, -0.75], dtype=np.float32)
+        params.focus_mode = int(sc["focus_mode"])
+        params.artifact_mode = int(sc["artifact_mode"])
 
         s_src = np.zeros(config.NUM_ACTIONS, dtype=np.float32)
-        for deg_name, val in sc["severities"].items():
+        for deg_name, val in sc["state"].items():
             s_src[pipeline.type_to_idx[deg_name]] = float(val)
 
         deg_u8 = pipeline.render_with_params(scene_rgb, s_src, params)
         deg_psnr = compute_psnr_u8(deg_u8, scene_rgb)
         deg_ssim = compute_ssim_u8(deg_u8, scene_rgb)
 
-        # Ideal physical targets for Selective, 50% Partial, and Split Mask
-        a_sel = parse_action_spec(sc["selective_spec"], config.DEGRADATION_TYPES)
-        s_tgt_sel = np.clip((1.0 - a_sel) * s_src, 0.0, 1.0)
+        a_sel = parse_action_spec(sc["selective_spec"], config.DEGRADATION_TYPES, signed_types=signed_types)
+        s_tgt_sel = pipeline.compute_target_state(s_src, a_sel)
         tgt_sel_u8 = pipeline.render_with_params(scene_rgb, s_tgt_sel, params)
 
-        a_part = parse_action_spec(sc["partial_spec"], config.DEGRADATION_TYPES)
-        s_tgt_part = np.clip((1.0 - a_part) * s_src, 0.0, 1.0)
+        a_part = parse_action_spec(sc["partial_spec"], config.DEGRADATION_TYPES, signed_types=signed_types)
+        s_tgt_part = pipeline.compute_target_state(s_src, a_part)
         tgt_part_u8 = pipeline.render_with_params(scene_rgb, s_tgt_part, params)
 
         tgt_split_u8 = np.clip(
@@ -415,15 +389,14 @@ def run_single_image_benchmark(
             ("2. Degraded Input", deg_u8, f"{deg_psnr:.2f} dB | SSIM {deg_ssim:.3f}"),
         ]
 
-        # Run 3..9 restoration modes on `deg_u8`
         eval_runs = [
             ("3. Identity (none)", "none", "none", None, 1.0, 0.0, deg_u8, "identity"),
             (sc["selective_label"], sc["selective_spec"], "none", None, 1.0, 0.0, tgt_sel_u8, "selective"),
-            ("5. 50% Partial", sc["partial_spec"], "none", None, 1.0, 0.35, tgt_part_u8, "partial_50"),
+            ("5. 50% Partial", sc["partial_spec"], "none", None, 1.0, 0.25, tgt_part_u8, "partial_50"),
             ("6. Targeted Exact", sc["exact_spec"], "none", None, 1.0, 0.0, scene_rgb, "targeted_exact"),
-            ("7. 'all' (Pixel LoRA)", "all", "none", None, 1.0, 0.0, scene_rgb, "all_pixel"),
-            ("8. 'all' (Dual LoRA)", "all", "none", None, 1.0, 0.85, scene_rgb, "all_dual"),
-            ("9. Split Mask (L/R)", sc["exact_spec"], "none", split_mask, 1.0, 0.5, tgt_split_u8, "split_mask"),
+            ("7. Full (Pixel Only)", sc["all_spec"], "none", None, 1.0, 0.0, scene_rgb, "all_pixel"),
+            ("8. Full (With Detail)", sc["all_spec"], "none", None, 1.0, 0.70, scene_rgb, "all_dual"),
+            ("9. Split Mask (L/R)", sc["exact_spec"], "none", split_mask, 1.0, 0.45, tgt_split_u8, "split_mask"),
         ]
 
         row_m = {
@@ -463,7 +436,7 @@ def run_single_image_benchmark(
 
     synth_sheet_u8 = _render_annotated_sheet(
         synth_rows_visual,
-        sheet_title=f"Synthetic Artifact & Selective Control Benchmark — {image_stem}",
+        sheet_title=f"Synthetic Artifact & Directional Control Benchmark — {image_stem}",
     )
     synth_sheet_file = out_path / f"{image_stem}_benchmark_synthetic_sweep.png"
     cv2.imwrite(str(synth_sheet_file), cv2.cvtColor(synth_sheet_u8, cv2.COLOR_RGB2BGR))
@@ -485,7 +458,6 @@ def run_single_image_benchmark(
     json_file = out_path / f"{image_stem}_benchmark_metrics.json"
     json_file.write_text(json.dumps(report, indent=2), encoding="utf-8")
 
-    # Print clean console summary tables
     print("\n── Raw Image 'As-Is' Sweep Summary (Full Scene) ──")
     print(f"  {'Mode':<24} | {'Mean |d| (0-255)':>16} | {'PSNR vs Raw':>12} | {'Sharpness':>10}")
     print("  " + "-" * 70)
@@ -498,7 +470,7 @@ def run_single_image_benchmark(
     print("\n── Controlled Synthetic Artifact Benchmark (PSNR dB vs Exact Target) ──")
     print(
         f"  {'Scenario':<16} | {'Degraded':>8} | {'Selective':>9} | {'50% Part':>8} | "
-        f"{'Targeted':>8} | {'all(Pix)':>8} | {'all(Dual)':>9} | {'SplitMsk':>8}"
+        f"{'Targeted':>8} | {'all(Pix)':>8} | {'all(Det)':>9} | {'SplitMsk':>8}"
     )
     print("  " + "-" * 92)
     for r in synth_metrics_report:

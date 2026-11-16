@@ -1,4 +1,4 @@
-"""Controllable Inference CLI (Global Sliders, Dual-LoRA Dials, 1-Click Semantic Object Masks)."""
+"""Controllable Inference CLI (6 Orthogonal Controls, Generative Detail Dial, 1-Click Object Masks)."""
 
 import argparse
 import gc
@@ -32,10 +32,9 @@ from utils.semantic_mask import (
 
 
 class ControllableInferencer:
-    """High-level wrapper for controllable global & localized image restoration."""
+    """High-level wrapper for V4 controllable global, directional & localized image restoration."""
 
     def __init__(self, checkpoint_path: Optional[str] = None, config: Optional[Config] = None, device: str = "cuda"):
-        # Release any stale Jupyter/%run traceback GPU references before allocating models
         sys.last_traceback = None
         sys.last_value = None
         gc.collect()
@@ -60,8 +59,7 @@ class ControllableInferencer:
             self.ckpt_best_psnr = ckpt.get("best_psnr")
             if "model_config" in ckpt and isinstance(ckpt["model_config"], dict):
                 self._loaded_model_config = dict(ckpt["model_config"])
-                for key, val in self._loaded_model_config.items():
-                    setattr(self.config, key, val)
+                self._sync_config_from_dict(self._loaded_model_config)
             adapter_state = ckpt.get("trainable_state_dict") or ckpt.get("model_state_dict")
             del ckpt
             gc.collect()
@@ -77,9 +75,14 @@ class ControllableInferencer:
 
         self.model.eval()
 
+    def _sync_config_from_dict(self, cfg_dict: dict) -> None:
+        for key, val in cfg_dict.items():
+            setattr(self.config, key, val)
+        if hasattr(self.config, "DEGRADATION_TYPES"):
+            self.config.NUM_ACTIONS = len(self.config.DEGRADATION_TYPES)
+
     @staticmethod
     def _read_checkpoint_cpu(checkpoint_path: str) -> dict:
-        """Load checkpoint on CPU so optimizer/discriminator states never consume GPU VRAM."""
         try:
             return torch.load(checkpoint_path, map_location="cpu", weights_only=False)
         except TypeError:
@@ -90,12 +93,12 @@ class ControllableInferencer:
         if missing_k or unexp_k:
             print(
                 f"[Warning] Checkpoint had {len(missing_k)} missing / {len(unexp_k)} legacy adapter keys. "
-                f"Make sure you are loading a compatible V3 checkpoint!"
+                f"Make sure you are loading a V4 orthogonal-control checkpoint!"
             )
         return missing_k, unexp_k
 
     def switch_checkpoint(self, checkpoint_path: str) -> dict:
-        """Hot-swap adapter weights in-place (~0.2s) without reloading frozen SD-Turbo/C-RADIO backbones."""
+        """Hot-swap adapter weights in-place (~0.2s) without reloading frozen backbones when compatible."""
         ckpt = self._read_checkpoint_cpu(checkpoint_path)
         new_cfg = ckpt.get("model_config") if isinstance(ckpt.get("model_config"), dict) else {}
         needs_rebuild = bool(self._loaded_model_config and new_cfg and new_cfg != self._loaded_model_config)
@@ -109,8 +112,7 @@ class ControllableInferencer:
         gc.collect()
 
         if needs_rebuild:
-            for key, val in new_cfg.items():
-                setattr(self.config, key, val)
+            self._sync_config_from_dict(new_cfg)
             self._loaded_model_config = dict(new_cfg)
             del self.model
             gc.collect()
@@ -158,7 +160,7 @@ class ControllableInferencer:
         tile_size: Optional[int] = None,
         tile_overlap: Optional[int] = None,
     ):
-        """Restore an RGB uint8 image with global sliders, mask image, or 1-click semantic selection."""
+        """Restore an RGB uint8 image with global sliders, directional tone/WB, or 1-click semantic masks."""
         h, w = image_rgb_u8.shape[:2]
         src_t = (
             torch.from_numpy(image_rgb_u8.astype(np.float32) / 255.0)
@@ -167,8 +169,9 @@ class ControllableInferencer:
             .to(self.device)
         )
 
-        fg_vec = parse_action_spec(action, self.config.DEGRADATION_TYPES)
-        bg_vec = parse_action_spec(bg_action, self.config.DEGRADATION_TYPES)
+        signed_types = getattr(self.config, "SIGNED_ACTION_TYPES", ["exposure", "warmth"])
+        fg_vec = parse_action_spec(action, self.config.DEGRADATION_TYPES, signed_types=signed_types)
+        bg_vec = parse_action_spec(bg_action, self.config.DEGRADATION_TYPES, signed_types=signed_types)
 
         resolved_mask = None
         if point_mask is not None:
@@ -187,7 +190,6 @@ class ControllableInferencer:
                 resolved_mask = cv2.resize(resolved_mask, (w, h), interpolation=cv2.INTER_LINEAR)
 
         if resolved_mask is None:
-            # Compact [1, K] global vector avoids allocating a full-res [1, 8, H, W] overlay on 2K/4K images
             overlay = torch.from_numpy(fg_vec).unsqueeze(0).to(device=self.device, dtype=torch.float32)
         else:
             overlay = build_spatial_action_overlay(
@@ -201,7 +203,6 @@ class ControllableInferencer:
 
         effective_detail_scale = detail_scale
         if effective_detail_scale is None and self.ckpt_stage in ("align_warmup", "pixel_stage"):
-            # Semantic-LoRA has not been trained yet in pre-Stage-3 checkpoints; skip zero branch cleanly
             effective_detail_scale = 0.0
 
         eff_tile = (
@@ -302,21 +303,21 @@ class ControllableInferencer:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Controllable Pretrained Image Restoration CLI")
-    parser.add_argument("--model", type=str, required=False, default=None, help="Path to model_best.pt / model_latest.pt checkpoint")
+    parser = argparse.ArgumentParser(description="Controllable Pretrained Image Restoration CLI (V4)")
+    parser.add_argument("--model", type=str, required=False, default=None, help="Path to model_best.pt / model_latest.pt")
     parser.add_argument("--image", type=str, required=True, help="Path to input image")
     parser.add_argument("--output-dir", type=str, default="./restored", help="Directory to save restored result")
     parser.add_argument(
         "--action",
         type=str,
         default="all",
-        help="Foreground/global action spec, e.g. 'noise=1.0,motion=0.0,exposure=0.7' or 'all'",
+        help="Control spec, e.g. 'denoise=1.0,motion=0.0,exposure=0.6,warmth=-0.4' or 'all'",
     )
     parser.add_argument(
         "--bg-action",
         type=str,
         default="none",
-        help="Background action outside localized mask (default: 'none' = 100%% preserve)",
+        help="Background control outside localized mask (default: 'none' = 100%% preserve)",
     )
     parser.add_argument(
         "--point-mask",
@@ -327,39 +328,20 @@ def main():
     parser.add_argument("--mask-path", type=str, default=None, help="Optional grayscale mask PNG path")
     parser.add_argument("--mask-threshold", type=float, default=None, help="Optional cosine threshold for --point-mask")
     parser.add_argument("--feather-sigma", type=float, default=6.0, help="Mask edge feathering sigma in pixels")
-    parser.add_argument("--fidelity-scale", type=float, default=None, help="Pixel-Faithful LoRA scale (default: 1.0)")
-    parser.add_argument("--detail-scale", type=float, default=None, help="Semantic-Detail LoRA scale (0.0=conservative, 1.0=crisp)")
-    parser.add_argument("--steps", type=int, default=1, help="Number of Rectified Flow Euler steps (1 to 4)")
     parser.add_argument(
-        "--tile-size",
-        type=int,
+        "--detail-scale",
+        type=float,
         default=None,
-        help="Seamless tile size in pixels for high-res 2K/4K photos (default: 512, 0=disable tiling)",
+        help="Generative Texture Detail dial in [0.0, 1.0] (0.0=pixel-faithful PSNR, 0.65-1.0=crisp texture)",
     )
-    parser.add_argument(
-        "--tile-overlap",
-        type=int,
-        default=None,
-        help="Overlap margin in pixels between adjacent tiles (default: 96)",
-    )
-    parser.add_argument(
-        "--benchmark",
-        action="store_true",
-        help="Run full Raw 'As-Is' + 4-Scenario Synthetic Artifact benchmark sweep on --image",
-    )
-    parser.add_argument(
-        "--benchmark-size",
-        type=int,
-        default=512,
-        help="Max side in pixels for multi-column benchmark panels (default: 512, 0=full native res)",
-    )
-    parser.add_argument(
-        "--benchmark-seed",
-        type=int,
-        default=1234,
-        help="Deterministic seed for synthetic benchmark degradations (default: 1234)",
-    )
-    parser.add_argument("--save-trajectory", action="store_true", help="Save intermediate multi-step frames")
+    parser.add_argument("--fidelity-scale", type=float, default=None, help="Internal base adapter scale (default: 1.0)")
+    parser.add_argument("--steps", type=int, default=1, help="Number of passes (default: 1)")
+    parser.add_argument("--tile-size", type=int, default=None, help="Seamless tile size for 2K/4K photos (default: 512)")
+    parser.add_argument("--tile-overlap", type=int, default=None, help="Overlap margin between tiles (default: 96)")
+    parser.add_argument("--benchmark", action="store_true", help="Run full Raw 'As-Is' + 4-Scenario Synthetic benchmark")
+    parser.add_argument("--benchmark-size", type=int, default=512, help="Max side in px for benchmark panels (default: 512)")
+    parser.add_argument("--benchmark-seed", type=int, default=1234, help="Deterministic seed for synthetic benchmark")
+    parser.add_argument("--save-trajectory", action="store_true", help="Save intermediate frames")
     parser.add_argument("--mock", action="store_true", help="Run with offline mock_tiny backbones")
     args = parser.parse_args()
 
@@ -392,6 +374,7 @@ def main():
             tile_overlap=args.tile_overlap,
         )
         return
+
     restored_u8, mask_2d, traj_u8 = inferencer.restore(
         image_rgb_u8=rgb_u8,
         action=args.action,
@@ -410,7 +393,6 @@ def main():
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    stem = Path(args.image).stem
     out_path = out_dir / f"{stem}_restored.png"
     cv2.imwrite(str(out_path), cv2.cvtColor(restored_u8, cv2.COLOR_RGB2BGR))
     print(f"Saved restored image -> {out_path}")
@@ -426,7 +408,7 @@ def main():
         traj_dir.mkdir(parents=True, exist_ok=True)
         for idx, frame_u8 in enumerate(traj_u8):
             cv2.imwrite(str(traj_dir / f"step_{idx:02d}.png"), cv2.cvtColor(frame_u8, cv2.COLOR_RGB2BGR))
-        print(f"Saved {len(traj_u8)} flow trajectory frames -> {traj_dir}")
+        print(f"Saved {len(traj_u8)} trajectory frames -> {traj_dir}")
 
 
 if __name__ == "__main__":

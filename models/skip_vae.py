@@ -1,8 +1,11 @@
-"""DataParallel-safe Skip-Connected AutoencoderKL with 1x1 Action-Gated Bridges.
+"""DataParallel-safe Skip-Connected AutoencoderKL with Blur-Aware Action-Gated Bridges.
 
-Preserves untouched high-frequency pixel details (motion blur trajectories, grain,
-sharp edges, colors) across the 8x latent bottleneck via zero-initialized
-Encoder -> Decoder skip connections modulated locally by the Spatial Action Overlay.
+Fixes the Skip-VAE bottleneck pathology:
+1. Only suppresses coarse/mid skips strongly when spatial deconvolution (`deblur_motion`,
+   `sharpen_focus`) is active—so denoising, de-artifacting, exposure, and warmth edits retain
+   sharp spatial boundaries across the 8x VAE bottleneck instead of getting low-pass smeared!
+2. `GroupNorm(..., affine=False)` + `bias=False` strips global brightness/color casts from
+   encoder skip features so directional `exposure` and `warmth` shifts never leak input casts.
 """
 
 from typing import List, Sequence, Tuple
@@ -15,34 +18,29 @@ from torch.utils.checkpoint import checkpoint as grad_checkpoint
 from .lora_layers import infer_module_dtype, inject_generator_dual_lora
 
 
-# Purely radiometric/tonal edits where spatial edges in the input are still clean once mean/scale-normalized
-_RADIOMETRIC_ONLY_NAMES = {"color_degradation", "exposure_issue"}
+_DECONV_BLUR_NAMES = {"deblur_motion", "sharpen_focus", "motion_blur", "defocus_blur", "downsample_upsample"}
+_NOISE_ART_NAMES = {"denoise", "deartifact", "gaussian_noise", "jpeg_compression", "color_banding"}
 
 
 class _ActionGatedSkipBridge(nn.Module):
-    """Action-suppressed, zero-mean GroupNorm 1x1 skip bridge from Encoder to Decoder.
-
-    Prevents the Skip-VAE shortcut pathology:
-    1. `GroupNorm(..., affine=False)` + `bias=False` strips global color casts & exposure shifts
-       from encoder features so radiometric fixes always come from the UNet's clean latent `hat_z_0`.
-    2. Explicit structural suppression envelope `(1 - s * a_struct)^2` shuts off degraded encoder
-       skips whenever spatial/quantization restoration sliders (deblur, SR, deband, denoise, JPEG)
-       are active, forcing the decoder to reconstruct clean structure from the UNet.
-    """
+    """Blur-aware, zero-mean GroupNorm 1x1 skip bridge from Encoder to Decoder."""
 
     def __init__(
         self,
         enc_channels: int,
         dec_channels: int,
         num_actions: int,
-        struct_indices: Sequence[int],
-        suppression_strength: float = 1.0,
+        blur_indices: Sequence[int],
+        noise_indices: Sequence[int],
+        blur_suppression: float = 0.90,
+        noise_suppression: float = 0.45,
         hidden_dim: int = 64,
     ):
         super().__init__()
-        self.suppression_strength = float(suppression_strength)
-        idx_tensor = torch.tensor(list(struct_indices), dtype=torch.long)
-        self.register_buffer("struct_indices", idx_tensor, persistent=False)
+        self.blur_suppression = float(blur_suppression)
+        self.noise_suppression = float(noise_suppression)
+        self.register_buffer("blur_indices", torch.tensor(list(blur_indices), dtype=torch.long), persistent=False)
+        self.register_buffer("noise_indices", torch.tensor(list(noise_indices), dtype=torch.long), persistent=False)
 
         num_groups = 32
         while enc_channels % num_groups != 0 and num_groups > 1:
@@ -81,14 +79,18 @@ class _ActionGatedSkipBridge(nn.Module):
         else:
             a_local = action_map.float()
 
-        if self.struct_indices.numel() > 0:
-            s_idx = self.struct_indices.to(a_local.device)
-            a_struct = a_local.index_select(1, s_idx).amax(dim=1, keepdim=True)
-        else:
-            a_struct = a_local.amax(dim=1, keepdim=True)
+        suppress = a_local.new_zeros((a_local.shape[0], 1, target_hw[0], target_hw[1]))
+        if self.blur_indices.numel() > 0:
+            b_idx = self.blur_indices.to(a_local.device)
+            a_blur = a_local.index_select(1, b_idx).abs().amax(dim=1, keepdim=True)
+            suppress = torch.maximum(suppress, self.blur_suppression * a_blur)
+        if self.noise_indices.numel() > 0:
+            n_idx = self.noise_indices.to(a_local.device)
+            a_noise = a_local.index_select(1, n_idx).abs().amax(dim=1, keepdim=True)
+            suppress = torch.maximum(suppress, self.noise_suppression * a_noise)
 
-        # Hard upper-bound retention envelope: -> 0.0 when structural sliders (blur/SR/banding/noise/JPEG) -> 1.0
-        retain_env = (1.0 - self.suppression_strength * a_struct).clamp(0.0, 1.0).square()
+        # Smooth non-zero floor (min >= 0.04) ensures learned skip adapters always receive clean gradients
+        retain_env = (1.0 - suppress).clamp(0.12, 1.0)
 
         normed_skip = self.norm(enc_skip_f)
         h_act = self.mlp_1x1(a_local)
@@ -140,9 +142,21 @@ class _MockTinyVAE(nn.Module):
         )
         self.decoder.up_blocks = nn.ModuleList(
             [
-                nn.Sequential(nn.Upsample(scale_factor=2, mode="nearest"), nn.Conv2d(base_ch * 4, base_ch * 4, 3, padding=1), nn.SiLU()),
-                nn.Sequential(nn.Upsample(scale_factor=2, mode="nearest"), nn.Conv2d(base_ch * 4, base_ch * 2, 3, padding=1), nn.SiLU()),
-                nn.Sequential(nn.Upsample(scale_factor=2, mode="nearest"), nn.Conv2d(base_ch * 2, base_ch, 3, padding=1), nn.SiLU()),
+                nn.Sequential(
+                    nn.Upsample(scale_factor=2, mode="nearest"),
+                    nn.Conv2d(base_ch * 4, base_ch * 4, 3, padding=1),
+                    nn.SiLU(),
+                ),
+                nn.Sequential(
+                    nn.Upsample(scale_factor=2, mode="nearest"),
+                    nn.Conv2d(base_ch * 4, base_ch * 2, 3, padding=1),
+                    nn.SiLU(),
+                ),
+                nn.Sequential(
+                    nn.Upsample(scale_factor=2, mode="nearest"),
+                    nn.Conv2d(base_ch * 2, base_ch, 3, padding=1),
+                    nn.SiLU(),
+                ),
                 nn.Sequential(nn.Conv2d(base_ch, base_ch, 3, padding=1), nn.SiLU()),
             ]
         )
@@ -152,7 +166,7 @@ class _MockTinyVAE(nn.Module):
 
 
 class SkipConnectedVAE(nn.Module):
-    """Wraps diffusers AutoencoderKL with explicit multi-scale Action-Gated Skip Bridges."""
+    """Wraps diffusers AutoencoderKL with blur-aware multi-scale Action-Gated Skip Bridges."""
 
     def __init__(self, vae: nn.Module, config):
         super().__init__()
@@ -161,11 +175,9 @@ class SkipConnectedVAE(nn.Module):
         self.scaling_factor = float(getattr(vae.config, "scaling_factor", 0.18215))
         self.gradient_checkpointing = bool(getattr(config, "GRADIENT_CHECKPOINTING", True))
 
-        # Freeze entire base VAE first
         for p in self.vae.parameters():
             p.requires_grad = False
 
-        # Inject lightweight Dual-LoRA into VAE Encoder & Decoder (Pix2Pix-Turbo / S3Diff adaptive VAE)
         enc_rank = getattr(config, "VAE_ENC_LORA_RANK", 8)
         enc_alpha = getattr(config, "VAE_ENC_LORA_ALPHA", 8.0)
         enc_pix_params, enc_sem_params = inject_generator_dual_lora(
@@ -187,7 +199,6 @@ class SkipConnectedVAE(nn.Module):
         self.vae_pix_lora_params = list(enc_pix_params) + list(dec_pix_params)
         self.vae_sem_lora_params = list(enc_sem_params) + list(dec_sem_params)
 
-        # Dynamically probe Encoder & Decoder intermediate channel dimensions
         with torch.no_grad():
             dummy = torch.zeros(1, 3, 64, 64)
             z_dummy, enc_skips = self._raw_encode(dummy)
@@ -195,30 +206,45 @@ class SkipConnectedVAE(nn.Module):
 
         num_actions = config.NUM_ACTIONS
         mod_hidden = getattr(config, "SPATIAL_MOD_HIDDEN_DIM", 64)
-        self.skip_dropout_prob = float(getattr(config, "SKIP_DROPOUT_PROB", 0.50))
+        self.skip_dropout_prob = float(getattr(config, "SKIP_DROPOUT_PROB", 0.0))
 
         deg_names = list(getattr(config, "DEGRADATION_TYPES", []))
-        struct_indices = [
-            i for i in range(num_actions)
-            if i >= len(deg_names) or deg_names[i] not in _RADIOMETRIC_ONLY_NAMES
-        ]
+        blur_indices = [i for i, n in enumerate(deg_names) if n in _DECONV_BLUR_NAMES]
+        noise_indices = [i for i, n in enumerate(deg_names) if n in _NOISE_ART_NAMES]
 
-        # Multi-scale mid/coarse bridges ONLY ([H/8, H/4, H/2] — NO raw HxW conv_in pixel-copy bypass!):
-        # enc_skips = [skip_2x (H/2), skip_4x (H/4), skip_8x (H/8)]
-        # dec_channels = [pre_up0 (H/8), pre_up1 (H/4), pre_up2 (H/2)]
+        # Multi-scale bridges ([H/8, H/4, H/2]) with scale-appropriate blur vs. noise attenuation:
+        # At H/8 & H/4, fine grain is already pooled down so sharp object edges pass cleanly during denoising!
         self.up_skip_bridges = nn.ModuleList(
             [
                 _ActionGatedSkipBridge(
-                    enc_skips[2].shape[1], dec_channels[0], num_actions, struct_indices,
-                    suppression_strength=0.85, hidden_dim=mod_hidden,
+                    enc_skips[2].shape[1],
+                    dec_channels[0],
+                    num_actions,
+                    blur_indices,
+                    noise_indices,
+                    blur_suppression=0.55,
+                    noise_suppression=0.15,
+                    hidden_dim=mod_hidden,
                 ),
                 _ActionGatedSkipBridge(
-                    enc_skips[1].shape[1], dec_channels[1], num_actions, struct_indices,
-                    suppression_strength=1.00, hidden_dim=mod_hidden,
+                    enc_skips[1].shape[1],
+                    dec_channels[1],
+                    num_actions,
+                    blur_indices,
+                    noise_indices,
+                    blur_suppression=0.78,
+                    noise_suppression=0.30,
+                    hidden_dim=mod_hidden,
                 ),
                 _ActionGatedSkipBridge(
-                    enc_skips[0].shape[1], dec_channels[2], num_actions, struct_indices,
-                    suppression_strength=1.00, hidden_dim=mod_hidden,
+                    enc_skips[0].shape[1],
+                    dec_channels[2],
+                    num_actions,
+                    blur_indices,
+                    noise_indices,
+                    blur_suppression=0.88,
+                    noise_suppression=0.55,
+                    hidden_dim=mod_hidden,
                 ),
             ]
         )
@@ -287,7 +313,7 @@ class SkipConnectedVAE(nn.Module):
         skip_scale: float = 1.0,
         release_skips: bool = False,
     ) -> torch.Tensor:
-        """Decode latents back to [0, 1] RGB using action-suppressed skips & DDP-safe skip dropout."""
+        """Decode latents back to [0, 1] RGB using blur-aware action-gated skip bridges."""
         dec = self.vae.decoder
         vae_dtype = infer_module_dtype(dec, fallback=latents.dtype)
         use_ckpt = getattr(self, "gradient_checkpointing", False) and self.training and torch.is_grad_enabled()
@@ -310,7 +336,6 @@ class SkipConnectedVAE(nn.Module):
             h = h.requires_grad_(True)
         h = grad_checkpoint(dec.mid_block, h, use_reentrant=False) if use_ckpt else dec.mid_block(h)
 
-        # Reverse order matches [skip_8x (2), skip_4x (1), skip_2x (0)]
         skip_indices = [2, 1, 0]
         for idx, up_block in enumerate(dec.up_blocks):
             if idx < 3 and len(enc_skips) > skip_indices[idx]:

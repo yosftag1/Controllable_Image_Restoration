@@ -1,118 +1,91 @@
-# Controllable Pretrained Image Restoration
+# Controllable Pretrained Image Restoration (V4)
 
-An **action-conditioned, spatially controllable image restoration framework** that repurposes pretrained **Semantic Vision Foundation Models** (`nvidia/C-RADIOv3-B` default, `nvidia/C-RADIOv2-B`, or `DINOv3 / DINOv2-Registers + SigLIP 2`) and **Fast Pretrained Diffusion/Flow Generators** (`stabilityai/sd-turbo` or `segmind/tiny-sd`)—without forcing images back to a single blind "base state."
+An **orthogonal, spatially controllable & directionally graded image restoration framework** built on **Semantic Vision Foundation Models** (`nvidia/C-RADIOv3-B` default, `nvidia/C-RADIOv2-B`, or `DINOv3 / DINOv2-Registers + SigLIP 2`) and **Fast Pretrained Diffusion Generators** (`stabilityai/sd-turbo` or `segmind/tiny-sd`).
 
-Instead of wiping out intentional motion blur, bokeh, film grain, or mood lighting, you pass a **Spatial Action Overlay** $\mathbf{A} \in [0, 1]^{8 \times H \times W}$ (via global sliders, custom masks, or **1-click semantic object selection**) plus **Dual-LoRA Fidelity/Detail dials** ($\lambda_{\text{pix}}, \lambda_{\text{sem}}$) to control *exactly what* gets fixed, *where*, and *how conservatively vs. generatively*.
+Instead of forcing every photo to an ambiguous "auto-fixed" state or wiping out intentional motion blur, portrait bokeh, film grain, or mood lighting, you pass a **6-Channel Spatial Control Overlay** $\mathbf{A}(y, x)$ plus a single **Generative Texture Detail** dial ($\lambda_{\text{det}} \in [0, 1]$):
 
----
+### Control Knobs
 
-## Core Architecture
-
-1. **Semantic "Eyes" (`SemanticEncoder` + Self-Teacher LoRA)**:
-   - Defaults to **`nvidia/C-RADIOv3-B`** (~90M unified *FeatSharp* distillation of `DINO` + `SigLIP` + `SAM`; also supports `nvidia/C-RADIOv2-B` or **`DINOv3 / DINOv2-Registers` + `SigLIP 2-Base`**).
-   - **Zero-Extra-VRAM Self-Teacher Alignment**: Frozen base weights act as the clean teacher (`LoRA OFF` on clean $x_0$) while lightweight `SwitchableLoRALinear` detours (`LoRA ON` on degraded $x_{\text{src}}$) learn to extract clean semantic tokens through heavy compound noise, dark gamma, and blur.
-2. **Generative "Hands" (`SkipConnectedVAE` + Dual-LoRA `UNet2DConditionModel`)**:
-   - Supports **`stabilityai/sd-turbo`** (peak 1-step generative quality) and **`segmind/tiny-sd` / `nota-ai/bk-sdm-tiny`** (~323M ultra-lightweight UNet), dropping the 123M–350M CLIP text encoder completely.
-   - **Action-Gated Skip-Connected VAE**: Zero-initialized multi-scale Encoder $\to$ Decoder bridges modulated pointwise (`1×1` Conv) by the Spatial Action Overlay let untouched pixels and intentional effects bypass the `8×` latent bottleneck with zero blur.
-   - **Action-Modulated Dual-LoRA (`PiSA-SR` + `S3Diff` style)**:
-     - **Pixel-Faithful LoRA ($\lambda_{\text{pix}}$)**: Trained strictly on structural/frequency losses for artifact-free accuracy.
-     - **Semantic-Detail LoRA ($\lambda_{\text{sem}}$)**: Trained with frozen Pixel-LoRA on multi-layer perceptual + `C-RADIO`/`DINOv3` semantic consistency losses for crisp texture synthesis on heavy blur and downsampling.
-3. **Pixel Overlay Sheet (`PointwiseSpatialModulator` + Zero-Action Lock)**:
-   - Uses strictly `1×1` spatial modulation (`kernel_size=1`, zero spatial receptive field across neighbors) so **whole-image sliders**, **single-object masks**, and **multi-region edits** behave identically at every pixel, backed by a **Zero-Action Lock** guaranteeing exact bit-for-bit preservation wherever all sliders equal `0.0`.
-4. **Seed-Synchronized Selective Degradation Synthesis (`SelectiveDegradationPipeline`)**:
-   - Samples all physical random variables (`DegradationParams`) upfront with continuous kernel interpolation, non-commutativity guards for radiometric + compression pairs, and **false-positive slider training** so pushing sliders up on already-clean attributes never causes ringing or over-smoothing.
+| Knob | Range | Meaning |
+| :--- | :---: | :--- |
+| **`denoise`** | `[0.0, 1.0]` | `0.0` = keep grain · `1.0` = full sensor luminance & chroma denoise |
+| **`deartifact`** | `[0.0, 1.0]` | `0.0` = keep · `1.0` = remove JPEG 8×8 blocking, ringing & 8-bit sky banding |
+| **`deblur_motion`** | `[0.0, 1.0]` | `0.0` = keep panning/motion streaks · `1.0` = deconvolve camera shake |
+| **`sharpen_focus`** | `[0.0, 1.0]` | `0.0` = keep portrait bokeh · `1.0` = sharpen optical defocus & low-res softness |
+| **`exposure`** | `[-1.0, +1.0]` | `-1.0` = darken / recover washout · `0.0` = keep mood lighting · `+1.0` = brighten shadows |
+| **`warmth`** | `[-1.0, +1.0]` | `-1.0` = cool / remove warm yellow cast · `0.0` = keep · `+1.0` = warm / remove cold blue cast |
+| **`detail_scale`** | `[0.0, 1.0]` | `0.0` = conservative pixel-faithful PSNR · `0.65–1.0` = crisp generative texture detail |
 
 ---
 
-## Project Layout
+## Core V4 Architecture
 
-```text
-Controllable_Image_Restoration/
-├── config.py                        # Hyperparameters, backbone switches, 3-phase schedule
-├── train.py                         # 3-Phase Multi-GPU FP16 trainer + controllable sweep grids
-├── inference.py                     # CLI for global sliders, Dual-LoRA dials & 1-click object masks
-├── app.py                           # Interactive Gradio Web UI (Kaggle / Colab / local notebook ready)
-├── requirements.txt
-├── data/
-│   └── selective_dataset.py         # Seed-synchronized partial & spatially localized synthesis
-├── models/
-│   ├── lora_layers.py               # Switchable Self-Teacher LoRA & Action-Modulated Dual-LoRA
-│   ├── semantic_encoder.py          # C-RADIOv2.5-B & DINOv3+SigLIP2 wrapper
-│   ├── action_overlay.py            # Action tokens + 1x1 PointwiseSpatialModulator (SPADE)
-│   ├── skip_vae.py                  # DataParallel-safe SkipConnectedVAE
-│   └── controllable_restorer.py     # End-to-end 1-to-4 step Latent Rectified Flow restorer
-├── losses/
-│   └── controllable_losses.py       # Charbonnier + Gradient + 2D FFT + Multi-Layer VGG + Semantic Consistency
-├── utils/
-│   └── semantic_mask.py             # Action string parser & 1-click semantic object mask extractor
-└── tests/
-    └── smoke_test.py                # Syntax, physics, Dual-LoRA isolation & overlay verification
-```
+1. **Calibrated Pre-Scaled `SD-Turbo` Step (`t = 249`)**:
+   - Pre-scales encoded latents (`z_in = sqrt_alpha_bar * z_src`) onto `sd-turbo`'s exact native ADD amplitude manifold and predicts $\hat{z}_0 = z_{\text{src}} - \sigma_t \hat{\epsilon}_\theta$, preserving exact `1.0x` unit identity at Step 0 instead of `1.90x` unscaled gain blowup.
+2. **Dense 2D `C-RADIO` Spatial Grid + Full Encoder-to-Decoder Spatial Modulation**:
+   - Injects spatially aligned 2D `C-RADIOv3-B` (`FeatSharp`) feature grids directly into UNet bottleneck and mid-resolution decoder blocks while modulating `conv_in`, all `down_blocks`, `mid_block`, and `up_blocks` pointwise (`1×1` SPADE) with the 6-channel spatial control overlay.
+3. **Blur-Aware `SkipConnectedVAE` + Native `H × W` `PixelSpaceRefiner`**:
+   - Blur-aware skip bridges retain sharp `H/4` & `H/8` object boundaries during denoising/tone edits while suppressing blurred encoder features during deconvolution.
+   - `PixelSpaceRefiner` combines a `1×1` rational-curve radiometric head (>40 dB directional `exposure` & `warmth` accuracy without `8x` VAE loss) with action-modulated depthwise-separable `3×3` edge blocks and a **Signed-Safe Zero-Action Lock** (`max(|a_k|) == 0`).
+4. **Calibrated Multi-Scale Phase + Edge + Preservation Objective**:
+   - Balances Charbonnier RGB L1, a 3-scale H/V/diagonal edge gradient pyramid, phase-aligned complex `rfft2` + log-amplitude frequency loss, multi-scale (`1×1` mean/std, `4×4`, `16×16`) opponent chroma/tone loss, bounded unit-normalized LPIPS, Vision-Aided PatchGAN, and an explicit **zero-DC tone lock** whenever `exposure = warmth = 0`.
 
 ---
 
 ## Quick Start
 
-### 1. Install Dependencies
+### 1. Install & Run Smoke Tests
 ```bash
 pip install -r requirements.txt
 python tests/smoke_test.py
 ```
 
-### 2. 3-Phase Training (Supports Single-GPU & Multi-GPU e.g. Kaggle 2× T4)
-Checkpoints only store the lightweight trainable LoRA / Skip-VAE / Overlay weights (**~45 MB** instead of 4 GB) as `model_latest.pt` and `model_best.pt`:
+### 2. Kaggle 2× T4 Training (~28k steps on DF2K-OST)
+> **Note:** Start V4 training fresh (without resuming legacy 8-slider V1–V3 checkpoints).
 
-```bash
-# On Kaggle, install open-clip-torch once if using C-RADIO (or omit to auto-fallback to DINOv2+SigLIP2)
+```python
 !pip install -q open-clip-torch
 
-# Kaggle DF2K-OST notebook workflow (safe on both fresh Epoch 1 runs & resumed sessions)
+%run train.py \
+  --train-root /kaggle/input/datasets/thaihoa1476050/df2k-ost/train \
+  --val-root /kaggle/input/datasets/thaihoa1476050/df2k-ost/test/DIV2K_valid
+```
+
+To resume an interrupted **V4** session seamlessly:
+```python
 %run train.py \
   --train-root /kaggle/input/datasets/thaihoa1476050/df2k-ost/train \
   --val-root /kaggle/input/datasets/thaihoa1476050/df2k-ost/test/DIV2K_valid \
   --resume ./checkpoints/model_latest.pt
-
-# Default local DIV2K: C-RADIOv2.5-B + sd-turbo (3-phase staged training)
-python train.py --data-root ./data/DIV2K
-
-# Ultra-lightweight generator + DINOv3+SigLIP2 vision encoders
-python train.py --data-root ./data/DIV2K --backbone tiny-sd --vision-encoder dinov3_siglip2
-
-# Fast debug check (3 epochs: 1 Warmup + 1 Pixel Stage + 1 Semantic Stage)
-python train.py --debug --data-root ./data/DIV2K
 ```
 
 ### 3. Controllable Inference Examples
-
 ```bash
-# A) Selective Global Control: Remove 100% noise & brighten exposure 70%, KEEP motion blur untouched!
+# A) Night Handheld Shot: Denoise + brighten shadows (+0.65), KEEP motion blur untouched!
 python inference.py \
     --model checkpoints/model_best.pt \
-    --image sample.jpg \
-    --action "noise=1.0,exposure=0.7,motion=0.0" \
-    --detail-scale 0.75
+    --image night_panning.jpg \
+    --action "denoise=1.0,exposure=0.65,motion=0.0" \
+    --detail-scale 0.0
 
-# B) 1-Click Localized Object Control: Click subject at (x=0.5, y=0.45) to deblur & denoise subject,
-#    while keeping background panning motion blur intact (only denoising background)!
+# B) Washed-Out Portrait: Darken highlights (-0.60), cool warm cast (-0.40), KEEP portrait bokeh!
+python inference.py \
+    --model checkpoints/model_best.pt \
+    --image portrait.jpg \
+    --action "denoise=0.5,deartifact=1.0,exposure=-0.60,warmth=-0.40,focus=0.0"
+
+# C) 1-Click Localized Object Restoration: Deblur & denoise clicked subject, only denoise background!
 python inference.py \
     --model checkpoints/model_best.pt \
     --image panning_car.jpg \
     --point-mask "0.5,0.45" \
-    --action "noise=1.0,motion=1.0" \
-    --bg-action "noise=1.0,motion=0.0" \
-    --detail-scale 1.0
-
-# C) Conservative Pixel-Exact Mode vs. High-Detail Mode (PiSA-SR Dual-LoRA dial, zero retraining)
-python inference.py --model checkpoints/model_best.pt --image blurry.jpg --action "all" --detail-scale 0.0
-python inference.py --model checkpoints/model_best.pt --image blurry.jpg --action "all" --detail-scale 1.2 --steps 2
+    --action "denoise=1.0,motion=1.0" \
+    --bg-action "denoise=1.0,motion=0.0" \
+    --detail-scale 0.70
 ```
 
-### 4. Interactive Gradio Studio (Kaggle / Colab / Jupyter Notebook)
-
-Launch an interactive web UI right inside your notebook (with live 8-slider control, Before/After drag slider, 1-click semantic object masking, checkpoint hot-swapping, and a Synthetic PSNR Test Lab):
-
+### 4. Interactive Gradio Studio
 ```python
 !pip install -q gradio
 %run app.py --model ./checkpoints/model_best.pt
 ```
-

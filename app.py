@@ -1,12 +1,8 @@
-"""Interactive Gradio Web UI for Controllable Pretrained Image Restoration.
+"""Interactive Gradio Web UI for Controllable Pretrained Image Restoration (V4 Orthogonal + Directional).
 
 Designed to run effortlessly inside Kaggle / Colab / Jupyter notebooks or locally:
-    # Inside a Kaggle or Colab notebook cell:
     !pip install -q gradio
     %run app.py --model ./checkpoints/model_best.pt
-
-    # Or from terminal / shell cell:
-    !python app.py --model ./checkpoints/model_best.pt --share
 """
 
 import argparse
@@ -49,60 +45,96 @@ from utils.semantic_mask import (
     render_mask_overlay_preview,
 )
 
-# Serialize GPU forward passes so device-scoped Dual-LoRA / Spatial Overlay contexts never overlap
 _INFER_LOCK = threading.Lock()
 
-SLIDER_SPECS: List[Tuple[str, str, str]] = [
-    ("gaussian_noise", "Gaussian / Sensor Noise", "Removes ISO grain & color/luminance noise"),
-    ("motion_blur", "Motion Blur", "Deblurs camera shake or subject motion streaks"),
-    ("defocus_blur", "Defocus / Out-of-Focus Blur", "Sharpens optical defocus (keep at 0.0 to preserve bokeh!)"),
-    ("jpeg_compression", "JPEG Compression Artifacts", "Removes 8x8 blockiness & mosquito ringing"),
-    ("exposure_issue", "Exposure & Gamma", "Recovers dark underexposure or washed-out highlights"),
-    ("color_degradation", "Color Cast & White Balance", "Neutralizes color tints & restores natural saturation"),
-    ("color_banding", "Color Banding", "Smooths 8-bit sky/gradient posterization steps"),
-    ("downsample_upsample", "Low-Res / 4x Super-Res Detail", "Synthesizes crisp high-frequency edges on upscaled inputs"),
+# (key, label, info, min_val, max_val, default_val)
+SLIDER_SPECS: List[Tuple[str, str, str, float, float, float]] = [
+    (
+        "denoise",
+        "Sensor Noise Removal",
+        "0.0 = preserve ISO/film grain | 1.0 = full luminance & chroma denoise",
+        0.0,
+        1.0,
+        1.0,
+    ),
+    (
+        "deartifact",
+        "Compression & Banding Cleanup",
+        "0.0 = preserve | 1.0 = remove JPEG 8x8 blocks, ringing & 8-bit sky banding",
+        0.0,
+        1.0,
+        1.0,
+    ),
+    (
+        "deblur_motion",
+        "Motion Deblur",
+        "0.0 = preserve panning/motion streaks | 1.0 = deconvolve camera shake",
+        0.0,
+        1.0,
+        1.0,
+    ),
+    (
+        "sharpen_focus",
+        "Focus & Detail Sharpening",
+        "0.0 = preserve portrait bokeh | 1.0 = sharpen optical defocus & low-res softness",
+        0.0,
+        1.0,
+        1.0,
+    ),
+    (
+        "exposure",
+        "Exposure (Darken  ↔  Keep  ↔  Brighten)",
+        "-1.0 = darken washed highlights | 0.0 = keep mood lighting | +1.0 = brighten dark shadows",
+        -1.0,
+        1.0,
+        0.0,
+    ),
+    (
+        "warmth",
+        "White Balance / Warmth (Cool  ↔  Keep  ↔  Warm)",
+        "-1.0 = cool / remove warm yellow cast | 0.0 = keep | +1.0 = warm / remove cold blue cast",
+        -1.0,
+        1.0,
+        0.0,
+    ),
 ]
 
+# Order matches SLIDER_SPECS: [denoise, deartifact, deblur_motion, sharpen_focus, exposure, warmth]
 RESTORE_PRESETS = {
-    "Fix Everything ('all')": [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
-    "Identity / Zero-Action Lock ('none')": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-    "Night Action Shot (Denoise + Exposure, KEEP Motion Blur)": [1.0, 0.0, 0.0, 0.3, 1.0, 0.5, 0.5, 0.0],
-    "Portrait Cleanup (Denoise + Color + Banding, KEEP Bokeh)": [1.0, 0.0, 0.0, 0.5, 0.6, 1.0, 1.0, 0.0],
-    "Old Web Image (DeJPEG + Crisp 4x Detail + Deband)": [0.4, 0.0, 0.3, 1.0, 0.3, 0.4, 1.0, 1.0],
-    "Handheld Deblur Only (Motion + Defocus)": [0.2, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.3],
+    "Restore All Artifacts (Keep Original Tone & WB)": [1.0, 1.0, 1.0, 1.0, 0.0, 0.0],
+    "Identity / Zero-Action Lock ('none')": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+    "Night Action Shot (Denoise + Brighten +0.65, KEEP Motion Blur)": [1.0, 0.4, 0.0, 0.0, 0.65, 0.0],
+    "Portrait Bokeh Cleanup (Denoise + Deband + Cool WB, KEEP Bokeh)": [1.0, 1.0, 0.0, 0.0, 0.0, -0.35],
+    "Washed-Out Overexposed Fix (Darken -0.60 + Sharpen + Deband)": [0.3, 1.0, 0.0, 1.0, -0.60, 0.0],
+    "Old Compressed Web Photo (DeJPEG + Sharpen Focus)": [0.4, 1.0, 0.3, 1.0, 0.0, 0.0],
+    "Artistic Golden-Hour Grade Only (Zero Structural Change)": [0.0, 0.0, 0.0, 0.0, 0.25, 0.50],
 }
 
 SYNTH_RECIPES = {
     "Custom Sliders": None,
-    "Handheld Low-Light (Motion + Noise + Dark Exposure)": {
-        "gaussian_noise": 0.75,
-        "motion_blur": 0.80,
-        "defocus_blur": 0.0,
-        "jpeg_compression": 0.0,
-        "exposure_issue": 0.65,
-        "color_degradation": 0.0,
-        "color_banding": 0.0,
-        "downsample_upsample": 0.0,
+    "Night Handheld (Dark Exposure -0.68 + Heavy Noise + Motion Blur)": {
+        "denoise": 0.72,
+        "deartifact": 0.0,
+        "deblur_motion": 0.75,
+        "sharpen_focus": 0.0,
+        "exposure": -0.68,
+        "warmth": 0.0,
     },
-    "Portrait Cast & Posterization (Defocus + Banding + Color Shift)": {
-        "gaussian_noise": 0.0,
-        "motion_blur": 0.0,
-        "defocus_blur": 0.80,
-        "jpeg_compression": 0.0,
-        "exposure_issue": 0.0,
-        "color_degradation": 0.85,
-        "color_banding": 0.82,
-        "downsample_upsample": 0.0,
+    "Washout + Bokeh + Warm Cast (Bright +0.65 + Defocus + Banding + Warm +0.55)": {
+        "denoise": 0.0,
+        "deartifact": 0.65,
+        "deblur_motion": 0.0,
+        "sharpen_focus": 0.70,
+        "exposure": 0.65,
+        "warmth": 0.55,
     },
-    "Compressed Low-Res Web Photo (4x Downsample + Heavy JPEG + Washed Exp)": {
-        "gaussian_noise": 0.0,
-        "motion_blur": 0.0,
-        "defocus_blur": 0.0,
-        "jpeg_compression": 0.80,
-        "exposure_issue": 0.60,
-        "color_degradation": 0.0,
-        "color_banding": 0.0,
-        "downsample_upsample": 0.85,
+    "Compressed Low-Res Web Photo (Low-Res + Heavy JPEG + Cool Cast -0.50)": {
+        "denoise": 0.0,
+        "deartifact": 0.80,
+        "deblur_motion": 0.40,
+        "sharpen_focus": 0.75,
+        "exposure": 0.0,
+        "warmth": -0.50,
     },
 }
 
@@ -154,7 +186,6 @@ def discover_checkpoints(explicit_path: Optional[str] = None) -> List[str]:
             except OSError:
                 pass
 
-    # Deduplicate and rank model_best.pt first
     seen = set()
     unique: List[Path] = []
     for p in candidates:
@@ -174,8 +205,8 @@ def discover_checkpoints(explicit_path: Optional[str] = None) -> List[str]:
 
 def _format_sliders_to_action_spec(slider_vals: List[float]) -> str:
     parts = []
-    for (deg_key, _, _), val in zip(SLIDER_SPECS, slider_vals):
-        parts.append(f"{deg_key}={float(val):.2f}")
+    for (deg_key, _, _, _, _, _), val in zip(SLIDER_SPECS, slider_vals):
+        parts.append(f"{deg_key}={float(val):.3f}")
     return ",".join(parts)
 
 
@@ -193,7 +224,6 @@ def _ensure_rgb_u8(img: Optional[np.ndarray]) -> Optional[np.ndarray]:
 
 
 def _make_side_by_side(before_u8: np.ndarray, after_u8: np.ndarray) -> np.ndarray:
-    """Build a clean labeled Before | After comparison image when ImageSlider is unavailable."""
     h, w = before_u8.shape[:2]
     sep = np.full((h, 4, 3), 240, dtype=np.uint8)
     canvas = np.concatenate([before_u8, sep, after_u8], axis=1)
@@ -203,7 +233,6 @@ def _make_side_by_side(before_u8: np.ndarray, after_u8: np.ndarray) -> np.ndarra
 
 
 def _make_diff_heatmap(before_u8: np.ndarray, after_u8: np.ndarray, amp: float = 4.0) -> np.ndarray:
-    """Render 4x amplified absolute pixel modification heatmap so zero-action locks are visually obvious."""
     diff = np.abs(after_u8.astype(np.float32) - before_u8.astype(np.float32)).mean(axis=2)
     scaled = np.clip(np.round(diff * amp), 0.0, 255.0).astype(np.uint8)
     bgr_heat = cv2.applyColorMap(scaled, cv2.COLORMAP_INFERNO)
@@ -248,26 +277,27 @@ def build_gradio_app(
 
     dropdown_kwargs = {
         "choices": discovered_ckpts,
-        "value": inferencer.checkpoint_path if inferencer.checkpoint_path in discovered_ckpts else (discovered_ckpts[0] if discovered_ckpts else None),
-        "label": "Checkpoint (.pt path — model_best.pt recommended)",
+        "value": inferencer.checkpoint_path
+        if inferencer.checkpoint_path in discovered_ckpts
+        else (discovered_ckpts[0] if discovered_ckpts else None),
+        "label": "Checkpoint (.pt path — model_best.pt or model_best_pixel.pt)",
         "scale": 4,
     }
     try:
-        ckpt_Probe = gr.Dropdown(allow_custom_value=True, **dropdown_kwargs)
-        del ckpt_Probe
+        ckpt_probe = gr.Dropdown(allow_custom_value=True, **dropdown_kwargs)
+        del ckpt_probe
         dropdown_kwargs["allow_custom_value"] = True
     except TypeError:
         pass
 
-    with gr.Blocks(title="Controllable Image Restoration Studio") as demo:
+    with gr.Blocks(title="Controllable Image Restoration Studio (V4)") as demo:
         gr.Markdown(
-            "## Controllable Pretrained Image Restoration Studio\n"
-            "Upload any image to fix specific degradations with **8 independent sliders**, dial between "
-            "**Pixel-Faithful (`detail_scale=0`)** and **Semantic-Detail (`detail_scale=0.75–1.2`)** LoRAs, "
-            "or **click directly on an object** in the input photo for localized restoration."
+            "## Controllable Pretrained Image Restoration Studio (V4)\n"
+            "Fix specific degradations with **4 orthogonal `[0, 1]` restoration sliders**, adjust mood & lighting with "
+            "**2 directional `[-1, +1]` Exposure & Warmth sliders**, dial **Generative Texture Detail**, "
+            "or **click any object** for localized restoration."
         )
 
-        # ── Top Checkpoint Switcher Bar ──
         status_md = gr.Markdown(_format_ckpt_banner(inferencer))
         with gr.Accordion("Switch / Load Another Checkpoint (.pt)", open=not bool(inferencer.checkpoint_path)):
             with gr.Row():
@@ -275,88 +305,73 @@ def build_gradio_app(
                 refresh_btn = gr.Button("Scan Checkpoints", scale=1)
                 load_ckpt_btn = gr.Button("Load Checkpoint", variant="secondary", scale=1)
 
-        # Shared state for 1-click object mask & synthetic clean ground-truth reference
         click_xy_state = gr.State(value=None)
         extracted_mask_state = gr.State(value=None)
         clean_ref_state = gr.State(value=None)
 
         with gr.Tabs() as main_tabs:
             # =========================================================================
-            # TAB 1: Interactive Controllable Restoration (Real Photos + 1-Click Mask)
+            # TAB 1: Interactive Controllable Restoration
             # =========================================================================
             with gr.TabItem("1. Interactive Restore", id="tab_restore"):
                 with gr.Row():
-                    # Left Column: Input Image + Sliders + Localized Mask Controls
                     with gr.Column(scale=5):
                         input_image = gr.Image(
                             type="numpy",
-                            label="Input Image (Upload photo — or click an object when '1-Click Object Mask' is active!)",
+                            label="Input Image (Upload photo — or click an object for 1-Click Localized Control!)",
                         )
 
                         with gr.Row():
                             preset_dropdown = gr.Dropdown(
                                 choices=list(RESTORE_PRESETS.keys()),
-                                value="Fix Everything ('all')",
-                                label="Quick Slider Preset",
+                                value="Restore All Artifacts (Keep Original Tone & WB)",
+                                label="Quick Control Preset",
                                 scale=3,
                             )
                             restore_btn = gr.Button("Restore Image", variant="primary", scale=2)
 
-                        gr.Markdown("#### Restoration Action Sliders (`0.0` = Preserve Untouched, `1.0` = Full Fix)")
+                        gr.Markdown("#### A. Structural & Artifact Restoration (`0.0` = Preserve, `1.0` = Full Fix)")
                         slider_controls = []
-                        for row_idx in range(0, len(SLIDER_SPECS), 2):
+                        for row_idx in (0, 2):
                             with gr.Row():
-                                for _, label_txt, info_txt in SLIDER_SPECS[row_idx : row_idx + 2]:
+                                for _, label_txt, info_txt, lo_v, hi_v, def_v in SLIDER_SPECS[row_idx : row_idx + 2]:
                                     s = gr.Slider(
-                                        minimum=0.0,
-                                        maximum=1.0,
-                                        value=1.0,
+                                        minimum=lo_v,
+                                        maximum=hi_v,
+                                        value=def_v,
                                         step=0.05,
                                         label=label_txt,
                                         info=info_txt,
                                     )
                                     slider_controls.append(s)
 
-                        with gr.Accordion("Dual-LoRA Quality & Tiling Dials", open=True):
-                            with gr.Row():
-                                fidelity_slider = gr.Slider(
-                                    minimum=0.0,
-                                    maximum=1.5,
-                                    value=float(inferencer.config.DEFAULT_FIDELITY_SCALE),
+                        gr.Markdown("#### B. Directional Tone & White Balance (`-1.0`  ↔  `0.0` Keep  ↔  `+1.0`)")
+                        with gr.Row():
+                            for _, label_txt, info_txt, lo_v, hi_v, def_v in SLIDER_SPECS[4:6]:
+                                s = gr.Slider(
+                                    minimum=lo_v,
+                                    maximum=hi_v,
+                                    value=def_v,
                                     step=0.05,
-                                    label="Pixel-Faithful LoRA (fidelity_scale)",
-                                    info="1.0 = strict structural & color accuracy",
+                                    label=label_txt,
+                                    info=info_txt,
                                 )
-                                default_det = (
-                                    0.0
-                                    if inferencer.ckpt_stage in ("align_warmup", "pixel_stage")
-                                    else float(inferencer.config.DEFAULT_DETAIL_SCALE)
-                                )
-                                detail_slider = gr.Slider(
-                                    minimum=0.0,
-                                    maximum=1.5,
-                                    value=default_det,
-                                    step=0.05,
-                                    label="Semantic-Detail LoRA (detail_scale)",
-                                    info="0.0 = conservative Stage-2 mode | 0.75-1.1 = crisp Stage-3 texture",
-                                )
-                            with gr.Row():
-                                steps_slider = gr.Slider(
-                                    minimum=1,
-                                    maximum=4,
-                                    value=1,
-                                    step=1,
-                                    label="Flow Refinement Steps",
-                                    info="1 step native SD-Turbo (2 steps for extra heavy blur/SR)",
-                                )
-                                tile_slider = gr.Slider(
-                                    minimum=0,
-                                    maximum=1024,
-                                    value=int(getattr(inferencer.config, "INFERENCE_TILE_SIZE", 512) or 512),
-                                    step=64,
-                                    label="Seamless Tile Size (px)",
-                                    info="512 recommended for 2K/4K photos (0 = untiled)",
-                                )
+                                slider_controls.append(s)
+
+                        gr.Markdown("#### C. Texture Synthesis Dial")
+                        default_det = (
+                            0.0
+                            if inferencer.ckpt_stage in ("align_warmup", "pixel_stage")
+                            else float(inferencer.config.DEFAULT_DETAIL_SCALE)
+                        )
+                        detail_slider = gr.Slider(
+                            minimum=0.0,
+                            maximum=1.0,
+                            value=default_det,
+                            step=0.05,
+                            label="Generative Texture Detail (detail_scale)",
+                            info="0.0 = conservative pixel-faithful PSNR | 0.65-1.0 = crisp generative edge/texture detail",
+                        )
 
                         with gr.Accordion("Localized Spatial Mask / 1-Click Semantic Object Control", open=False):
                             mask_mode = gr.Radio(
@@ -371,7 +386,7 @@ def build_gradio_app(
                             bg_action_box = gr.Textbox(
                                 value="none",
                                 label="Background Action (outside mask)",
-                                info="Examples: 'none' (100% preserve background), 'noise=1.0,motion=0.0' (denoise bg, keep bg motion blur)",
+                                info="Examples: 'none' (100% preserve bg), 'denoise=1.0,motion=0.0' (denoise bg, keep bg motion blur)",
                             )
                             with gr.Row():
                                 feather_slider = gr.Slider(
@@ -399,7 +414,16 @@ def build_gradio_app(
                                 interactive=False,
                             )
 
-                    # Right Column: Before/After Slider + Restored Image + Diff Heatmap + Download
+                        with gr.Accordion("Advanced High-Res Tiling", open=False):
+                            tile_slider = gr.Slider(
+                                minimum=0,
+                                maximum=1024,
+                                value=int(getattr(inferencer.config, "INFERENCE_TILE_SIZE", 512) or 512),
+                                step=64,
+                                label="Seamless Tile Size (px)",
+                                info="512 recommended for 2K/4K photos (0 = untiled)",
+                            )
+
                     with gr.Column(scale=6):
                         if has_image_slider:
                             compare_view = gr.ImageSlider(
@@ -436,9 +460,9 @@ def build_gradio_app(
             # =========================================================================
             with gr.TabItem("2. Synthetic Degradation Test Lab (PSNR / SSIM)", id="tab_synth"):
                 gr.Markdown(
-                    "Upload any **clean sharp photo**, inject controlled camera/compression degradations, "
-                    "and send it directly to **Tab 1** so every restoration run automatically reports exact "
-                    "**PSNR (dB) & SSIM gains** against your clean ground truth!"
+                    "Upload any **clean sharp photo**, inject controlled camera/compression/tone degradations, "
+                    "and send it directly to **Tab 1** with **exact inverse recovery sliders pre-filled** "
+                    "(e.g. dark `-0.68` exposure → `+0.68` Brighten) to verify live PSNR/SSIM gains!"
                 )
                 with gr.Row():
                     with gr.Column(scale=5):
@@ -446,20 +470,20 @@ def build_gradio_app(
                         with gr.Row():
                             synth_recipe_dd = gr.Dropdown(
                                 choices=list(SYNTH_RECIPES.keys()),
-                                value="Handheld Low-Light (Motion + Noise + Dark Exposure)",
+                                value="Night Handheld (Dark Exposure -0.68 + Heavy Noise + Motion Blur)",
                                 label="Degradation Recipe Preset",
                                 scale=3,
                             )
                             synth_seed_num = gr.Number(value=42, precision=0, label="Random Seed", scale=1)
 
                         synth_sliders = []
-                        default_recipe = SYNTH_RECIPES["Handheld Low-Light (Motion + Noise + Dark Exposure)"]
-                        for row_idx in range(0, len(SLIDER_SPECS), 2):
+                        default_recipe = SYNTH_RECIPES["Night Handheld (Dark Exposure -0.68 + Heavy Noise + Motion Blur)"]
+                        for row_idx in (0, 2, 4):
                             with gr.Row():
-                                for deg_key, label_txt, _ in SLIDER_SPECS[row_idx : row_idx + 2]:
+                                for deg_key, label_txt, _, lo_v, hi_v, _ in SLIDER_SPECS[row_idx : row_idx + 2]:
                                     s = gr.Slider(
-                                        minimum=0.0,
-                                        maximum=1.0,
+                                        minimum=lo_v,
+                                        maximum=hi_v,
                                         value=float(default_recipe.get(deg_key, 0.0)),
                                         step=0.05,
                                         label=f"Inject {label_txt}",
@@ -469,7 +493,7 @@ def build_gradio_app(
                         with gr.Row():
                             synth_btn = gr.Button("1. Synthesize Degraded Image", variant="secondary")
                             send_to_restore_btn = gr.Button(
-                                "2. Send to Tab 1 (With Clean GT Reference)", variant="primary"
+                                "2. Send to Tab 1 (Pre-fill Exact Recovery Sliders)", variant="primary"
                             )
 
                     with gr.Column(scale=6):
@@ -484,7 +508,7 @@ def build_gradio_app(
             with gr.TabItem("3. Full Benchmark Contact Sheets", id="tab_bench"):
                 gr.Markdown(
                     "Runs `ControllableInferencer.benchmark()` on any uploaded photo to generate the complete "
-                    "**Raw As-Is Slider Sweep** + **4-Scenario Synthetic Stress-Test Sheet** with per-tile PSNR/SSIM."
+                    "**Raw As-Is Slider Sweep** + **4-Scenario Directional & Selective Stress-Test Sheet** with per-tile PSNR/SSIM."
                 )
                 with gr.Row():
                     bench_input = gr.Image(type="numpy", label="Benchmark Input Image")
@@ -495,13 +519,6 @@ def build_gradio_app(
                             value=512,
                             step=64,
                             label="Benchmark Tile Max Side (px)",
-                        )
-                        bench_steps_slider = gr.Slider(
-                            minimum=1,
-                            maximum=4,
-                            value=1,
-                            step=1,
-                            label="Inference Steps",
                         )
                         run_bench_btn = gr.Button("Run Full Benchmark Suite", variant="primary")
                         bench_status_md = gr.Markdown("")
@@ -542,8 +559,7 @@ def build_gradio_app(
 
         preset_dropdown.change(_on_preset_change, inputs=[preset_dropdown], outputs=slider_controls)
 
-        def _on_new_user_upload(img_np):
-            # When the user manually uploads/clears an image in Tab 1, clear stale click masks & synthetic GT
+        def _on_new_user_upload(_img_np):
             return None, None, None, None
 
         input_image.upload(
@@ -626,9 +642,7 @@ def build_gradio_app(
             click_xy: Optional[Tuple[float, float]],
             cached_mask: Optional[np.ndarray],
             clean_gt_np: Optional[np.ndarray],
-            f_scale: float,
             d_scale: float,
-            steps_val: int,
             tile_val: int,
             *slider_vals,
         ):
@@ -638,9 +652,9 @@ def build_gradio_app(
 
             fg_spec = _format_sliders_to_action_spec(list(slider_vals))
             bg_clean = (bg_spec or "none").strip()
-            # Validate bg action syntax nicely for UI feedback
+            signed_types = getattr(inferencer.config, "SIGNED_ACTION_TYPES", ["exposure", "warmth"])
             try:
-                parse_action_spec(bg_clean, inferencer.config.DEGRADATION_TYPES)
+                parse_action_spec(bg_clean, inferencer.config.DEGRADATION_TYPES, signed_types=signed_types)
             except ValueError as exc:
                 raise gr.Error(str(exc)) from exc
 
@@ -678,8 +692,8 @@ def build_gradio_app(
                     action=fg_spec,
                     bg_action=bg_clean,
                     mask_2d=active_mask,
-                    steps=int(steps_val),
-                    fidelity_scale=float(f_scale),
+                    steps=1,
+                    fidelity_scale=1.0,
                     detail_scale=float(d_scale),
                     tile_size=int(tile_val),
                 )
@@ -694,8 +708,8 @@ def build_gradio_app(
             h, w = rgb.shape[:2]
             summary_parts = [
                 f"**Resolution:** `{w}×{h}`",
-                f"**Latency:** `{elapsed_ms:.0f} ms` (`{int(steps_val)}` step{'s' if int(steps_val) > 1 else ''})",
-                f"**Dual-LoRA:** `λ_pix={float(f_scale):.2f}, λ_sem={float(d_scale):.2f}`",
+                f"**Latency:** `{elapsed_ms:.0f} ms`",
+                f"**Generative Detail:** `{float(d_scale):.2f}`",
                 f"**Pixel Δ:** mean `{mean_px_diff:.2f}` / max `{max_px_diff:.1f}` (out of 255)",
             ]
             if clean_gt_np is not None and clean_gt_np.shape == restored_u8.shape:
@@ -731,9 +745,7 @@ def build_gradio_app(
                 click_xy_state,
                 extracted_mask_state,
                 clean_ref_state,
-                fidelity_slider,
                 detail_slider,
-                steps_slider,
                 tile_slider,
                 *slider_controls,
             ],
@@ -752,7 +764,7 @@ def build_gradio_app(
             rec = SYNTH_RECIPES.get(recipe_name)
             if rec is None:
                 return [gr.update() for _ in SLIDER_SPECS]
-            return [gr.update(value=float(rec.get(k, 0.0))) for k, _, _ in SLIDER_SPECS]
+            return [gr.update(value=float(rec.get(k, 0.0))) for k, _, _, _, _, _ in SLIDER_SPECS]
 
         synth_recipe_dd.change(_on_synth_recipe, inputs=[synth_recipe_dd], outputs=synth_sliders)
 
@@ -763,14 +775,14 @@ def build_gradio_app(
             h, w = clean_rgb.shape[:2]
             rng = np.random.default_rng(int(seed_val or 42))
             params = synth_pipeline.sample_params(h, w, rng=rng)
-            sev_vec = np.array([float(v) for v in sev_vals], dtype=np.float32)
-            deg_u8 = synth_pipeline.render_with_params(clean_rgb, sev_vec, params)
+            state_vec = np.array([float(v) for v in sev_vals], dtype=np.float32)
+            deg_u8 = synth_pipeline.render_with_params(clean_rgb, state_vec, params)
             in_psnr = compute_psnr_u8(deg_u8, clean_rgb)
             in_ssim = compute_ssim_u8(deg_u8, clean_rgb)
             info = (
                 f"**Synthesized Degraded Input:** `{w}×{h}` &nbsp;|&nbsp; "
                 f"**Input PSNR:** `{in_psnr:.2f} dB` &nbsp;|&nbsp; **Input SSIM:** `{in_ssim:.3f}`\n\n"
-                f"Click **2. Send to Tab 1** to test selective or full restoration with live PSNR gain tracking!"
+                f"Click **2. Send to Tab 1** to auto-fill exact directional recovery sliders and test PSNR gains!"
             )
             return deg_u8, clean_rgb, info
 
@@ -785,10 +797,11 @@ def build_gradio_app(
             if deg_rgb is None:
                 raise gr.Error("Click '1. Synthesize Degraded Image' first!")
             clean_rgb = _ensure_rgb_u8(clean_np)
-            # Pre-set restoration sliders to 1.0 on active degradations and 0.0 on untouched ones!
-            suggested = [1.0 if float(v) > 0.02 else 0.0 for v in sev_vals]
-            if all(v == 0.0 for v in suggested):
-                suggested = [1.0] * len(SLIDER_SPECS)
+            state_vec = np.array([float(v) for v in sev_vals], dtype=np.float32)
+            full_act = synth_pipeline.compute_full_restore_action(state_vec)
+            suggested = [round(float(x) * 20.0) / 20.0 for x in full_act.tolist()]
+            if all(abs(v) < 1e-4 for v in suggested):
+                suggested = [1.0, 1.0, 1.0, 1.0, 0.0, 0.0]
             return (
                 deg_rgb,
                 clean_rgb,
@@ -814,7 +827,7 @@ def build_gradio_app(
         )
 
         # ── Tab 3 Callback: Full Benchmark Sheets ──
-        def _run_benchmark_suite(img_np: Optional[np.ndarray], b_size: int, b_steps: int):
+        def _run_benchmark_suite(img_np: Optional[np.ndarray], b_size: int):
             rgb = _ensure_rgb_u8(img_np)
             if rgb is None:
                 raise gr.Error("Please upload an image for the benchmark first!")
@@ -826,7 +839,7 @@ def build_gradio_app(
                     image_rgb_u8=rgb,
                     output_dir=str(out_dir),
                     image_stem="gradio_bench",
-                    steps=int(b_steps),
+                    steps=1,
                     benchmark_size=int(b_size),
                 )
             dt = time.perf_counter() - t0
@@ -843,7 +856,7 @@ def build_gradio_app(
 
         run_bench_btn.click(
             _run_benchmark_suite,
-            inputs=[bench_input, bench_size_slider, bench_steps_slider],
+            inputs=[bench_input, bench_size_slider],
             outputs=[bench_raw_sheet, bench_synth_sheet, bench_status_md],
         )
 
@@ -882,8 +895,6 @@ def launch_app(
 
     in_nb = _in_ipython_kernel()
     use_share = (_is_cloud_notebook() or in_nb) if share is None else bool(share)
-    # In an interactive IPython cell (%run app.py), non-blocking keeps the server + public URL alive
-    # while letting you inspect logs or run follow-up cells; in CLI (!python app.py), block so process stays alive!
     prevent_lock = in_nb if block is None else (not bool(block))
 
     launch_kwargs = {
@@ -900,13 +911,8 @@ def launch_app(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Launch Gradio Web UI for Controllable Image Restoration")
-    parser.add_argument(
-        "--model",
-        type=str,
-        default=None,
-        help="Path to checkpoint (auto-discovers model_best.pt in ./checkpoints or /kaggle if omitted)",
-    )
+    parser = argparse.ArgumentParser(description="Launch Gradio Web UI for Controllable Image Restoration (V4)")
+    parser.add_argument("--model", type=str, default=None, help="Path to checkpoint (auto-discovers model_best.pt)")
     parser.add_argument("--share", action="store_true", default=None, help="Create a public *.gradio.live share URL")
     parser.add_argument("--no-share", action="store_true", help="Disable public *.gradio.live share tunnel")
     parser.add_argument("--port", type=int, default=None, help="Optional local server port (e.g. 7860)")
