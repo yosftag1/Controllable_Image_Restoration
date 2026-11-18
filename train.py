@@ -1621,6 +1621,8 @@ def main():
         config.PIXEL_STAGE_EPOCHS = args.pixel_epochs
     if args.steps_per_epoch is not None:
         config.MAX_STEPS_PER_EPOCH = args.steps_per_epoch
+        if args.steps_per_epoch > 0:
+            config.MIN_STEPS_PER_EPOCH = min(config.MIN_STEPS_PER_EPOCH, args.steps_per_epoch)
     if args.min_steps_per_epoch is not None:
         config.MIN_STEPS_PER_EPOCH = args.min_steps_per_epoch
     if args.train_images is not None:

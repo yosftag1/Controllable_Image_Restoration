@@ -301,30 +301,15 @@ class HYPIRConfig(Config):
 
 
 class PilotConfig(Config):
-    """Fast ~45-minute end-to-end 3-stage pilot preset (`--pilot` / `--quick`) for large datasets.
     """Balanced ~5-hour end-to-end 3-stage preset (`--pilot` / `--5h`) for Kaggle 2x T4.
 
-    Rotates random non-overlapping slices across your full clean + paired datasets each epoch so
-    you get a complete end-to-end preview of all 3 stages (Align -> Pixel Experts/eVAE -> CSD Detail)
-    and can later expand seamlessly into a full uncapped run via `--resume checkpoints/model_best_pixel.pt`.
     Runs 13 epochs (`1` align @ `350` steps + `9` pixel @ `950` steps/ep + `3` CSD detail @ `950`
     steps/ep = `11,750` total steps, ~94k patches rotating across your full clean + paired datasets)
     so all 3 stages converge solidly in ~5 hours, and can still be resumed into a longer uncapped run.
     """
 
-    EPOCHS = 8
     EPOCHS = 13
     ALIGN_WARMUP_EPOCHS = 1
-    PIXEL_STAGE_EPOCHS = 5
-    CURRICULUM_WARMUP_EPOCHS = 1
-    LEARNING_RATE = 1.35e-4
-    MAX_ALIGN_STEPS = 200
-    MAX_STEPS_PER_EPOCH = 350
-    MIN_STEPS_PER_EPOCH = 350
-    VAL_IMAGES_COUNT = 40
-    LOG_INTERVAL = 35
-    SAMPLE_EVERY_N_STEPS = 175
-    CHECKPOINT_EVERY_N_EPOCHS = 2
     PIXEL_STAGE_EPOCHS = 9
     CURRICULUM_WARMUP_EPOCHS = 2
     LEARNING_RATE = 1.15e-4
