@@ -466,15 +466,38 @@ class _ExpertLoRABranch(nn.Module):
         kernel_size=1,
         padding=0,
         stride=1,
+        dilation=1,
         device=None,
     ):
         super().__init__()
         self.is_conv = is_conv
         self.rank = rank
         ks_tuple = (kernel_size, kernel_size) if isinstance(kernel_size, int) else tuple(kernel_size)
+        st_tuple = (stride, stride) if isinstance(stride, int) else tuple(stride)
+        dil_tuple = (dilation, dilation) if isinstance(dilation, int) else tuple(dilation)
+        if isinstance(padding, int):
+            pad_tuple = (padding, padding)
+        elif isinstance(padding, tuple):
+            pad_tuple = padding
+        else:
+            pad_tuple = None
+
         is_spatial_conv = is_conv and (ks_tuple != (1, 1))
         self.conv_mode = conv_mode if is_spatial_conv else "pointwise"
         self.scaling = 1.0 / float(max(1, rank))
+
+        # Match `base_conv` geometry whenever stride != 1 or asymmetric padding is used
+        # (e.g. diffusers AutoencoderKL Downsample2D pads 64->65 then runs k=3, s=2, p=0 -> 32x32!)
+        same_hw_as_1x1 = (
+            pad_tuple is not None
+            and st_tuple == (1, 1)
+            and (2 * pad_tuple[0] == dil_tuple[0] * (ks_tuple[0] - 1))
+            and (2 * pad_tuple[1] == dil_tuple[1] * (ks_tuple[1] - 1))
+        )
+        down_ks = 1 if same_hw_as_1x1 else kernel_size
+        down_st = 1 if same_hw_as_1x1 else stride
+        down_pad = 0 if same_hw_as_1x1 else padding
+        down_dil = 1 if same_hw_as_1x1 else dilation
 
         if not is_conv:
             self.down = nn.Linear(in_dim, rank, bias=False, device=device, dtype=torch.float32)
@@ -482,7 +505,15 @@ class _ExpertLoRABranch(nn.Module):
         elif self.conv_mode == "strip_1x7_7x1":
             # Oriented horizontal + vertical strip depthwise bottleneck for wide camera-shake streaks!
             self.down = nn.Conv2d(
-                in_dim, rank, kernel_size=1, stride=stride, padding=0, bias=False, device=device, dtype=torch.float32
+                in_dim,
+                rank,
+                kernel_size=down_ks,
+                stride=down_st,
+                padding=down_pad,
+                dilation=down_dil,
+                bias=False,
+                device=device,
+                dtype=torch.float32,
             )
             self.dw_h = nn.Conv2d(
                 rank, rank, kernel_size=(1, 7), padding=(0, 3), groups=rank, bias=False, device=device, dtype=torch.float32
@@ -502,7 +533,15 @@ class _ExpertLoRABranch(nn.Module):
         elif self.conv_mode == "multiscale_5x5":
             # Multi-scale 3x3 + 5x5 depthwise bottleneck for optical lens defocus / bokeh disc inversion!
             self.down = nn.Conv2d(
-                in_dim, rank, kernel_size=1, stride=stride, padding=0, bias=False, device=device, dtype=torch.float32
+                in_dim,
+                rank,
+                kernel_size=down_ks,
+                stride=down_st,
+                padding=down_pad,
+                dilation=down_dil,
+                bias=False,
+                device=device,
+                dtype=torch.float32,
             )
             self.dw_3 = nn.Conv2d(
                 rank, rank, kernel_size=3, padding=1, groups=rank, bias=False, device=device, dtype=torch.float32
@@ -523,6 +562,7 @@ class _ExpertLoRABranch(nn.Module):
                 kernel_size=kernel_size,
                 stride=stride,
                 padding=padding,
+                dilation=dilation,
                 bias=False,
                 device=device,
                 dtype=torch.float32,
@@ -704,6 +744,7 @@ class ActionDualLoRAConv2d(nn.Module):
                 kernel_size=base_conv.kernel_size,
                 padding=base_conv.padding,
                 stride=base_conv.stride,
+                dilation=base_conv.dilation,
                 device=device,
             )
 
@@ -718,6 +759,7 @@ class ActionDualLoRAConv2d(nn.Module):
             kernel_size=base_conv.kernel_size,
             padding=base_conv.padding,
             stride=base_conv.stride,
+            dilation=base_conv.dilation,
             device=device,
         )
 
@@ -763,12 +805,17 @@ class ActionDualLoRAConv2d(nn.Module):
                     spatial_map, self.expert_indices[ename], target_hw, bsz, out.device
                 )
                 exp_out = expert(x, action_cond)
+                if exp_out.shape[-2:] != target_hw:
+                    exp_out = F.interpolate(exp_out, size=target_hw, mode="bilinear", align_corners=False)
                 term = exp_out * route_2d.to(exp_out.dtype)
                 pix_sum = term if pix_sum is None else (pix_sum + term)
             delta = (lam_pix * self.alpha_scale) * pix_sum
 
         if abs(lam_sem) >= 1e-6:
-            sem_d = (lam_sem * self.sem_alpha_scale) * self.sem_branch(x, action_cond)
+            sem_out = self.sem_branch(x, action_cond)
+            if sem_out.shape[-2:] != target_hw:
+                sem_out = F.interpolate(sem_out, size=target_hw, mode="bilinear", align_corners=False)
+            sem_d = (lam_sem * self.sem_alpha_scale) * sem_out
             delta = sem_d if delta is None else (delta + sem_d)
 
         return out if delta is None else (out + delta.to(out.dtype))

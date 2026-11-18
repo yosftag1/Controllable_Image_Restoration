@@ -104,6 +104,17 @@ class _UniversalSpatialSkipBridge(nn.Module):
         return dec_feat + bridge.to(dec_feat.dtype)
 
 
+class _MockAsymmetricDownsample2D(nn.Module):
+    """Mimics diffusers AutoencoderKL Downsample2D: asymmetric pad (0,1,0,1) + Conv2d(k=3, s=2, p=0)."""
+
+    def __init__(self, in_ch: int, out_ch: int):
+        super().__init__()
+        self.downsamplers_conv = nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=2, padding=0)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.silu(self.downsamplers_conv(F.pad(x, (0, 1, 0, 1))))
+
+
 class _MockTinyVAE(nn.Module):
     """Compact AutoencoderKL-compatible 8x VAE for fast offline unit testing."""
 
@@ -121,9 +132,9 @@ class _MockTinyVAE(nn.Module):
         self.encoder.conv_in = nn.Conv2d(3, base_ch, kernel_size=3, padding=1)
         self.encoder.down_blocks = nn.ModuleList(
             [
-                nn.Sequential(nn.Conv2d(base_ch, base_ch, 3, stride=2, padding=1), nn.SiLU()),
-                nn.Sequential(nn.Conv2d(base_ch, base_ch * 2, 3, stride=2, padding=1), nn.SiLU()),
-                nn.Sequential(nn.Conv2d(base_ch * 2, base_ch * 4, 3, stride=2, padding=1), nn.SiLU()),
+                _MockAsymmetricDownsample2D(base_ch, base_ch),
+                _MockAsymmetricDownsample2D(base_ch, base_ch * 2),
+                _MockAsymmetricDownsample2D(base_ch * 2, base_ch * 4),
                 nn.Sequential(nn.Conv2d(base_ch * 4, base_ch * 4, 3, stride=1, padding=1), nn.SiLU()),
             ]
         )
