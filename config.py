@@ -214,6 +214,7 @@ class Config:
     VAL_IMAGES_COUNT = 0
     MIN_STEPS_PER_EPOCH = 1000
     MAX_STEPS_PER_EPOCH = 0
+    MAX_ALIGN_STEPS = 0
 
     OUTPUT_DIR = "./outputs"
     LOG_DIR = "./logs"
@@ -297,6 +298,28 @@ class HYPIRConfig(Config):
     HYPIR_LORA_RANK_SCALE = 2.0
     LOSS_CSD_WEIGHT = 0.0
     LOSS_RPGAN_WEIGHT = 0.08
+
+
+class PilotConfig(Config):
+    """Balanced ~5-hour end-to-end 3-stage preset (`--pilot` / `--5h`) for Kaggle 2x T4.
+
+    Runs 13 epochs (`1` align @ `350` steps + `9` pixel @ `950` steps/ep + `3` CSD detail @ `950`
+    steps/ep = `11,750` total steps, ~94k patches rotating across your full clean + paired datasets)
+    so all 3 stages converge solidly in ~5 hours, and can still be resumed into a longer uncapped run.
+    """
+
+    EPOCHS = 13
+    ALIGN_WARMUP_EPOCHS = 1
+    PIXEL_STAGE_EPOCHS = 9
+    CURRICULUM_WARMUP_EPOCHS = 2
+    LEARNING_RATE = 1.15e-4
+    MAX_ALIGN_STEPS = 350
+    MAX_STEPS_PER_EPOCH = 950
+    MIN_STEPS_PER_EPOCH = 950
+    VAL_IMAGES_COUNT = 60
+    LOG_INTERVAL = 100
+    SAMPLE_EVERY_N_STEPS = 475
+    CHECKPOINT_EVERY_N_EPOCHS = 3
 
 
 class DebugConfig(Config):

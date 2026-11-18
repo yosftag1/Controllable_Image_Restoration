@@ -50,7 +50,7 @@ PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-from config import Config, DebugConfig, HYPIRConfig
+from config import Config, DebugConfig, HYPIRConfig, PilotConfig
 from data.selective_dataset import (
     SelectiveDegradationPipeline,
     create_controllable_dataset,
@@ -743,9 +743,14 @@ def _build_train_loader(
     total_nw = int(config.NUM_WORKERS)
     nw = max(1, total_nw // max(1, world_size)) if total_nw > 0 else 0
 
-    max_steps = int(getattr(config, "MAX_STEPS_PER_EPOCH", 0) or 0)
+    max_align = int(getattr(config, "MAX_ALIGN_STEPS", 0) or 0)
+    raw_max_steps = int(getattr(config, "MAX_STEPS_PER_EPOCH", 0) or 0)
+    if align_only and max_align > 0:
+        max_steps = min(max_align, raw_max_steps) if raw_max_steps > 0 else max_align
+    else:
+        max_steps = raw_max_steps
     min_steps_cfg = int(getattr(config, "MIN_STEPS_PER_EPOCH", 0) or 0) if not is_debug else 0
-    min_steps = min(300, min_steps_cfg) if align_only else min_steps_cfg
+    min_steps = min(max_align if max_align > 0 else 300, min_steps_cfg) if align_only else min_steps_cfg
     full_steps = max(1, len(train_dataset) // max(1, global_bsz))
 
     target_steps = 0
@@ -1149,11 +1154,32 @@ def train(
 
                 if epoch == start_epoch and resumed_stage == stage and resumed_opt_state is not None:
                     try:
+                        base_lrs = [pg["lr"] for pg in optimizer.param_groups]
                         optimizer.load_state_dict(resumed_opt_state)
-                        if resumed_sched_state is not None:
+                        sched_exhausted = bool(
+                            resumed_sched_state is not None
+                            and int(resumed_sched_state.get("last_epoch", 0))
+                            >= int(resumed_sched_state.get("T_max", 1))
+                        )
+                        if resumed_sched_state is not None and not sched_exhausted:
                             scheduler.load_state_dict(resumed_sched_state)
-                        if is_main:
-                            print(f"Restored optimizer & scheduler states for stage '{stage}'.", flush=True)
+                            if is_main:
+                                print(f"Restored optimizer & scheduler states for stage '{stage}'.", flush=True)
+                        else:
+                            # Expanding a completed `--pilot` / `--speedrun` checkpoint into a longer run:
+                            # preserve warm AdamW momentum while starting a fresh cosine LR schedule!
+                            for pg, blr in zip(optimizer.param_groups, base_lrs):
+                                pg["lr"] = blr * 0.85
+                                pg["initial_lr"] = blr * 0.85
+                            scheduler = optim.lr_scheduler.CosineAnnealingLR(
+                                optimizer, T_max=stage_rem, eta_min=1e-5
+                            )
+                            if is_main:
+                                print(
+                                    f"Restored warm AdamW states with fresh {stage_rem}-epoch cosine LR schedule "
+                                    f"for extended '{stage}' run.",
+                                    flush=True,
+                                )
                     except Exception as exc:
                         if is_main:
                             print(f"[Note] Optimizer state re-initialized cleanly for stage '{stage}' ({exc}).", flush=True)
@@ -1513,7 +1539,18 @@ def main():
     parser.add_argument("--min-steps-per-epoch", type=int, default=None, help="Minimum optimizer steps per epoch on small folders")
     parser.add_argument("--train-images", type=int, default=None, help="Cap number of training reference images")
     parser.add_argument("--val-images", type=int, default=None, help="Cap number of validation reference images")
-    parser.add_argument("--speedrun", action="store_true", help="Fast ~90-min preset (500 steps/epoch, 6 pixel + 2 detail epochs)")
+    parser.add_argument(
+        "--pilot",
+        "--5h",
+        dest="pilot",
+        action="store_true",
+        help="Balanced ~5-hour end-to-end 3-stage run on 2x T4 (1 align + 9 pixel + 3 CSD epochs @ 950 steps/ep)",
+    )
+    parser.add_argument(
+        "--speedrun",
+        action="store_true",
+        help="Quick ~60-min sanity preset (350 steps/epoch, 1 align + 5 pixel + 2 detail epochs)",
+    )
     parser.add_argument("--num-workers", type=int, default=None)
     parser.add_argument("--log-interval", type=int, default=None, help="Steps between clean log lines (default: 100)")
     parser.add_argument("--sample-steps", type=int, default=None, help="Save mid-epoch sweep grid every N steps (0=disable)")
@@ -1523,14 +1560,15 @@ def main():
 
     if args.debug:
         config = DebugConfig()
-        if args.hypir_mode:
-            for k in dir(HYPIRConfig):
-                if k.isupper():
-                    setattr(config, k, getattr(HYPIRConfig, k))
-    elif args.hypir_mode:
-        config = HYPIRConfig()
+    elif args.pilot:
+        config = PilotConfig()
     else:
         config = Config()
+
+    if args.hypir_mode:
+        for k, v in HYPIRConfig.__dict__.items():
+            if k.isupper():
+                setattr(config, k, v)
 
     if args.mock:
         config.GENERATOR_BACKBONE = "mock_tiny"
@@ -1564,14 +1602,17 @@ def main():
     if args.batch_size:
         config.BATCH_SIZE = args.batch_size
     if args.speedrun:
-        config.MAX_STEPS_PER_EPOCH = 500
-        config.MIN_STEPS_PER_EPOCH = 500
-        config.LOG_INTERVAL = 50
-        config.SAMPLE_EVERY_N_STEPS = 250
+        config.MAX_ALIGN_STEPS = 200
+        config.MAX_STEPS_PER_EPOCH = 350
+        config.MIN_STEPS_PER_EPOCH = 350
+        config.LEARNING_RATE = 1.35e-4
+        config.VAL_IMAGES_COUNT = 40
+        config.LOG_INTERVAL = 40
+        config.SAMPLE_EVERY_N_STEPS = 175
         if not args.resume:
             config.ALIGN_WARMUP_EPOCHS = 1
-            config.PIXEL_STAGE_EPOCHS = 6
-            config.EPOCHS = 9
+            config.PIXEL_STAGE_EPOCHS = 5
+            config.EPOCHS = 8
     if args.epochs:
         config.EPOCHS = args.epochs
     if args.align_epochs is not None:

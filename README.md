@@ -45,13 +45,24 @@ python tests/smoke_test.py
 ```
 
 ### 2. Kaggle 2× T4 Training (Clean 2K + Curated Real Deblurring Pack)
+
+**Balanced ~5-Hour End-to-End 3-Stage Run (`--pilot` / `--5h` — `1` align + `9` pixel + `3` CSD epochs @ `950` steps/ep):**
 ```python
 !pip install -q open-clip-torch
 
-%run train.py \
+%run train.py --pilot \
   --train-root /kaggle/input/datasets/thaihoa1476050/df2k-ost/train \
   --paired-motion-root /kaggle/input/a-curated-list-of-image-deblurring-datasets \
   --val-root /kaggle/input/datasets/thaihoa1476050/df2k-ost/test/DIV2K_valid
+```
+
+**Full Uncapped Run (or continue directly from a Pilot checkpoint into the full 16-epoch schedule):**
+```python
+%run train.py \
+  --train-root /kaggle/input/datasets/thaihoa1476050/df2k-ost/train \
+  --paired-motion-root /kaggle/input/a-curated-list-of-image-deblurring-datasets \
+  --val-root /kaggle/input/datasets/thaihoa1476050/df2k-ost/test/DIV2K_valid \
+  --resume ./checkpoints/model_best_pixel.pt
 ```
 
 To test the **separate experimental `HYPIR` mode** on its own:

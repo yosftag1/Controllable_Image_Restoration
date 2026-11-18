@@ -34,7 +34,7 @@ def test_selective_pipeline():
     import cv2
     import numpy as np
     import tempfile
-    from config import Config, HYPIRConfig
+    from config import Config, HYPIRConfig, PilotConfig
     from data.selective_dataset import (
         SelectiveDegradationPipeline,
         create_controllable_dataset,
@@ -61,10 +61,14 @@ def test_selective_pipeline():
     assert cfg.HYPIR_MODE is False and cfg.LOSS_RPGAN_WEIGHT == 0.0 and cfg.LOSS_CSD_WEIGHT > 0.0
     assert len(cfg.LORA_EXPERT_SPECS) == 3
 
-    # Verify HYPIR mode stays cleanly isolated in HYPIRConfig
+    # Verify HYPIR mode stays cleanly isolated in HYPIRConfig & PilotConfig compresses all 3 stages
     hyp_cfg = HYPIRConfig()
     assert hyp_cfg.HYPIR_MODE is True and hyp_cfg.LOSS_CSD_WEIGHT == 0.0 and hyp_cfg.LOSS_RPGAN_WEIGHT > 0.0
     assert hyp_cfg.ADAPTIVE_TIMESTEP is False and hyp_cfg.UNFREEZE_UNET_NORMS is True
+
+    pil_cfg = PilotConfig()
+    assert pil_cfg.EPOCHS == 13 and pil_cfg.ALIGN_WARMUP_EPOCHS == 1 and pil_cfg.PIXEL_STAGE_EPOCHS == 9
+    assert pil_cfg.MAX_STEPS_PER_EPOCH == 950 and pil_cfg.MAX_ALIGN_STEPS == 350
 
     # Verify CLI action parser: 'all' keeps signed artistic channels at 0.0; signed & legacy aliases work
     all_vec = parse_action_spec("all", cfg.DEGRADATION_TYPES, signed_types=cfg.SIGNED_ACTION_TYPES)
