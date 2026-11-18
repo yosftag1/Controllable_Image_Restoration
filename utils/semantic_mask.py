@@ -181,8 +181,9 @@ def extract_one_click_semantic_mask(
             sem_out = semantic_encoder(rgb_proc, use_lora=True)
     else:
         sem_out = semantic_encoder(rgb_proc, use_lora=True)
-    grid = F.normalize(sem_out["grid"].float(), dim=1)
-    del sem_out
+    raw_mask_grid = sem_out.get("mask_grid", sem_out["grid"])
+    grid = F.normalize(raw_mask_grid.float(), dim=1)
+    del sem_out, raw_mask_grid
 
     sample_coord = torch.tensor(
         [[[[norm_x * 2.0 - 1.0, norm_y * 2.0 - 1.0]]]], device=grid.device, dtype=torch.float32

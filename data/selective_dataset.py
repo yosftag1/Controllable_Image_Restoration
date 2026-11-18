@@ -376,11 +376,21 @@ class SelectiveDegradationPipeline:
         else:
             k = 1
 
-        chosen = list(rng.choice(self.num_types, size=min(k, self.num_types), replace=False))
+        # Up-weight structural deconvolution (`deblur_motion`, `sharpen_focus`) so motion/focus experts never starve!
+        type_weights = np.array(
+            [
+                1.55 if name == "deblur_motion" else (1.40 if name == "sharpen_focus" else 1.0)
+                for name in self.degradation_types
+            ],
+            dtype=np.float64,
+        )
+        type_probs = type_weights / np.maximum(type_weights.sum(), 1e-8)
+
+        chosen = list(rng.choice(self.num_types, size=min(k, self.num_types), replace=False, p=type_probs))
         chosen_names = [self.degradation_types[i] for i in chosen]
 
-        if "deblur_motion" in chosen_names and "sharpen_focus" in chosen_names and len(chosen) > 1 and rng.random() < 0.75:
-            drop_name = "deblur_motion" if rng.random() < 0.5 else "sharpen_focus"
+        if "deblur_motion" in chosen_names and "sharpen_focus" in chosen_names and len(chosen) > 1 and rng.random() < 0.35:
+            drop_name = "deblur_motion" if rng.random() < 0.4 else "sharpen_focus"
             chosen.remove(self.type_to_idx[drop_name])
 
         damping = 1.0 if len(chosen) == 1 else (0.90 if len(chosen) == 2 else 0.80)
@@ -427,7 +437,8 @@ class SelectiveDegradationPipeline:
 
         elif u < p_sel + p_part + p_full:
             action = full_act.copy()
-            if rng.random() < 0.22:
+            # Keep exact active sliders 95% of the time so inactive `deblur_motion` isn't flooded with no-op `1.0`s!
+            if rng.random() < 0.05:
                 for idx in self.unsigned_indices:
                     action[idx] = 1.0
 
@@ -596,7 +607,7 @@ class SelectiveDegradationPipeline:
         # Sample 0, 1, or 2 downstream orthogonal degradations (exposure, warmth, deartifact, denoise)
         s_down = np.zeros(self.num_types, dtype=np.float32)
         u_mode = float(rng.random())
-        need_downstream = (0.14 <= u_mode < 0.36)  # selective blur preservation needs >= 1 downstream edit
+        need_downstream = (0.06 <= u_mode < 0.22)  # selective blur preservation needs >= 1 downstream edit
         if downstream_candidates and (need_downstream or rng.random() < 0.58):
             n_extra = 1 if rng.random() < 0.72 else min(2, len(downstream_candidates))
             for idx in rng.choice(downstream_candidates, size=n_extra, replace=False):
@@ -615,16 +626,16 @@ class SelectiveDegradationPipeline:
             ones_mask = np.ones((h, w), dtype=np.float32)
             return x_src, sharp_rgb_u8, zeros_a, zeros_a, ones_mask, s_src
 
-        if u_mode < 0.14:
-            # 14%: False-Positive Safety on Real Clean Sharp Photo (prevents oversharpening clean photos!)
+        if u_mode < 0.06:
+            # 6%: False-Positive Safety on Real Clean Sharp Photo (prevents oversharpening clean photos!)
             base_src = sharp_rgb_u8
             base_tgt_fg = sharp_rgb_u8
             s_src = s_down.copy()
             a_fg = self.compute_full_restore_action(s_down)
             a_fg[blur_idx] = float(rng.uniform(0.55, 1.0))
             s_tgt_down = self.compute_target_state(s_down, a_fg)
-        elif u_mode < 0.36:
-            # 22%: Selective Real-Blur Preservation (`a_blur = 0.0`: clean noise/tone, KEEP real camera blur!)
+        elif u_mode < 0.22:
+            # 16%: Selective Real-Blur Preservation (`a_blur = 0.0`: clean noise/tone, KEEP real camera blur!)
             base_src = blur_rgb_u8
             base_tgt_fg = blur_rgb_u8
             s_src = s_down.copy()
@@ -633,7 +644,7 @@ class SelectiveDegradationPipeline:
             a_fg[blur_idx] = 0.0
             s_tgt_down = self.compute_target_state(s_down, a_fg)
         else:
-            # 64%: Real Camera Deblurring (`a_blur = 1.0`) + full or selective downstream fixes!
+            # 78%: Active Real Camera Deblurring (`a_blur = 1.0`) + full or selective downstream fixes!
             base_src = blur_rgb_u8
             base_tgt_fg = sharp_rgb_u8
             s_src = s_down.copy()
@@ -849,13 +860,43 @@ class ControllableRestorationDataset(_TorchDataset):
         h, w = sharp_rgb.shape[:2]
         if h >= ps and w >= ps:
             if self.is_train:
-                y = random.randint(0, h - ps)
-                x = random.randint(0, w - ps)
+                # Multi-scale window (`256..470 -> 256`) bridges 1280x720 GoPro blur across all real photo scales,
+                # and 4-candidate Active Blur Gate rejects flat sky/road crops where `blur == sharp`!
+                min_hw = min(h, w)
+                if min_hw >= int(ps * 1.45) and random.random() < 0.45:
+                    win = random.randint(int(ps * 1.15), min(min_hw, int(ps * 1.85)))
+                else:
+                    win = ps
+
+                best_b, best_s = None, None
+                best_score = -1.0
+                n_cands = 4 if (h > win or w > win) else 1
+                for _ in range(n_cands):
+                    y = random.randint(0, h - win)
+                    x = random.randint(0, w - win)
+                    bc = blur_rgb[y : y + win, x : x + win]
+                    sc = sharp_rgb[y : y + win, x : x + win]
+                    b_sub = bc[::4, ::4].astype(np.float32)
+                    s_sub = sc[::4, ::4].astype(np.float32)
+                    motion_diff = float(np.mean(np.abs(s_sub - b_sub)))
+                    edge_energy = float(np.mean(np.abs(s_sub[:, 1:] - s_sub[:, :-1])))
+                    score = motion_diff + 0.35 * edge_energy
+                    if score > best_score:
+                        best_score = score
+                        best_b, best_s = bc, sc
+                    if motion_diff >= 4.5 and edge_energy >= 6.0:
+                        break
+
+                if win != ps:
+                    b_crop = cv2.resize(best_b, (ps, ps), interpolation=cv2.INTER_AREA)
+                    s_crop = cv2.resize(best_s, (ps, ps), interpolation=cv2.INTER_AREA)
+                else:
+                    b_crop, s_crop = best_b, best_s
             else:
                 y = (h - ps) // 2
                 x = (w - ps) // 2
-            b_crop = blur_rgb[y : y + ps, x : x + ps]
-            s_crop = sharp_rgb[y : y + ps, x : x + ps]
+                b_crop = blur_rgb[y : y + ps, x : x + ps]
+                s_crop = sharp_rgb[y : y + ps, x : x + ps]
         else:
             b_crop = cv2.resize(blur_rgb, (ps, ps), interpolation=cv2.INTER_CUBIC)
             s_crop = cv2.resize(sharp_rgb, (ps, ps), interpolation=cv2.INTER_CUBIC)
@@ -991,10 +1032,25 @@ def unpack_batch_action_map(batch: dict, device) -> "torch.Tensor":
 
 
 _IMG_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff"}
-_BLUR_DIR_NAMES = {"blur", "blur_gamma", "blurred", "defocus", "input", "inputc", "source"}
-_SHARP_DIR_NAMES = {"sharp", "gt", "groundtruth", "ground_truth", "target", "clean"}
+_BLUR_DIR_NAMES = {
+    "blur",
+    "blur_gamma",
+    "blurred",
+    "motion_blur",
+    "motion_blurred",
+    "defocus",
+    "defocus_blur",
+    "defocused_blurred",
+    "input",
+    "inputc",
+    "source",
+    "lq",
+    "degraded",
+}
+_SHARP_DIR_NAMES = {"sharp", "gt", "groundtruth", "ground_truth", "target", "clean", "hq", "hr"}
+_NON_CLEAN_DIR_NAMES = _BLUR_DIR_NAMES | {"noisy", "noise", "lr", "low", "corrupted"}
 # Exclude synthetic low-res face/OCR subsets (`CelebA`, `Text`) & dark un-tonemapped linear RAW (`RealBlur_R`)
-# inside curated collections so paired training stays 100% high-res natural sRGB photography!
+# inside curated collections so paired & clean training stays 100% high-res natural sRGB photography!
 _EXCLUDED_PAIR_SUBSTRINGS = ("celeba", "text", "bmvc", "widerface", "realblur_r", "realblur-r")
 
 
@@ -1003,6 +1059,18 @@ def _is_excluded_pair_token(path_or_name: str, exclude_domain_subsets: bool = Tr
         return False
     low = path_or_name.lower()
     return any(tok in low for tok in _EXCLUDED_PAIR_SUBSTRINGS)
+
+
+def _is_degraded_or_excluded_for_clean_pool(path: Path, root: Optional[Path] = None) -> bool:
+    """Quarantine pre-blurred/noisy folders & synthetic CelebA/Text/RAW subtrees from entering clean `image_paths`!"""
+    try:
+        rel_str = os.path.relpath(str(path), str(root)) if root is not None else str(path)
+    except ValueError:
+        rel_str = str(path)
+    parts = [p.lower() for p in rel_str.replace("\\", "/").split("/")[:-1] if p and p != "."]
+    if any(p in _NON_CLEAN_DIR_NAMES for p in parts):
+        return True
+    return any(_is_excluded_pair_token(p, exclude_domain_subsets=True) for p in parts)
 
 
 def _collect_images(folder: Path) -> List[Path]:
@@ -1019,13 +1087,21 @@ def _collect_images(folder: Path) -> List[Path]:
 
 
 def _normalize_pair_stem(rel_key: str) -> str:
-    """Normalize pair filenames (e.g. RealBlur `scene1/blur_001` <-> `scene1/gt_001`)."""
+    """Normalize pair filenames across prefix & suffix conventions (`blur_001` <-> `gt_001`, `01_M` <-> `01_S`)."""
     parent, base = os.path.split(rel_key.replace("\\", "/"))
     low = base.lower()
-    for pfx in ("blur_", "sharp_", "gt_", "target_", "input_", "source_", "defocus_"):
-        if low.startswith(pfx):
+    for pfx in ("blur_", "blurred_", "sharp_", "gt_", "target_", "input_", "source_", "defocus_", "motion_"):
+        if low.startswith(pfx) and len(base) > len(pfx):
             base = base[len(pfx) :]
+            low = base.lower()
             break
+    for sfx in ("_blurred", "_blur", "_sharp", "_gt", "_clean", "_target", "_input", "_defocus", "_motion"):
+        if low.endswith(sfx) and len(base) > len(sfx):
+            base = base[: -len(sfx)]
+            low = base.lower()
+            break
+    if len(base) > 3 and low[-2:] in ("_s", "_m", "_f"):
+        base = base[:-2]
     return f"{parent}/{base}" if parent else base
 
 
@@ -1033,6 +1109,8 @@ def _infer_pair_channel(path_str: str, default_channel: str) -> str:
     low = path_str.lower()
     if any(tok in low for tok in ("dpdd", "defocus", "realdof", "bokeh", "dof")):
         return "sharpen_focus"
+    if any(tok in low for tok in ("motion", "gopro", "hide", "realblur")):
+        return "deblur_motion"
     return default_channel
 
 
@@ -1042,7 +1120,7 @@ def discover_paired_blur_datasets(
     is_train: bool = True,
     exclude_domain_subsets: bool = True,
 ) -> List[Tuple[Path, Path, str]]:
-    """Auto-discover paired `(blur_path, sharp_path, blur_channel)` across GoPro, HIDE, RealBlur-J & DPDD!"""
+    """Auto-discover paired `(blur_path, sharp_path, blur_channel)` across GoPro, HIDE, RealBlur-J, BlurDataset & DPDD!"""
     if not roots_spec:
         return []
     if isinstance(roots_spec, (str, Path)):
@@ -1059,7 +1137,7 @@ def discover_paired_blur_datasets(
         root_path = Path(r_str)
         root_pairs: List[Tuple[Path, Path, str]] = []
 
-        # 1. Check RealBlur-style `.txt` pair index files first (pruning CelebA/Text/RAW subtrees immediately)
+        # 1. Check RealBlur/HIDE-style `.txt` pair index files first (pruning CelebA/Text/RAW subtrees immediately)
         for cur_dir, dirs, files in os.walk(r_str, followlinks=True):
             dirs[:] = [d for d in dirs if not _is_excluded_pair_token(d, exclude_domain_subsets)]
             for fname in files:
@@ -1094,7 +1172,7 @@ def discover_paired_blur_datasets(
                         ch = _infer_pair_channel(str(blur_p), default_channel)
                         root_pairs.append((blur_p, sharp_p, ch))
 
-        # 2. Discover sibling `(blur, sharp)` / `(inputC, target)` / `(blur, GT)` directory pairs
+        # 2. Discover sibling `(blur, sharp)` / `(motion_blurred, defocused_blurred, sharp)` / `(inputC, target)` folders
         for cur_dir, dirs, _files in os.walk(r_str, followlinks=True):
             dirs[:] = [d for d in dirs if not _is_excluded_pair_token(d, exclude_domain_subsets)]
             lower_map: Dict[str, str] = {d.lower(): d for d in dirs}
@@ -1103,9 +1181,8 @@ def discover_paired_blur_datasets(
             if not blur_subs or not sharp_subs:
                 continue
 
-            # Prefer canonical `blur` over `blur_gamma` unless only `blur_gamma` exists
-            blur_subs.sort(key=lambda s: (0 if s.lower() in ("blur", "inputc", "defocus", "input") else 1, s))
-            sharp_subs.sort(key=lambda s: (0 if s.lower() in ("sharp", "gt", "target") else 1, s))
+            blur_subs.sort(key=lambda s: (0 if s.lower() != "blur_gamma" else 1, s))
+            sharp_subs.sort(key=lambda s: (0 if s.lower() in ("sharp", "gt", "target", "clean") else 1, s))
 
             sharp_dir = Path(cur_dir) / sharp_subs[0]
             sharp_imgs = _collect_images(sharp_dir)
@@ -1116,29 +1193,47 @@ def discover_paired_blur_datasets(
                 rel = os.path.splitext(os.path.relpath(str(sp), str(sharp_dir)))[0]
                 sharp_index[_normalize_pair_stem(rel)] = sp
 
-            b_dir = Path(cur_dir) / blur_subs[0]
-            for bp in _collect_images(b_dir):
-                rel_b = os.path.splitext(os.path.relpath(str(bp), str(b_dir)))[0]
-                key_b = _normalize_pair_stem(rel_b)
-                if key_b in sharp_index:
-                    ch = _infer_pair_channel(str(bp), default_channel)
-                    root_pairs.append((bp, sharp_index[key_b], ch))
+            has_canonical_blur = "blur" in lower_map
+            for b_sub in blur_subs:
+                # Skip duplicate `blur_gamma` when canonical `blur` already exists in the same GoPro scene
+                if b_sub.lower() == "blur_gamma" and has_canonical_blur:
+                    continue
+                b_dir = Path(cur_dir) / b_sub
+                for bp in _collect_images(b_dir):
+                    rel_b = os.path.splitext(os.path.relpath(str(bp), str(b_dir)))[0]
+                    key_b = _normalize_pair_stem(rel_b)
+                    if key_b in sharp_index:
+                        ch = _infer_pair_channel(str(bp), default_channel)
+                        root_pairs.append((bp, sharp_index[key_b], ch))
 
-        # Filter train vs test/val subdirectories if both exist inside the same root
+        # Filter train vs test/val PER top-level subdataset (so GoPro uses GoPro/train while HIDE — which only
+        # has `HIDE/test/` in the Kaggle DBlur collection — is NOT discarded alongside GoPro/test!)
         if root_pairs:
+            buckets: Dict[str, List[Tuple[Path, Path, str]]] = {}
+            for rec in root_pairs:
+                rel_parts = os.path.relpath(str(rec[0]), r_str).replace("\\", "/").split("/")
+                top_key = rel_parts[0].lower() if len(rel_parts) > 1 else "."
+                if top_key in ("train", "training", "test", "testing", "val", "valid", "validation"):
+                    top_key = "."
+                buckets.setdefault(top_key, []).append(rec)
+
             def _is_eval_pair(rec: Tuple[Path, Path, str]) -> bool:
                 rel_tokens = set(os.path.relpath(str(rec[0]), r_str).replace("\\", "/").lower().split("/"))
                 return bool(rel_tokens & {"test", "testing", "val", "valid", "validation"})
 
-            train_only = [rec for rec in root_pairs if not _is_eval_pair(rec)]
-            eval_only = [rec for rec in root_pairs if _is_eval_pair(rec)]
-            selected = (train_only if train_only else root_pairs) if is_train else (eval_only if eval_only else root_pairs)
-
-            for bp, sp, ch in selected:
-                sig = (str(bp), str(sp))
-                if sig not in seen:
-                    seen.add(sig)
-                    all_pairs.append((bp, sp, ch))
+            for _b_key, sub_pairs in buckets.items():
+                train_only = [rec for rec in sub_pairs if not _is_eval_pair(rec)]
+                eval_only = [rec for rec in sub_pairs if _is_eval_pair(rec)]
+                selected = (
+                    (train_only if train_only else sub_pairs)
+                    if is_train
+                    else (eval_only if eval_only else sub_pairs)
+                )
+                for bp, sp, ch in selected:
+                    sig = (str(bp), str(sp))
+                    if sig not in seen:
+                        seen.add(sig)
+                        all_pairs.append((bp, sp, ch))
 
     return sorted(all_pairs, key=lambda x: (str(x[0]), str(x[1])))
 
@@ -1146,7 +1241,7 @@ def discover_paired_blur_datasets(
 def create_controllable_dataset(
     config, is_train=True, dataset_path=None, align_only: bool = False, compact_ipc: bool = False, verbose: bool = True
 ):
-    """Discover clean 2K references (DIV2K/DF2K/LSDIR) + optional real paired deblurring datasets."""
+    """Discover clean 2K references + clean sharp targets from paired datasets + real paired camera blur."""
     split_name = "train" if is_train else "val"
     explicit_dir = dataset_path or (config.TRAIN_DATASET_PATH if is_train else config.VAL_DATASET_PATH)
 
@@ -1163,7 +1258,7 @@ def create_controllable_dataset(
     source_desc = ""
 
     if explicit_dir:
-        # Support comma-separated multiple clean roots (e.g. `/kaggle/input/div2k,/kaggle/input/lsdir`)
+        # Support comma-separated multiple clean/curated roots (e.g. `/kaggle/input/df2k,/kaggle/input/curated`)
         dir_parts = [p.strip() for p in str(explicit_dir).split(",") if p.strip()]
         auto_pairs: List[Tuple[Path, Path, str]] = []
         for d_str in dir_parts:
@@ -1179,7 +1274,11 @@ def create_controllable_dataset(
         if len(dir_parts) == 1:
             target_root = Path(dir_parts[0])
             div2k_sub = target_root / ("DIV2K_train_HR" if is_train else "DIV2K_valid_HR")
-            all_paths = [p for p in _collect_images(target_root) if str(p) not in blur_exclude]
+            all_paths = [
+                p
+                for p in _collect_images(target_root)
+                if str(p) not in blur_exclude and not _is_degraded_or_excluded_for_clean_pool(p, target_root)
+            ]
             if not all_paths and not paired_records:
                 raise FileNotFoundError(
                     f"No images found in {target_root}. Verify --{'train' if is_train else 'val'}-root path."
@@ -1203,7 +1302,12 @@ def create_controllable_dataset(
         else:
             collected = []
             for d_str in dir_parts:
-                collected.extend(p for p in _collect_images(Path(d_str)) if str(p) not in blur_exclude)
+                d_root = Path(d_str)
+                collected.extend(
+                    p
+                    for p in _collect_images(d_root)
+                    if str(p) not in blur_exclude and not _is_degraded_or_excluded_for_clean_pool(p, d_root)
+                )
             paths = sorted(set(collected))
             if not paths and not paired_records:
                 raise FileNotFoundError(f"No images found in {explicit_dir}.")
@@ -1217,7 +1321,9 @@ def create_controllable_dataset(
         elif root.exists():
             if verbose:
                 print(f"No DIV2K folder found at {sub}, falling back to recursive image search in {root}.")
-            all_paths = _collect_images(root)
+            all_paths = [
+                p for p in _collect_images(root) if not _is_degraded_or_excluded_for_clean_pool(p, root)
+            ]
             if all_paths:
                 rng = random.Random(config.SEED)
                 shuffled = list(all_paths)
@@ -1234,6 +1340,23 @@ def create_controllable_dataset(
                 f"No images found in {root}. Pass --train-root / --val-root or --paired-motion-root."
             )
 
+    # Reuse all verified clean `sharp`/`gt` images from paired datasets inside `paths` so they ALSO train
+    # all 6 main tasks (`denoise`, `deartifact`, `sharpen_focus`, `exposure`, `warmth`, `deblur_motion`)!
+    added_paired_clean = 0
+    if is_train and paired_records and bool(getattr(config, "REUSE_PAIRED_CLEAN_FOR_SYNTH", True)):
+        existing_clean = {str(p) for p in paths}
+        extra_clean = sorted(
+            {
+                sp
+                for _bp, sp, _ch in paired_records
+                if str(sp) not in existing_clean and not _is_excluded_pair_token(str(sp))
+            },
+            key=str,
+        )
+        if extra_clean:
+            paths = list(paths) + extra_clean
+            added_paired_clean = len(extra_clean)
+
     limit = config.TRAIN_IMAGES_COUNT if is_train else config.VAL_IMAGES_COUNT
     if limit and 0 < limit < len(paths):
         rng = random.Random(config.SEED + (0 if is_train else 1))
@@ -1242,15 +1365,20 @@ def create_controllable_dataset(
         paths = sorted(shuffled[:limit])
 
     if verbose:
+        clean_note = (
+            f" (incl. +{added_paired_clean} clean sharp/GT images from paired datasets)"
+            if added_paired_clean > 0
+            else ""
+        )
         pair_msg = ""
         if paired_records:
             n_mot = sum(1 for _b, _s, ch in paired_records if ch == "deblur_motion")
             n_foc = sum(1 for _b, _s, ch in paired_records if ch == "sharpen_focus")
             pair_msg = (
                 f" + {len(paired_records)} real camera pairs "
-                f"(motion={n_mot}, defocus={n_foc}, p_real={getattr(config, 'PAIRED_REAL_PROB', 0.35):.2f})"
+                f"(motion={n_mot}, defocus={n_foc}, p_real={getattr(config, 'PAIRED_REAL_PROB', 0.42):.2f})"
             )
-        print(f"[{split_name}] Using {len(paths)} clean reference images from {source_desc}{pair_msg}")
+        print(f"[{split_name}] Using {len(paths)} clean reference images from {source_desc}{clean_note}{pair_msg}")
     return ControllableRestorationDataset(
         paths,
         config,

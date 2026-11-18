@@ -53,10 +53,12 @@ def test_selective_pipeline():
     )
     assert abs(dist_sum - 1.0) < 1e-6, f"Action distribution must sum to 1.0, got {dist_sum}"
     assert cfg.NUM_ACTIONS == 6, f"Expected 6 orthogonal controls, got {cfg.NUM_ACTIONS}"
+    assert cfg.SEMANTIC_ENCODER_TYPE == "convnextv2_dinov2", "Default V5 vision encoder must be convnextv2_dinov2!"
     assert cfg.GENERATOR_BACKBONE == "sd-2.1-base", "Default V5 backbone must be sd-2.1-base!"
     assert cfg.GENERATOR_REPO_MAP["sd-2.1-base"] == "sd2-community/stable-diffusion-2-1-base"
     assert "sd-turbo" in cfg.GENERATOR_REPO_MAP and "bk-sdm-small" in cfg.GENERATOR_REPO_MAP
     assert cfg.ADAPTIVE_TIMESTEP is True and 10 <= cfg.RESTORATION_MIN_TIMESTEP < cfg.RESTORATION_MAX_TIMESTEP
+    assert cfg.SKIP_DROPOUT_PROB > 0.0, "Skip dropout must be active during training so UNet hat_z_0 learns full deblurring!"
     assert cfg.VAE_DEC_LORA_RANK == 0, "VAE decoder must remain frozen to protect SD's natural image manifold!"
     assert cfg.HYPIR_MODE is False and cfg.LOSS_RPGAN_WEIGHT == 0.0 and cfg.LOSS_CSD_WEIGHT > 0.0
     assert len(cfg.LORA_EXPERT_SPECS) == 3
@@ -169,20 +171,40 @@ def test_selective_pipeline():
         val_root = tmp_path / "df2k-ost" / "test" / "DIV2K_valid"
         val_root.mkdir(parents=True)
 
-        big_clean = cv2.resize(clean, (300, 300), interpolation=cv2.INTER_NEAREST)
-        big_blur = cv2.GaussianBlur(big_clean, (11, 11), 3.0)
+        big_clean = cv2.resize(clean, (420, 420), interpolation=cv2.INTER_NEAREST)
+        big_blur = cv2.GaussianBlur(big_clean, (13, 13), 3.4)
         cv2.imwrite(str(train_root / "DIV2K" / "0001.png"), big_clean)
         cv2.imwrite(str(train_root / "Flickr2K" / "0002.jpg"), big_clean)
         cv2.imwrite(str(real_ost / "0003.png"), big_clean)
         os.symlink(str(real_ost), str(train_root / "OST_link"))
         cv2.imwrite(str(val_root / "0801.png"), big_clean)
 
-        # Mock Curated Motion Pack (GoPro scene layout + RealBlur .txt list layout) & DPDD Defocus layout
+        # Mock Curated Motion Pack (GoPro train+test, HIDE test-only, RealBlur .txt, multi-blur sharp/M/F) & DPDD
         curated_motion = tmp_path / "curated_deblur"
         (curated_motion / "GoPro" / "train" / "GOPR0372" / "blur").mkdir(parents=True)
+        (curated_motion / "GoPro" / "train" / "GOPR0372" / "blur_gamma").mkdir(parents=True)
         (curated_motion / "GoPro" / "train" / "GOPR0372" / "sharp").mkdir(parents=True)
         cv2.imwrite(str(curated_motion / "GoPro" / "train" / "GOPR0372" / "blur" / "0001.png"), big_blur)
+        cv2.imwrite(str(curated_motion / "GoPro" / "train" / "GOPR0372" / "blur_gamma" / "0001.png"), big_blur)
         cv2.imwrite(str(curated_motion / "GoPro" / "train" / "GOPR0372" / "sharp" / "0001.png"), big_clean)
+        (curated_motion / "GoPro" / "test" / "GOPR0384" / "blur").mkdir(parents=True)
+        (curated_motion / "GoPro" / "test" / "GOPR0384" / "sharp").mkdir(parents=True)
+        cv2.imwrite(str(curated_motion / "GoPro" / "test" / "GOPR0384" / "blur" / "0099.png"), big_blur)
+        cv2.imwrite(str(curated_motion / "GoPro" / "test" / "GOPR0384" / "sharp" / "0099.png"), big_clean)
+
+        # HIDE in Kaggle DBlur only has HIDE/test/{blur,sharp} — verify per-subdataset filter rescues it!
+        (curated_motion / "HIDE" / "test" / "blur").mkdir(parents=True)
+        (curated_motion / "HIDE" / "test" / "sharp").mkdir(parents=True)
+        cv2.imwrite(str(curated_motion / "HIDE" / "test" / "blur" / "hide_01.png"), big_blur)
+        cv2.imwrite(str(curated_motion / "HIDE" / "test" / "sharp" / "hide_01.png"), big_clean)
+
+        # Multi-blur sibling layout (`sharp/*_S` + `motion_blurred/*_M` + `defocused_blurred/*_F`)
+        (curated_motion / "BlurSet" / "sharp").mkdir(parents=True)
+        (curated_motion / "BlurSet" / "motion_blurred").mkdir(parents=True)
+        (curated_motion / "BlurSet" / "defocused_blurred").mkdir(parents=True)
+        cv2.imwrite(str(curated_motion / "BlurSet" / "sharp" / "0_CAM_S.png"), big_clean)
+        cv2.imwrite(str(curated_motion / "BlurSet" / "motion_blurred" / "0_CAM_M.png"), big_blur)
+        cv2.imwrite(str(curated_motion / "BlurSet" / "defocused_blurred" / "0_CAM_F.png"), big_blur)
 
         rb_dir = curated_motion / "RealBlur" / "scene_001"
         (rb_dir / "blur").mkdir(parents=True)
@@ -208,17 +230,32 @@ def test_selective_pipeline():
 
         found_motion = discover_paired_blur_datasets(curated_motion, "deblur_motion", is_train=True)
         found_defocus = discover_paired_blur_datasets(dpdd_root, "sharpen_focus", is_train=True)
-        assert len(found_motion) == 2, f"Expected 2 GoPro+RealBlur-J motion pairs (CelebA/Text pruned), got {len(found_motion)}"
+        # Expect 5 curated pairs: GoPro/train (1, GoPro/test & blur_gamma skipped), HIDE/test (1), BlurSet M+F (2), RealBlur (1)
+        assert len(found_motion) == 5, f"Expected 5 curated pairs, got {len(found_motion)}: {found_motion}"
+        assert sum(1 for _, _, c in found_motion if c == "sharpen_focus") == 1
         assert len(found_defocus) == 1 and found_defocus[0][2] == "sharpen_focus"
 
         ds_cfg = Config()
-        ds_cfg.TRAIN_DATASET_PATH = str(train_root)
-        ds_cfg.PAIRED_MOTION_DATASET_PATH = str(curated_motion)
+        ds_cfg.TRAIN_DATASET_PATH = f"{train_root},{curated_motion}"
         ds_cfg.PAIRED_DEFOCUS_DATASET_PATH = str(dpdd_root)
         ds_cfg.VAL_DATASET_PATH = str(val_root)
         train_ds = create_controllable_dataset(ds_cfg, is_train=True, verbose=False)
         val_ds = create_controllable_dataset(ds_cfg, is_train=False, verbose=False)
-        assert len(train_ds) == 3 and len(train_ds.image_paths) == 3 and len(train_ds.paired_records) == 3 and len(val_ds) == 1
+        # Clean pool must contain ONLY clean references (3 DF2K + GoPro train/test sharp + HIDE sharp + BlurSet sharp + RealBlur gt + DPDD target = 9),
+        # with ZERO `blur`, `blur_gamma`, `motion_blurred`, `defocused_blurred`, `CelebA`, `Text_OCR`, or `RealBlur_R` files!
+        assert len(train_ds.paired_records) == 6 and len(val_ds) == 1
+        assert len(train_ds.image_paths) == 9, f"Expected 9 clean images, got {len(train_ds.image_paths)}: {train_ds.image_paths}"
+        for cp in train_ds.image_paths:
+            low_cp = str(cp).lower()
+            assert not any(
+                bad in low_cp
+                for bad in ("/blur/", "/blur_gamma/", "motion_blurred", "defocused_blurred", "celeba", "text_ocr", "realblur_r")
+            ), f"Pre-blurred or excluded image leaked into clean pool: {cp}"
+        # Verify multi-scale active-blur crop gate on paired GoPro/RealBlur images
+        for p_i in range(6):
+            bc_chk, sc_chk, ch_chk = train_ds._load_paired_crop_with_retry(p_i)
+            assert bc_chk.shape == (ds_cfg.PATCH_SIZE, ds_cfg.PATCH_SIZE, 3) and sc_chk.shape == bc_chk.shape
+            assert ch_chk in ("deblur_motion", "sharpen_focus")
 
         bench_out = tmp_path / "bench_out"
         test_photo = cv2.resize(clean.copy(), (256, 200), interpolation=cv2.INTER_LINEAR)

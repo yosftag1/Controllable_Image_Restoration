@@ -1,6 +1,6 @@
 # Controllable Pretrained Image Restoration (V5)
 
-An **orthogonal, spatially controllable & expandable universal image restoration framework** built on **Semantic Vision Foundation Models** (`nvidia/C-RADIOv3-B` default, `nvidia/C-RADIOv2-B`, or `DINOv3 / DINOv2-Registers + SigLIP 2`) and **Pretrained Diffusion Score Priors** (`sd2-community/stable-diffusion-2-1-base` default, plus `sd-turbo`, `sd-1.5`, `bk-sdm-small`, and `tiny-sd`).
+An **orthogonal, spatially controllable & expandable universal image restoration framework** built on **Dual-Stream Vision Foundation Models** (`facebook/convnextv2-base-22k-224` `4×/8×/16×` conv pyramid + `facebook/dinov2-with-registers-base` default; `dinov3_siglip2` and `c_radio` also selectable) and **Pretrained Diffusion Score Priors** (`sd2-community/stable-diffusion-2-1-base` default, plus `sd-turbo`, `sd-1.5`, `bk-sdm-small`, and `tiny-sd`).
 
 Instead of forcing every photo into an uncontrolled blind restoration or training task-specific blur estimators, V5 keeps **100% of control inside your 6-Channel Spatial Control Overlay** $\mathbf{A}(y, x)$ plus a single **Generative Texture Detail** dial ($\lambda_{\text{det}} \in [0, 1]$), and makes adding future knobs (e.g., lens distortion, lens flare) plug-and-play:
 
@@ -48,11 +48,9 @@ python tests/smoke_test.py
 
 **Balanced ~5-Hour End-to-End 3-Stage Run (`--pilot` / `--5h` — `1` align + `9` pixel + `3` CSD epochs @ `950` steps/ep):**
 ```python
-!pip install -q open-clip-torch
-
 %run train.py --pilot \
   --train-root /kaggle/input/datasets/thaihoa1476050/df2k-ost/train \
-  --paired-motion-root /kaggle/input/a-curated-list-of-image-deblurring-datasets \
+  --paired-motion-root /kaggle/input/datasets/jishnuparayilshibu/a-curated-list-of-image-deblurring-datasets \
   --val-root /kaggle/input/datasets/thaihoa1476050/df2k-ost/test/DIV2K_valid
 ```
 

@@ -26,7 +26,7 @@ except ImportError:
 
 
 class MultiLayerVGGPerceptual(nn.Module):
-    """Anti-aliased, unit-channel-normalized mid/deep LPIPS-VGG19 perceptual loss."""
+    """Full-res (`relu1_2..relu4_4`) LPIPS + DISTS Local Patch Texture Similarity (mean & std matching)."""
 
     LAYER_MAP = {
         "relu1_2": 3,
@@ -36,16 +36,16 @@ class MultiLayerVGGPerceptual(nn.Module):
         "relu5_4": 35,
     }
     LAYER_WEIGHTS = {
-        3: 0.10,
-        8: 0.25,
-        17: 0.40,
-        26: 0.35,
-        35: 0.25,
+        3: 0.25,
+        8: 0.30,
+        17: 0.25,
+        26: 0.20,
+        35: 0.15,
     }
 
     def __init__(
         self,
-        layers: Iterable[str] = ("relu2_2", "relu3_4", "relu4_4"),
+        layers: Iterable[str] = ("relu1_2", "relu2_2", "relu3_4", "relu4_4"),
         use_pretrained: bool = True,
     ):
         super().__init__()
@@ -89,13 +89,19 @@ class MultiLayerVGGPerceptual(nn.Module):
         sample_weights: Optional[torch.Tensor] = None,
         active_change_gate: Optional[torch.Tensor] = None,
         return_contrast: bool = False,
+        use_dists_texture: bool = False,
     ):
-        x = (self._antialias_rgb(pred_01) - self.mean) / self.std
+        # In Stage 3 (`use_dists_texture=True`), feed crisp unblurred RGB so full-res `relu1_2` (256x256)
+        # sees 1-2px citrus pores, feather barbs, and leaf veins without binomial pre-blurring!
+        p_rgb = pred_01.float() if use_dists_texture else self._antialias_rgb(pred_01)
+        x = (p_rgb - self.mean) / self.std
         with torch.no_grad():
-            y_in = (self._antialias_rgb(target_01) - self.mean) / self.std
+            t_rgb = target_01.float() if use_dists_texture else self._antialias_rgb(target_01)
+            y_in = (t_rgb - self.mean) / self.std
             has_src = src_01 is not None and return_contrast
             if has_src:
-                s_in = (self._antialias_rgb(src_01) - self.mean) / self.std
+                s_rgb = src_01.float() if use_dists_texture else self._antialias_rgb(src_01)
+                s_in = (s_rgb - self.mean) / self.std
                 ys_cat = torch.cat([y_in, s_in], dim=0)
             else:
                 ys_cat = y_in
@@ -126,6 +132,36 @@ class MultiLayerVGGPerceptual(nn.Module):
                 pos_dist = (lpips_map * w_l).mean(dim=(1, 2, 3))
             else:
                 pos_dist = lpips_map.mean(dim=(1, 2, 3))
+
+            if use_dists_texture:
+                # DISTS Local Patch Texture Matching (8x8 & 16x16 mean + std):
+                # Rewards real local micro-contrast (pores, feathers, leaf fibers) matching Clean GT
+                # WITHOUT penalizing 1-2px subpixel shifts (breaks the MMSE double-penalty blur trap!)
+                tex_dist = pred_01.new_zeros((x.shape[0],), dtype=torch.float32)
+                win_cnt = 0
+                ch_scale = y_det.abs().mean(dim=(0, 2, 3), keepdim=True).clamp(min=1e-2)
+                xn = x / ch_scale
+                yn = y_det / ch_scale
+                for win_k, win_s in ((8, 4), (16, 8)):
+                    if xn.shape[-2] >= win_k and xn.shape[-1] >= win_k:
+                        mu_x = F.avg_pool2d(xn, kernel_size=win_k, stride=win_s)
+                        mu_y = F.avg_pool2d(yn, kernel_size=win_k, stride=win_s)
+                        var_x = (F.avg_pool2d(xn * xn, kernel_size=win_k, stride=win_s) - mu_x * mu_x).clamp(min=0.0)
+                        var_y = (F.avg_pool2d(yn * yn, kernel_size=win_k, stride=win_s) - mu_y * mu_y).clamp(min=0.0)
+                        std_x = torch.sqrt(var_x + 1e-6)
+                        std_y = torch.sqrt(var_y + 1e-6)
+                        patch_err = (0.30 * (mu_x - mu_y).abs() + 0.70 * (std_x - std_y).abs()).mean(
+                            dim=1, keepdim=True
+                        )
+                        if spatial_weight is not None:
+                            w_p = F.adaptive_avg_pool2d(spatial_weight.float(), output_size=patch_err.shape[-2:])
+                            w_p = w_p / w_p.mean(dim=(2, 3), keepdim=True).clamp(min=1e-4)
+                            tex_dist = tex_dist + (patch_err * w_p).mean(dim=(1, 2, 3))
+                        else:
+                            tex_dist = tex_dist + patch_err.mean(dim=(1, 2, 3))
+                        win_cnt += 1
+                if win_cnt > 0:
+                    pos_dist = 0.40 * pos_dist + 0.60 * (tex_dist / float(win_cnt))
 
             if sample_weights is not None:
                 total_pos = total_pos + sw * (pos_dist * sample_weights.float()).mean()
@@ -284,10 +320,13 @@ class ControllableRestorationLoss(nn.Module):
 
         deg_names = list(getattr(config, "DEGRADATION_TYPES", []))
         signed_set = set(getattr(config, "SIGNED_ACTION_TYPES", ["exposure", "warmth"]))
+        local_clean_set = {"denoise", "deartifact"}
         signed_idx = [i for i, n in enumerate(deg_names) if n in signed_set]
         struct_idx = [i for i, n in enumerate(deg_names) if n not in signed_set]
+        deconv_idx = [i for i, n in enumerate(deg_names) if (n not in signed_set) and (n not in local_clean_set)]
         self.register_buffer("signed_indices", torch.tensor(signed_idx, dtype=torch.long), persistent=False)
         self.register_buffer("struct_indices", torch.tensor(struct_idx, dtype=torch.long), persistent=False)
+        self.register_buffer("deconv_indices", torch.tensor(deconv_idx, dtype=torch.long), persistent=False)
 
         b1d = torch.tensor([1.0, 4.0, 6.0, 4.0, 1.0], dtype=torch.float32) / 16.0
         b2d = (b1d[:, None] * b1d[None, :]).view(1, 1, 5, 5).repeat(3, 1, 1, 1)
@@ -303,7 +342,8 @@ class ControllableRestorationLoss(nn.Module):
         action_map: torch.Tensor,
         src_01: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        max_act = action_map.float().abs().amax(dim=1, keepdim=True)
+        a_f = action_map.float()
+        max_act = a_f.abs().amax(dim=1, keepdim=True)
         if src_01 is not None:
             deg_mag = (target_01.float() - src_01.float()).abs().mean(dim=1, keepdim=True).detach()
             raw_w = 0.60 + 0.85 * max_act + 4.5 * deg_mag
@@ -312,6 +352,14 @@ class ControllableRestorationLoss(nn.Module):
         else:
             raw_w = 0.60 + 0.85 * max_act
             active_change_gate = None
+
+        # Focus deconvolution supervision directly onto sharp GT edges, fur strands & object contours!
+        if self.deconv_indices.numel() > 0 and target_01.shape[-2] >= 8 and target_01.shape[-1] >= 8:
+            d_idx = self.deconv_indices.to(a_f.device)
+            deconv_act = a_f.index_select(1, d_idx).abs().amax(dim=1, keepdim=True).clamp(0.0, 1.0)
+            tgt_f = target_01.float().detach()
+            tgt_edge = (tgt_f - self._gaussian_blur5(tgt_f)).abs().mean(dim=1, keepdim=True)
+            raw_w = raw_w + 7.5 * deconv_act * tgt_edge
 
         spatial_w = raw_w / raw_w.mean(dim=(2, 3), keepdim=True).clamp(min=1e-4)
         return spatial_w.detach(), active_change_gate
@@ -323,14 +371,23 @@ class ControllableRestorationLoss(nn.Module):
         charb = torch.sqrt(diff_sq + self.eps * self.eps)
         return (charb * spatial_weight).mean()
 
+    def _lowpass_4x(self, rgb_01: torch.Tensor) -> torch.Tensor:
+        """Anti-aliased 4x low-pass structural filter (locks shapes & color while freeing 1-3px pores!)."""
+        h = self._gaussian_blur5(rgb_01.float())[:, :, ::2, ::2]
+        return self._gaussian_blur5(h)[:, :, ::2, ::2]
+
     def latent_reconstruction_loss(
         self,
         hat_z_0: torch.Tensor,
         z_tgt: torch.Tensor,
         spatial_weight: Optional[torch.Tensor] = None,
+        lowpass_only: bool = False,
     ) -> torch.Tensor:
         zp = hat_z_0.float()
         zt = z_tgt.float().detach()
+        if lowpass_only and zp.shape[-2] >= 4 and zp.shape[-1] >= 4:
+            zp = F.avg_pool2d(zp, kernel_size=2, stride=2)
+            zt = F.avg_pool2d(zt, kernel_size=2, stride=2)
         charb = torch.sqrt((zp - zt) ** 2 + 1e-6)
         if spatial_weight is not None:
             w_z = F.adaptive_avg_pool2d(spatial_weight.float(), output_size=zp.shape[-2:])
@@ -339,6 +396,8 @@ class ControllableRestorationLoss(nn.Module):
         else:
             l_val = charb.mean()
 
+        if lowpass_only:
+            return l_val
         dx = ((zp[:, :, :, 1:] - zp[:, :, :, :-1]) - (zt[:, :, :, 1:] - zt[:, :, :, :-1])).abs().mean()
         dy = ((zp[:, :, 1:, :] - zp[:, :, :-1, :]) - (zt[:, :, 1:, :] - zt[:, :, :-1, :])).abs().mean()
         return l_val + 0.25 * 0.5 * (dx + dy)
@@ -348,6 +407,7 @@ class ControllableRestorationLoss(nn.Module):
         pred_01: torch.Tensor,
         target_01: torch.Tensor,
         spatial_weight: Optional[torch.Tensor] = None,
+        detail_mode: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         cur_p = pred_01.float()
         cur_t = target_01.float()
@@ -355,7 +415,9 @@ class ControllableRestorationLoss(nn.Module):
 
         pyr_loss = cur_p.new_zeros((), dtype=torch.float32)
         hf_guard = cur_p.new_zeros((), dtype=torch.float32)
-        level_weights = (0.35, 0.30, 0.20, 0.15)
+        # In Stage 3 (`detail_mode=True`), zero out finest L1 bands (lvl 0 & 1) so shifted 1-3px pores
+        # aren't smoothed away by the double-penalty effect; keep coarse structural octaves (lvl 2 & 3)!
+        level_weights = (0.0, 0.0, 0.55, 0.45) if detail_mode else (0.35, 0.30, 0.20, 0.15)
         w_sum = 0.0
 
         for lvl, lw in enumerate(level_weights):
@@ -366,17 +428,22 @@ class ControllableRestorationLoss(nn.Module):
             band_p = cur_p - blur_p
             band_t = cur_t - blur_t
 
-            band_charb = torch.sqrt((band_p - band_t) ** 2 + self.eps * self.eps)
-            if cur_w is not None:
-                pyr_loss = pyr_loss + lw * (band_charb * cur_w).mean()
-            else:
-                pyr_loss = pyr_loss + lw * band_charb.mean()
-            w_sum += lw
+            if lw > 0.0:
+                band_charb = torch.sqrt((band_p - band_t) ** 2 + self.eps * self.eps)
+                if cur_w is not None:
+                    pyr_loss = pyr_loss + lw * (band_charb * cur_w).mean()
+                else:
+                    pyr_loss = pyr_loss + lw * band_charb.mean()
+                w_sum += lw
 
             if lvl <= 1:
                 p_energy = band_p.abs().mean(dim=1, keepdim=True)
                 t_energy = band_t.abs().mean(dim=1, keepdim=True).detach()
-                excess_hf = F.relu(p_energy - t_energy - 0.010)
+                # Allow natural GT-level crispness in detail_mode while still blocking extreme spike artifacts
+                if detail_mode:
+                    excess_hf = F.relu(p_energy - 1.18 * t_energy - 0.035)
+                else:
+                    excess_hf = F.relu(p_energy - t_energy - 0.010)
                 hf_guard = hf_guard + (0.65 if lvl == 0 else 0.35) * excess_hf.mean()
 
             cur_p = blur_p[:, :, ::2, ::2]
@@ -515,15 +582,33 @@ class ControllableRestorationLoss(nn.Module):
         )
         stage = stage.lower()
 
+        is_detail_stage = stage == "semantic_stage"
         spatial_w, active_change_gate = self._build_spatial_focus_weight(target_01, action_map, src_01=src_01)
-        loss_l1 = self.charbonnier_with_preservation_weight(pred_01, target_01, spatial_w)
-        loss_pyr, loss_hf_guard = self.laplacian_pyramid_loss(pred_01, target_01, spatial_weight=spatial_w)
-        loss_grad = self.spatial_gradient_loss(pred_01, target_01, spatial_weight=spatial_w)
-        loss_freq = self.fft_frequency_loss(pred_01, target_01)
+
+        if is_detail_stage and pred_01.shape[-2] >= 16 and pred_01.shape[-1] >= 16:
+            # PiSA-SR Detail Stage Principle: supervise pixel L1 & gradients ONLY on 4x low-pass structure
+            # so 1-3px micro-textures (pores, feather barbs, leaf veins) are free from MMSE blur averaging!
+            pred_lp4 = self._lowpass_4x(pred_01)
+            tgt_lp4 = self._lowpass_4x(target_01)
+            w_lp4 = F.adaptive_avg_pool2d(spatial_w, output_size=pred_lp4.shape[-2:])
+            w_lp4 = w_lp4 / w_lp4.mean(dim=(2, 3), keepdim=True).clamp(min=1e-4)
+            loss_l1 = self.charbonnier_with_preservation_weight(pred_lp4, tgt_lp4, w_lp4)
+            loss_grad = self.spatial_gradient_loss(pred_lp4, tgt_lp4, spatial_weight=w_lp4)
+            loss_freq = pred_01.new_zeros((), dtype=torch.float32)
+        else:
+            loss_l1 = self.charbonnier_with_preservation_weight(pred_01, target_01, spatial_w)
+            loss_grad = self.spatial_gradient_loss(pred_01, target_01, spatial_weight=spatial_w)
+            loss_freq = self.fft_frequency_loss(pred_01, target_01)
+
+        loss_pyr, loss_hf_guard = self.laplacian_pyramid_loss(
+            pred_01, target_01, spatial_weight=spatial_w, detail_mode=is_detail_stage
+        )
         loss_color = self.multiscale_color_tone_loss(pred_01, target_01)
 
         loss_latent = (
-            self.latent_reconstruction_loss(hat_z_0, z_tgt, spatial_weight=spatial_w)
+            self.latent_reconstruction_loss(
+                hat_z_0, z_tgt, spatial_weight=spatial_w, lowpass_only=is_detail_stage
+            )
             if (hat_z_0 is not None and z_tgt is not None)
             else pred_01.new_zeros((), dtype=torch.float32)
         )
@@ -534,15 +619,21 @@ class ControllableRestorationLoss(nn.Module):
         )
 
         l1_weight = (
-            float(getattr(self.config, "LOSS_SEMANTIC_STAGE_L1_WEIGHT", 0.85))
-            if stage == "semantic_stage"
+            float(getattr(self.config, "LOSS_SEMANTIC_STAGE_LP_L1_WEIGHT", 0.75))
+            if is_detail_stage
             else float(self.config.LOSS_L1_WEIGHT)
         )
-        lat_weight = float(getattr(self.config, "LOSS_LATENT_WEIGHT", 0.85))
+        lat_weight = (
+            float(getattr(self.config, "LOSS_SEMANTIC_STAGE_LATENT_LP_WEIGHT", 0.30))
+            if is_detail_stage
+            else float(getattr(self.config, "LOSS_LATENT_WEIGHT", 0.85))
+        )
         evae_weight = float(getattr(self.config, "LOSS_EVAE_SKIP_WEIGHT", 0.35))
-        if stage == "semantic_stage":
-            evae_weight = 0.25 * evae_weight
-        pyr_weight = float(getattr(self.config, "LOSS_PYRAMID_WEIGHT", 0.60))
+        if is_detail_stage:
+            evae_weight = 0.15 * evae_weight
+        pyr_weight = (0.30 if is_detail_stage else 1.0) * float(getattr(self.config, "LOSS_PYRAMID_WEIGHT", 0.60))
+        grad_weight = (0.50 if is_detail_stage else 1.0) * float(self.config.LOSS_GRADIENT_WEIGHT)
+        freq_weight = 0.0 if is_detail_stage else float(self.config.LOSS_FREQUENCY_WEIGHT)
         hf_guard_weight = float(getattr(self.config, "LOSS_HF_GUARD_WEIGHT", 0.50))
         color_weight = float(getattr(self.config, "LOSS_COLOR_TONE_WEIGHT", 0.65))
         preserve_weight = float(getattr(self.config, "LOSS_PRESERVE_WEIGHT", 0.50))
@@ -552,9 +643,9 @@ class ControllableRestorationLoss(nn.Module):
             + lat_weight * loss_latent
             + evae_weight * evae_scalar
             + pyr_weight * loss_pyr
-            + self.config.LOSS_GRADIENT_WEIGHT * loss_grad
+            + grad_weight * loss_grad
             + hf_guard_weight * loss_hf_guard
-            + self.config.LOSS_FREQUENCY_WEIGHT * loss_freq
+            + freq_weight * loss_freq
             + color_weight * loss_color
             + preserve_weight * loss_preserve
         )
@@ -604,6 +695,7 @@ class ControllableRestorationLoss(nn.Module):
         use_rpgan = rpgan_w > 0.0
         use_gan = stage in ("semantic_stage", "joint") and discriminator is not None and active_gan_w > 0.0
 
+        use_dists = stage in ("semantic_stage", "joint")
         if perc_w > 0.0 or (contrast_w > 0.0 and src_01 is not None):
             need_cr = contrast_w > 0.0 and src_01 is not None
             if need_cr:
@@ -615,6 +707,7 @@ class ControllableRestorationLoss(nn.Module):
                     sample_weights=t_weights,
                     active_change_gate=active_change_gate,
                     return_contrast=True,
+                    use_dists_texture=use_dists,
                 )
                 total = total + perc_w * loss_perc + contrast_w * loss_contrast
             else:
@@ -624,6 +717,7 @@ class ControllableRestorationLoss(nn.Module):
                     spatial_weight=spatial_w,
                     sample_weights=t_weights,
                     return_contrast=False,
+                    use_dists_texture=use_dists,
                 )
                 total = total + perc_w * loss_perc
 
@@ -634,9 +728,13 @@ class ControllableRestorationLoss(nn.Module):
                 tgt_sem = semantic_encoder(target_01, use_lora=False)
 
             if sem_w > 0.0:
-                p_tok = F.normalize(pred_sem["tokens"].float(), dim=-1)
-                g_tok = F.normalize(tgt_sem["tokens"].float().detach(), dim=-1)
-                loss_sem_cons = (1.0 - (p_tok * g_tok).sum(dim=-1)).mean()
+                p_grid = F.normalize(pred_sem["grid"].float(), dim=1, eps=1e-6)
+                g_grid = F.normalize(tgt_sem["grid"].float().detach(), dim=1, eps=1e-6)
+                grid_cons = (1.0 - (p_grid * g_grid).sum(dim=1)).mean()
+                p_tok = F.normalize(pred_sem["tokens"].float(), dim=-1, eps=1e-6)
+                g_tok = F.normalize(tgt_sem["tokens"].float().detach(), dim=-1, eps=1e-6)
+                tok_cons = (1.0 - (p_tok * g_tok).sum(dim=-1)).mean()
+                loss_sem_cons = 0.60 * grid_cons + 0.40 * tok_cons
                 total = total + sem_w * loss_sem_cons
 
             if use_gan:

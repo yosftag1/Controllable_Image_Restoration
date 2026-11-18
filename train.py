@@ -173,7 +173,7 @@ def build_stage_optimizer(raw_model: ControllableRestorer, stage: str, config: C
         param_groups.append({"params": groups["vision_lora"], "lr": config.VISION_LORA_LR * 0.25})
         param_groups.append({"params": groups["pixel_stage"], "lr": config.LEARNING_RATE})
     elif stage == "semantic_stage":
-        param_groups.append({"params": groups["semantic_stage"], "lr": config.LEARNING_RATE * 0.75})
+        param_groups.append({"params": groups["semantic_stage"], "lr": config.LEARNING_RATE * 1.25})
     elif stage == "joint":
         param_groups.append({"params": groups["vision_lora"], "lr": config.VISION_LORA_LR * 0.50})
         param_groups.append(
@@ -268,7 +268,7 @@ def _psnr_u8_tile(pred_u8: np.ndarray, ref_u8: np.ndarray) -> float:
 
 
 @torch.no_grad()
-def evaluate_validation(model, val_loader, device, config, stage: str):
+def evaluate_validation(model, val_loader, device, config, stage: str, loss_fn=None):
     raw_model = unwrap_model(model)
     raw_model.eval()
     use_amp = config.USE_AMP and (device.type == "cuda")
@@ -276,10 +276,12 @@ def evaluate_validation(model, val_loader, device, config, stage: str):
 
     total_psnr = 0.0
     total_l1 = 0.0
+    total_dists = 0.0
     count = 0
 
     restore_psnr_sum = 0.0
     restore_gain_sum = 0.0
+    restore_dists_sum = 0.0
     restore_count = 0
 
     for batch in val_loader:
@@ -296,6 +298,11 @@ def evaluate_validation(model, val_loader, device, config, stage: str):
                 detail_scale=detail_scale,
             )
             l1 = float(torch.mean(torch.abs(pred.float() - tgt.float())).item())
+            dists_val = (
+                float(loss_fn.perceptual(pred, tgt, use_dists_texture=True).detach().item())
+                if loss_fn is not None
+                else 0.0
+            )
 
         bsz = src.shape[0]
         pred_psnrs = _per_sample_psnr(pred, tgt)
@@ -303,6 +310,7 @@ def evaluate_validation(model, val_loader, device, config, stage: str):
 
         total_psnr += float(pred_psnrs.sum().item())
         total_l1 += l1 * bsz
+        total_dists += dists_val * bsz
         count += bsz
 
         # Signed-safe max |action| so negative darken/cool validation edits are accurately counted!
@@ -313,6 +321,7 @@ def evaluate_validation(model, val_loader, device, config, stage: str):
         if n_act > 0:
             restore_psnr_sum += float(pred_psnrs[active_mask].sum().item())
             restore_gain_sum += float((pred_psnrs[active_mask] - in_psnrs[active_mask]).sum().item())
+            restore_dists_sum += dists_val * n_act
             restore_count += n_act
 
     raw_model.clear_runtime_contexts()
@@ -321,11 +330,13 @@ def evaluate_validation(model, val_loader, device, config, stage: str):
     overall_psnr = total_psnr / denom
     restore_psnr = (restore_psnr_sum / restore_count) if restore_count > 0 else overall_psnr
     restore_gain = (restore_gain_sum / restore_count) if restore_count > 0 else 0.0
+    val_dists = (restore_dists_sum / restore_count) if restore_count > 0 else (total_dists / denom)
     return {
         "val_psnr": overall_psnr,
         "val_restore_psnr": restore_psnr,
         "val_restore_gain": restore_gain,
         "val_l1": total_l1 / denom,
+        "val_dists": val_dists,
     }
 
 
@@ -537,6 +548,8 @@ def save_checkpoint(
             "SIGNED_ACTION_TYPES": list(getattr(config, "SIGNED_ACTION_TYPES", ["exposure", "warmth"])),
             "LORA_EXPERT_SPECS": [dict(sp) for sp in getattr(config, "LORA_EXPERT_SPECS", [])],
             "SEMANTIC_ENCODER_TYPE": config.SEMANTIC_ENCODER_TYPE,
+            "CONVNEXTV2_MODEL_ID": getattr(config, "CONVNEXTV2_MODEL_ID", "facebook/convnextv2-base-22k-224"),
+            "DINOV2_REG_MODEL_ID": getattr(config, "DINOV2_REG_MODEL_ID", "facebook/dinov2-with-registers-base"),
             "RADIO_MODEL_ID": getattr(config, "RADIO_MODEL_ID", "nvidia/C-RADIOv3-B"),
             "GENERATOR_BACKBONE": config.GENERATOR_BACKBONE,
             "ADAPTIVE_TIMESTEP": bool(getattr(config, "ADAPTIVE_TIMESTEP", True)),
@@ -904,6 +917,7 @@ def train(
 
         start_epoch = 1
         best_psnr = -1.0
+        best_stage_score = -1e9
         resumed_stage = None
         resumed_opt_state = None
         resumed_sched_state = None
@@ -948,6 +962,7 @@ def train(
                 start_epoch = int(ckpt.get("epoch", 0)) + 1
                 last_epoch = start_epoch - 1
                 best_psnr = float(ckpt.get("best_psnr", -1.0))
+                best_stage_score = best_psnr if best_psnr > 0 else -1e9
                 resumed_stage = ckpt.get("stage")
                 resumed_opt_state = ckpt.get("optimizer_state_dict")
                 resumed_sched_state = ckpt.get("scheduler_state_dict")
@@ -1077,6 +1092,7 @@ def train(
                                 flush=True,
                             )
                     best_psnr = -1.0
+                    best_stage_score = -1e9
 
                 if is_ddp and model is not raw_model:
                     del model
@@ -1414,17 +1430,19 @@ def train(
                 if stage != "align_warmup" and (epoch % max(1, config.VAL_EPOCH_INTERVAL) == 0 or epoch == config.EPOCHS):
                     if device.type == "cuda":
                         torch.cuda.empty_cache()
-                    val_metrics = evaluate_validation(raw_model, val_loader, device, config, stage)
+                    val_metrics = evaluate_validation(raw_model, val_loader, device, config, stage, loss_fn=loss_fn)
                     epoch_summary.update(val_metrics)
                     grid_path, row_summary = save_controllable_validation_grid(
                         raw_model, val_dataset, device, config, epoch, stage, return_summary=True
                     )
                     rest_psnr = val_metrics.get("val_restore_psnr", val_metrics["val_psnr"])
                     rest_gain = val_metrics.get("val_restore_gain", 0.0)
+                    val_dists = val_metrics.get("val_dists", 0.0)
                     print(
                         f"Epoch {epoch:03d} | train_loss={epoch_summary['total']:.4f} | "
                         f"restore_psnr={rest_psnr:.2f} dB ({rest_gain:+.2f} dB) | "
-                        f"val_psnr={val_metrics['val_psnr']:.2f} dB | val_l1={val_metrics['val_l1']:.4f} | sweep={grid_path}\n"
+                        f"val_dists={val_dists:.4f} | val_psnr={val_metrics['val_psnr']:.2f} dB | "
+                        f"val_l1={val_metrics['val_l1']:.4f} | sweep={grid_path}\n"
                         f"  ↳ {row_summary}",
                         flush=True,
                     )
@@ -1432,12 +1450,18 @@ def train(
                         grid_path,
                         caption=(
                             f"Epoch {epoch:03d}/{config.EPOCHS} [{stage}] | "
-                            f"restore_psnr={rest_psnr:.2f} dB ({rest_gain:+.2f} dB) | {row_summary}"
+                            f"restore_psnr={rest_psnr:.2f} dB ({rest_gain:+.2f} dB) | "
+                            f"dists={val_dists:.4f} | {row_summary}"
                         ),
                         config=config,
                     )
 
-                    if rest_psnr > best_psnr:
+                    # In `pixel_stage`, select `model_best.pt` by pure PSNR (`model_best_pixel.pt` backs it up).
+                    # In `semantic_stage`, select by Perceptual-Structural Quality (`rest_psnr - 12 * val_dists`)
+                    # so crisp micro-texture isn't discarded due to the perception-distortion PSNR dip!
+                    cur_score = (rest_psnr - 12.0 * val_dists) if stage == "semantic_stage" else rest_psnr
+                    if cur_score > best_stage_score:
+                        best_stage_score = cur_score
                         best_psnr = rest_psnr
                         save_checkpoint(raw_model, optimizer, scheduler, epoch, stage, best_psnr, config, "model_best.pt")
 
@@ -1526,7 +1550,12 @@ def main():
         choices=["sd-2.1-base", "sd-turbo", "sd-1.5", "bk-sdm-small", "tiny-sd", "bk-sdm-tiny", "mock_tiny"],
         default=None,
     )
-    parser.add_argument("--vision-encoder", type=str, choices=["c_radio", "dinov3_siglip2", "mock_tiny"], default=None)
+    parser.add_argument(
+        "--vision-encoder",
+        type=str,
+        choices=["convnextv2_dinov2", "dinov3_siglip2", "c_radio", "mock_tiny"],
+        default=None,
+    )
     parser.add_argument("--radio-id", type=str, default=None, help="Override HF repo ID for C-RADIO (e.g. nvidia/C-RADIOv3-B)")
     parser.add_argument("--training-mode", type=str, choices=["staged", "joint"], default=None)
     parser.add_argument("--batch-size", type=int, default=None)
@@ -1605,6 +1634,7 @@ def main():
         config.MAX_ALIGN_STEPS = 200
         config.MAX_STEPS_PER_EPOCH = 350
         config.MIN_STEPS_PER_EPOCH = 350
+        config.CURRICULUM_WARMUP_EPOCHS = 1
         config.LEARNING_RATE = 1.35e-4
         config.VAL_IMAGES_COUNT = 40
         config.LOG_INTERVAL = 40

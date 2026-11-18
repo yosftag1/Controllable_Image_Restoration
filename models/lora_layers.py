@@ -537,7 +537,8 @@ class _ExpertLoRABranch(nn.Module):
 
         is_spatial_conv = is_conv and (ks_tuple != (1, 1))
         self.conv_mode = conv_mode if is_spatial_conv else "pointwise"
-        self.scaling = 1.0 / float(max(1, rank))
+        # rsLoRA scaling normalized to r_ref=24 so higher-rank motion/focus experts (r=32) gain stronger authority!
+        self.scaling = 1.0 / math.sqrt(float(max(1, rank)) * 24.0)
 
         # Match `base_conv` geometry whenever stride != 1 or asymmetric padding is used
         # (e.g. diffusers AutoencoderKL Downsample2D pads 64->65 then runs k=3, s=2, p=0 -> 32x32!)
@@ -556,7 +557,7 @@ class _ExpertLoRABranch(nn.Module):
             self.down = nn.Linear(in_dim, rank, bias=False, device=device, dtype=torch.float32)
             self.up = nn.Linear(rank, out_dim, bias=False, device=device, dtype=torch.float32)
         elif self.conv_mode == "strip_1x7_7x1":
-            # Oriented horizontal + vertical strip depthwise bottleneck for wide camera-shake streaks!
+            # Full-2D separable 7x7 outer-product (`dw_v * dw_h`) + dense 5x5 curved/diagonal kernel + axial strips!
             self.down = nn.Conv2d(
                 in_dim,
                 rank,
@@ -575,14 +576,14 @@ class _ExpertLoRABranch(nn.Module):
                 rank, rank, kernel_size=(7, 1), padding=(3, 0), groups=rank, bias=False, device=device, dtype=torch.float32
             )
             self.dw_local = nn.Conv2d(
-                rank, rank, kernel_size=3, padding=1, groups=rank, bias=False, device=device, dtype=torch.float32
+                rank, rank, kernel_size=5, padding=2, groups=rank, bias=False, device=device, dtype=torch.float32
             )
             self.up = nn.Conv2d(
                 rank, out_dim, kernel_size=1, stride=1, padding=0, bias=False, device=device, dtype=torch.float32
             )
             for dw in (self.dw_h, self.dw_v, self.dw_local):
                 nn.init.kaiming_uniform_(dw.weight, a=math.sqrt(5))
-                dw.weight.data.mul_(0.35)
+                dw.weight.data.mul_(0.45)
             eye7 = torch.zeros((rank, 1, 7, 7), device=device, dtype=torch.float32)
             eye7[:, :, 3, 3] = 1.0
             self.register_buffer("_eye_kernel", eye7, persistent=False)
@@ -610,7 +611,7 @@ class _ExpertLoRABranch(nn.Module):
             )
             for dw in (self.dw_3, self.dw_5):
                 nn.init.kaiming_uniform_(dw.weight, a=math.sqrt(5))
-                dw.weight.data.mul_(0.35)
+                dw.weight.data.mul_(0.45)
             eye5 = torch.zeros((rank, 1, 5, 5), device=device, dtype=torch.float32)
             eye5[:, :, 2, 2] = 1.0
             self.register_buffer("_eye_kernel", eye5, persistent=False)
@@ -634,19 +635,22 @@ class _ExpertLoRABranch(nn.Module):
 
         nn.init.kaiming_uniform_(self.down.weight, a=math.sqrt(5))
         nn.init.zeros_(self.up.weight)
-        nn.init.zeros_(self.gate_proj.weight)
+        # Small non-zero init on `gate_proj` avoids a double-zero saddle point (`up=0` still keeps exact 0 at step 0!)
+        nn.init.normal_(self.gate_proj.weight, mean=0.0, std=0.02)
         nn.init.zeros_(self.gate_proj.bias)
 
     def forward(self, x: torch.Tensor, action_cond: Optional[torch.Tensor]) -> torch.Tensor:
         x_in = x if torch.is_autocast_enabled() else x.to(self.down.weight.dtype)
         h = self.down(x_in)
         if self.conv_mode == "strip_1x7_7x1":
-            # Exact algebraic kernel fusion: 1 single FP16/FP32 7x7 depthwise conv instead of 3 separate convs!
+            # Full 2D 7x7 outer-product (`dw_v * dw_h` covers ALL 49 diagonal & off-axis pixels!)
+            # + dense 5x5 curved trajectory kernel + axial strips — fused into 1 fast depthwise conv!
             k7 = (
                 self._eye_kernel
+                + (self.dw_v.weight * self.dw_h.weight)
                 + F.pad(self.dw_h.weight, (0, 0, 3, 3))
                 + F.pad(self.dw_v.weight, (3, 3, 0, 0))
-                + F.pad(self.dw_local.weight, (2, 2, 2, 2))
+                + F.pad(self.dw_local.weight, (1, 1, 1, 1))
             )
             h = F.conv2d(h, k7.to(h.dtype), padding=3, groups=self.rank)
         elif self.conv_mode == "multiscale_5x5":
@@ -742,9 +746,9 @@ class ActionDualLoRALinear(nn.Module):
             action_cond = action_cond.to(x.device)
 
         delta = None
+        max_route = None
         if abs(lam_pix) >= 1e-6:
             pix_sum = None
-            max_route = None
             for ename, expert in self.pix_experts.items():
                 route_w = _compute_linear_expert_route(
                     spatial_map, self.expert_indices[ename], tuple(x.shape), x.device
@@ -763,7 +767,16 @@ class ActionDualLoRALinear(nn.Module):
                 delta = delta.float() + dora_term
 
         if abs(lam_sem) >= 1e-6:
-            sem_d = (lam_sem * self.sem_alpha_scale) * self.sem_branch(x, action_cond)
+            if max_route is None:
+                for ename in self.pix_experts:
+                    rw = _compute_linear_expert_route(
+                        spatial_map, self.expert_indices[ename], tuple(x.shape), x.device
+                    )
+                    max_route = rw if max_route is None else torch.maximum(max_route, rw)
+            sem_raw = self.sem_branch(x, action_cond)
+            if max_route is not None:
+                sem_raw = sem_raw * max_route.to(sem_raw.dtype)
+            sem_d = (lam_sem * self.sem_alpha_scale) * sem_raw
             delta = sem_d if delta is None else (delta + sem_d)
 
         return out if delta is None else (out + delta.to(out.dtype))
@@ -866,6 +879,7 @@ class ActionDualLoRAConv2d(nn.Module):
         bsz = out.shape[0]
 
         delta = None
+        max_route_2d = None
         if abs(lam_pix) >= 1e-6:
             pix_sum = None
             for ename, expert in self.pix_experts.items():
@@ -877,12 +891,21 @@ class ActionDualLoRAConv2d(nn.Module):
                     exp_out = F.interpolate(exp_out, size=target_hw, mode="bilinear", align_corners=False)
                 term = exp_out * route_2d.to(exp_out.dtype)
                 pix_sum = term if pix_sum is None else (pix_sum + term)
+                max_route_2d = route_2d if max_route_2d is None else torch.maximum(max_route_2d, route_2d)
             delta = (lam_pix * self.alpha_scale) * pix_sum
 
         if abs(lam_sem) >= 1e-6:
+            if max_route_2d is None:
+                for ename in self.pix_experts:
+                    r2 = _compute_conv_expert_route(
+                        spatial_map, self.expert_indices[ename], target_hw, bsz, out.device
+                    )
+                    max_route_2d = r2 if max_route_2d is None else torch.maximum(max_route_2d, r2)
             sem_out = self.sem_branch(x, action_cond)
             if sem_out.shape[-2:] != target_hw:
                 sem_out = F.interpolate(sem_out, size=target_hw, mode="bilinear", align_corners=False)
+            if max_route_2d is not None:
+                sem_out = sem_out * max_route_2d.to(sem_out.dtype)
             sem_d = (lam_sem * self.sem_alpha_scale) * sem_out
             delta = sem_d if delta is None else (delta + sem_d)
 
@@ -912,8 +935,11 @@ def inject_vision_lora(
         "query",
         "key",
         "value",
+        "dense",
         "fc1",
         "fc2",
+        "pwconv1",
+        "pwconv2",
     ),
 ) -> List[nn.Parameter]:
     """Freeze `model` and replace matching nn.Linear layers with SwitchableLoRALinear."""

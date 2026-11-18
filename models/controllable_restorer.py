@@ -809,11 +809,15 @@ class ControllableRestorer(nn.Module):
 
         for idx in range(len(self.unet.down_blocks)):
             out_ch = probed_channels[f"down_{idx}"]
+            # Inject 32x32 ConvNeXt-V2 + DINOv2-Reg pyramid right at `down_blocks[0]` (full latent resolution!)
+            use_down_sem = sem_dim if idx == 0 else None
             wrapped_down = _SpatialModulatedUNetStage(
-                self.unet.down_blocks[idx], out_ch, num_actions, mod_hidden, sem_dim=None
+                self.unet.down_blocks[idx], out_ch, num_actions, mod_hidden, sem_dim=use_down_sem
             ).to(device=unet_dev)
             self.unet.down_blocks[idx] = wrapped_down
             self.spatial_mod_params.extend(list(wrapped_down.spatial_mod.parameters()))
+            if wrapped_down.sem_grid_proj is not None:
+                self.spatial_mod_params.extend(list(wrapped_down.sem_grid_proj.parameters()))
 
         mid_ch = probed_channels["mid"]
         wrapped_mid = _SpatialModulatedUNetStage(
@@ -824,10 +828,11 @@ class ControllableRestorer(nn.Module):
         self.spatial_mod_params.extend(list(wrapped_mid.sem_grid_proj.parameters()))
 
         num_up = len(self.unet.up_blocks)
-        sem_up_idx = min(1, num_up - 1)
+        # Inject semantic/edge pyramid at BOTH mid-resolution (`up_blocks[1]`) AND final 32x32 (`up_blocks[-1]`)!
+        sem_up_indices = {min(1, num_up - 1), num_up - 1}
         for idx in range(num_up):
             out_ch = probed_channels[f"up_{idx}"]
-            use_sem = sem_dim if idx == sem_up_idx else None
+            use_sem = sem_dim if idx in sem_up_indices else None
             wrapped_up = _SpatialModulatedUNetStage(
                 self.unet.up_blocks[idx], out_ch, num_actions, mod_hidden, sem_dim=use_sem
             ).to(device=unet_dev)
@@ -1080,11 +1085,12 @@ class ControllableRestorer(nn.Module):
             eps_stu_neg = _to_eps(raw_neg, z_t_stu)
             eps_gt_pos = _to_eps(raw_gt, z_t_gt)
 
-            cfg_scale = float(getattr(self.config, "CSD_CFG_SCALE", 4.5))
+            cfg_scale = float(getattr(self.config, "CSD_CFG_SCALE", 5.5))
+            step_mag = float(getattr(self.config, "CSD_STEP_SCALE", 0.35))
             # TSD target anchor `(eps_stu_pos - eps_gt_pos)` + PiSA-SR negative-prompt suppression `(pos - neg)`
-            score_dir = (eps_stu_pos - eps_gt_pos) + 0.30 * cfg_scale * (eps_stu_pos - eps_stu_neg)
+            score_dir = (eps_stu_pos - eps_gt_pos) + 0.35 * cfg_scale * (eps_stu_pos - eps_stu_neg)
             norm_scale = score_dir.std(dim=(1, 2, 3), keepdim=True, unbiased=False).clamp(min=1e-4)
-            step_delta = (score_dir / norm_scale) * 0.08
+            step_delta = (score_dir / norm_scale) * step_mag
             target_csd = (z_stu_det - step_delta).detach()
 
             if self.struct_action_indices.numel() > 0:
@@ -1094,7 +1100,7 @@ class ControllableRestorer(nn.Module):
                 act_gate = action_map.float().abs().amax(dim=(1, 2, 3)).clamp(0.0, 1.0)
             act_gate = act_gate.view(-1, 1, 1, 1)
 
-        return 0.5 * (((hat_z_0.float() - target_csd) ** 2) * act_gate).mean()
+        return (((hat_z_0.float() - target_csd) ** 2) * act_gate).mean()
 
     def _apply_zero_action_lock(
         self, src_01: torch.Tensor, pred_01: torch.Tensor, action_map: torch.Tensor

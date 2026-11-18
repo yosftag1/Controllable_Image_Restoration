@@ -10,13 +10,19 @@ class Config:
     # -------------------------------------------------------------------------
     # 1. Pretrained Semantic Vision Encoder ("The Eyes" + Self-Teacher LoRA)
     # -------------------------------------------------------------------------
-    SEMANTIC_ENCODER_TYPE = "c_radio"
+    # Default switched from `c_radio` (coarse 16x16 single-grid remote code) to `convnextv2_dinov2`:
+    # - `ConvNeXt-V2` (4x/8x/16x 7x7 depthwise conv pyramid) preserves sub-patch blur trajectories & fur edges!
+    # - `DINOv2-with-Registers` (clean register-filtered ViT) supplies artifact-free semantics & 1-click masks!
+    SEMANTIC_ENCODER_TYPE = "convnextv2_dinov2"
 
+    CONVNEXTV2_MODEL_ID = "facebook/convnextv2-base-22k-224"
+    CONVNEXTV2_FALLBACK_ID = "facebook/convnextv2-tiny-22k-224"
+    DINOV2_REG_MODEL_ID = "facebook/dinov2-with-registers-base"
+    DINOV2_FALLBACK_MODEL_ID = "facebook/dinov2-with-registers-small"
+    DINOV3_MODEL_ID = "facebook/dinov3-vits16-pretrain-lvd1689m"
+    SIGLIP2_MODEL_ID = "google/siglip2-base-patch16-256"
     RADIO_MODEL_ID = "nvidia/C-RADIOv3-B"
     RADIO_ALT_MODEL_ID = "nvidia/C-RADIOv2-B"
-    DINOV3_MODEL_ID = "facebook/dinov3-vits16-pretrain-lvd1689m"
-    DINOV2_FALLBACK_MODEL_ID = "facebook/dinov2-with-registers-small"
-    SIGLIP2_MODEL_ID = "google/siglip2-base-patch16-224"
 
     VISION_LORA_RANK = 8
     VISION_LORA_ALPHA = 16.0
@@ -106,21 +112,22 @@ class Config:
     )
     PROMPT_SEQ_LEN = 77
 
-    # Single user-facing Generative Detail dial (`detail_scale` in [0, 1]; conservative natural default)
+    # Single user-facing Generative Detail dial (`detail_scale` in [0, 1])
     DEFAULT_FIDELITY_SCALE = 1.0
-    DEFAULT_DETAIL_SCALE = 0.35
+    DEFAULT_DETAIL_SCALE = 0.75
 
     # Slider-Driven Adaptive Timestep Schedule (`FideDiff` principle without a blind estimator!):
     # Maps active structural slider strength smoothly into [RESTORATION_MIN_TIMESTEP, RESTORATION_MAX_TIMESTEP].
     DEFAULT_INFERENCE_STEPS = 1
     ADAPTIVE_TIMESTEP = True
-    RESTORATION_MIN_TIMESTEP = 49
-    RESTORATION_MAX_TIMESTEP = 279
+    RESTORATION_MIN_TIMESTEP = 79
+    RESTORATION_MAX_TIMESTEP = 339
     INFERENCE_TILE_SIZE = 512
     INFERENCE_TILE_OVERLAP = 96
     MULTI_STEP_TRAIN_PROB = 0.0
     INITIAL_VELOCITY_SCALE = 1.0
-    SKIP_DROPOUT_PROB = 0.0
+    # Drop encoder skips on 20% of training steps so UNet `hat_z_0` MUST carry full sharp deblurring on its own!
+    SKIP_DROPOUT_PROB = 0.20
 
     # -------------------------------------------------------------------------
     # Separate Experimental HYPIR Mode (Disabled by default; opt-in via --hypir-mode)
@@ -177,13 +184,13 @@ class Config:
     # Action sampling distribution (must sum to 1.0):
     ACTION_DIST_SELECTIVE = 0.22
     ACTION_DIST_PARTIAL = 0.14
-    ACTION_DIST_FULL = 0.42
-    ACTION_DIST_FALSE_POS = 0.16   # Strong no-op & clean-bokeh safety when blur/sharpen sliders are high
+    ACTION_DIST_FULL = 0.50
+    ACTION_DIST_FALSE_POS = 0.08   # Clean-photo safety without drowning out active motion deblurring!
     ACTION_DIST_IDENTITY = 0.06
 
     # Physical camera & compression parameter ranges
     GAUSSIAN_NOISE_STD_RANGE = (8.0, 48.0)
-    MOTION_BLUR_KERNEL_RANGE = (5, 25)
+    MOTION_BLUR_KERNEL_RANGE = (6, 27)
     MOTION_BLUR_ANGLE_RANGE = (0.0, 180.0)
     MOTION_CURVE_MAX_BEND = 0.38
     DEFOCUS_SIGMA_RANGE = (0.8, 4.4)
@@ -208,7 +215,9 @@ class Config:
     # Wrapped via Compositional Real-Pair Wrapper so all 6 selective sliders train on REAL camera blur!
     PAIRED_MOTION_DATASET_PATH = None
     PAIRED_DEFOCUS_DATASET_PATH = None
-    PAIRED_REAL_PROB = 0.35
+    PAIRED_REAL_PROB = 0.42
+    # Also reuse verified clean `sharp`/`gt` images from paired datasets inside the main multi-task clean pool!
+    REUSE_PAIRED_CLEAN_FOR_SYNTH = True
 
     TRAIN_IMAGES_COUNT = 0
     VAL_IMAGES_COUNT = 0
@@ -249,28 +258,30 @@ class Config:
     CHECKPOINT_EVERY_N_EPOCHS = 4
 
     # V5 Artifact-Free Latent + Universal eVAE + Laplacian Pyramid + Target-Anchored CSD Weights:
-    LOSS_LATENT_WEIGHT = 0.85             # Direct clean-latent target supervision (hat_z_0 vs frozen_vae(tgt))
+    LOSS_LATENT_WEIGHT = 0.85             # Direct clean-latent target supervision in Stage 2
+    LOSS_SEMANTIC_STAGE_LATENT_LP_WEIGHT = 0.30  # Low-pass 2x latent structural anchor in Stage 3 (frees micro-texture!)
     LOSS_EVAE_SKIP_WEIGHT = 0.35          # Universal OSDD-style eVAE skip feature alignment vs clean encoder!
     LOSS_L1_WEIGHT = 1.00
-    LOSS_SEMANTIC_STAGE_L1_WEIGHT = 0.85  # Strong pixel anchor in Stage 3 prevents fake texture drift
-    LOSS_PYRAMID_WEIGHT = 0.60            # 4-level anti-aliased Laplacian pyramid (local sharpness, zero FFT ringing)
-    LOSS_GRADIENT_WEIGHT = 0.35           # Multi-scale edge gradient alignment
-    LOSS_HF_GUARD_WEIGHT = 0.50           # Asymmetric hinge penalizing fake high-freq energy > ground truth
-    LOSS_FREQUENCY_WEIGHT = 0.10          # Pure complex (real, imag) phase+amp L1 ONLY
+    LOSS_SEMANTIC_STAGE_LP_L1_WEIGHT = 0.75  # 4x Low-Pass structural L1 in Stage 3 (zero double-penalty blur on 1-3px pores!)
+    LOSS_PYRAMID_WEIGHT = 0.60            # 4-level anti-aliased Laplacian pyramid in Stage 2
+    LOSS_GRADIENT_WEIGHT = 0.35           # Multi-scale edge gradient alignment in Stage 2
+    LOSS_HF_GUARD_WEIGHT = 0.50           # Asymmetric hinge penalizing fake high-freq energy >> ground truth
+    LOSS_FREQUENCY_WEIGHT = 0.10          # Pure complex (real, imag) phase+amp L1 in Stage 2
     LOSS_COLOR_TONE_WEIGHT = 0.65         # Multi-scale RGB + opponent chroma accuracy
     LOSS_PRESERVE_WEIGHT = 0.50           # Zero-action & zero-DC tone lock when exposure=warmth=0
     LOSS_ALIGN_WEIGHT = 0.15              # Self-Teacher vision encoder alignment
     LOSS_PIXEL_STAGE_PERCEPTUAL_WEIGHT = 0.08
-    LOSS_PERCEPTUAL_WEIGHT = 0.22
-    LOSS_CSD_WEIGHT = 0.20                # Stage-3 zero-extra-VRAM Target-Anchored CSD (`sd-2.1-base` teacher!)
-    CSD_CFG_SCALE = 4.5                   # Negative-prompt suppression strength in Target-Anchored CSD
-    CSD_TIMESTEP_RANGE = (40, 320)        # TSD-SR DASM low-to-mid noise band for texture crispness without drift
+    LOSS_PERCEPTUAL_WEIGHT = 0.65         # Full-res relu1_2..relu4_4 DISTS local texture + LPIPS in Stage 3!
+    LOSS_CSD_WEIGHT = 0.65                # Stage-3 zero-extra-VRAM Target-Anchored CSD (`sd-2.1-base` teacher!)
+    CSD_CFG_SCALE = 5.5                   # Negative-prompt suppression & sharpness guidance in Stage-3 CSD
+    CSD_STEP_SCALE = 0.35                 # Calibrated score step magnitude so CSD actively synthesizes fine detail!
+    CSD_TIMESTEP_RANGE = (50, 500)        # Full SD-2.1 micro- & meso-texture synthesis band
     LOSS_CONTRAST_WEIGHT = 0.0
     # Disabled in Stage 2 (`pixel_stage` already uses latent+eVAE+L1+pyramid+VGG; avoids a 2nd uncheckpointed C-RADIO backward!)
     LOSS_PIXEL_STAGE_SEM_WEIGHT = 0.0
-    LOSS_SEM_CONSISTENCY_WEIGHT = 0.22
+    LOSS_SEM_CONSISTENCY_WEIGHT = 0.25
     LOSS_GAN_WEIGHT = 0.0
-    PERCEPTUAL_LAYERS = ["relu2_2", "relu3_4", "relu4_4"]
+    PERCEPTUAL_LAYERS = ["relu1_2", "relu2_2", "relu3_4", "relu4_4"]
 
     USE_TQDM = False
     LOG_INTERVAL = 100

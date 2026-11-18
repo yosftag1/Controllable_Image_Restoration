@@ -290,9 +290,9 @@ def build_gradio_app(
     except TypeError:
         pass
 
-    with gr.Blocks(title="Controllable Image Restoration Studio (V4)") as demo:
+    with gr.Blocks(title="Controllable Image Restoration Studio (V5)") as demo:
         gr.Markdown(
-            "## Controllable Pretrained Image Restoration Studio (V4)\n"
+            "## Controllable Pretrained Image Restoration Studio (V5)\n"
             "Fix specific degradations with **4 orthogonal `[0, 1]` restoration sliders**, adjust mood & lighting with "
             "**2 directional `[-1, +1]` Exposure & Warmth sliders**, dial **Generative Texture Detail**, "
             "or **click any object** for localized restoration."

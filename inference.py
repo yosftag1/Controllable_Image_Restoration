@@ -312,6 +312,13 @@ def main():
         default=None,
         help="Optional generator backbone override when running without a checkpoint",
     )
+    parser.add_argument(
+        "--vision-encoder",
+        type=str,
+        choices=["convnextv2_dinov2", "dinov3_siglip2", "c_radio", "mock_tiny"],
+        default=None,
+        help="Optional vision semantic encoder override when running without a checkpoint",
+    )
     parser.add_argument("--image", type=str, required=True, help="Path to input image")
     parser.add_argument("--output-dir", type=str, default="./restored", help="Directory to save restored result")
     parser.add_argument(
@@ -355,6 +362,8 @@ def main():
     cfg = Config()
     if args.backbone:
         cfg.GENERATOR_BACKBONE = args.backbone
+    if args.vision_encoder:
+        cfg.SEMANTIC_ENCODER_TYPE = args.vision_encoder
     if args.mock:
         cfg.GENERATOR_BACKBONE = "mock_tiny"
         cfg.SEMANTIC_ENCODER_TYPE = "mock_tiny"
