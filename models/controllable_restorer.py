@@ -1,26 +1,23 @@
-"""End-to-End Controllable Pretrained Restoration Model (V4 Orthogonal + Directional).
+"""End-to-End Controllable Pretrained Restoration Model (V5 Universal Slider-Routed Experts).
 
-Key V4 Upgrades:
-1. Calibrated Pre-Scaled Latent Step at SD-Turbo Native ADD `t=249`:
-   Feeds `z_in = sqrt_alpha_bar * z_src` (exact SD-Turbo signal amplitude) and computes
-   `hat_z_0 = z_src - sigma_t * eps_pred`, eliminating the 1.90x unscaled latent blowup!
-2. Full Encoder-to-Decoder Spatial Action & Dense 2D `C-RADIO` Grid Conditioning:
-   - `_ActionConditionedConvIn` injects `action_map` directly at layer 0 of the UNet.
-   - `_SpatialModulatedUNetStage` modulates all `down_blocks`, `mid_block`, and `up_blocks`
-     and injects spatially aligned 2D `C-RADIO` dense feature grids into bottleneck/H/16 blocks.
-3. Native `H x W` Pixel-Space Radiometric & Edge Refiner (`PixelSpaceRefiner`):
-   - `1x1` Rational-Basis Tone/Warmth Head hits 40+ dB on directional `exposure` & `warmth`
-     without `8x` VAE bottleneck loss.
-   - Action-modulated `3x3` depthwise-separable residual blocks recover crisp 1-pixel edge
-     phase on motion blur & focus sharpening while preserving untouched fine detail.
-4. Signed-Safe Zero-Action Lock (`max(|a_k|) == 0`) & Smart Structural Detail Gating.
+Key V5 Architectural Upgrades:
+1. Default `sd-2.1-base` Backbone + Zero-Extra-VRAM Target-Anchored CSD (`PiSA-SR` + `TSD-SR`):
+   Eliminates `sd-turbo`'s baked-in ADD oversharpening bias and uses the frozen base UNet itself
+   (`LoRA OFF`, 0 MB extra model weights) with negative prompts in Stage 3 to suppress fake ripples.
+2. Expandable Slider-Routed UIR-LoRA Task Experts + Strip/Multi-Scale Conv-LoRA + DoRA:
+   Routes `denoise`/`deartifact`, `deblur_motion` (`1x7+7x1` strips), and `sharpen_focus` (`5x5` discs)
+   to dedicated named experts driven 100% by the user's sliders (`zero blind estimator`, ready for
+   future knobs like lens distortion or flare).
+3. Universal `OSDD`-style `eVAE` Spatial Skip Alignment + Frozen Natural-Manifold VAE Decoder +
+   Strictly `1x1` `PointwiseRadiometricHead` + Slider-Driven Adaptive Timestep (`FideDiff`).
+4. Isolated Experimental `HYPIR` Mode (`--hypir-mode` / `HYPIRConfig`) kept separate for clean testing.
 """
 
 from contextlib import contextmanager
 import gc
 import math
 import os
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -36,6 +33,7 @@ from .lora_layers import (
     infer_module_device,
     infer_module_dtype,
     inject_generator_dual_lora,
+    resolve_expert_specs,
     set_generator_lora_state,
 )
 from .semantic_encoder import SemanticEncoder, load_hf_public_safe
@@ -147,7 +145,6 @@ def _build_default_alphas_cumprod(
     beta_start: float = 0.00085,
     beta_end: float = 0.012,
 ) -> torch.Tensor:
-    """Exact SD 1.5 / SD 2.1 / sd-turbo `scaled_linear` cumulative alpha schedule."""
     betas = torch.linspace(
         math.sqrt(beta_start), math.sqrt(beta_end), num_train_timesteps, dtype=torch.float64
     ) ** 2
@@ -155,13 +152,14 @@ def _build_default_alphas_cumprod(
     return torch.cumprod(alphas, dim=0).float()
 
 
-def _precompute_openclip_prompt_embeds(
+def _precompute_openclip_prompt_pair(
     repo_id: str,
-    prompt: str,
+    pos_prompt: str,
+    neg_prompt: str,
     cross_attn_dim: int,
     prompt_seq_len: int = 77,
-) -> torch.Tensor:
-    """Precompute native CLIP/OpenCLIP prompt tokens once on CPU (0 MB runtime text-encoder GPU VRAM)."""
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Precompute positive & negative CLIP text embeddings on CPU (0 MB text-encoder GPU VRAM!)."""
     is_rank0 = os.environ.get("RANK", "0") == "0"
     try:
         from transformers import AutoTokenizer, CLIPTextModel
@@ -174,7 +172,7 @@ def _precompute_openclip_prompt_embeds(
             max_len = prompt_seq_len
         with torch.no_grad():
             text_inputs = tokenizer(
-                [prompt],
+                [pos_prompt, neg_prompt],
                 padding="max_length",
                 max_length=max_len,
                 truncation=True,
@@ -186,21 +184,23 @@ def _precompute_openclip_prompt_embeds(
             ).detach().clone().float().cpu()
         del text_encoder, tokenizer, out, text_inputs
         gc.collect()
-        if embeds.ndim == 3 and embeds.shape[-1] == cross_attn_dim:
+        if embeds.ndim == 3 and embeds.shape[0] == 2 and embeds.shape[-1] == cross_attn_dim:
             if is_rank0:
                 print(
-                    f"[PromptAnchor] Precomputed native CLIP prompt {tuple(embeds.shape)} on CPU (0 MB text-encoder VRAM)",
+                    f"[PromptAnchor] Precomputed pos/neg CLIP prompts {tuple(embeds[0:1].shape)} on CPU "
+                    f"(0 MB text-encoder VRAM)",
                     flush=True,
                 )
-            return embeds
+            return embeds[0:1].contiguous(), embeds[1:2].contiguous()
     except Exception as exc:
         if is_rank0:
-            print(f"[PromptAnchor] Fallback zero prompt anchor ({exc})", flush=True)
-    return torch.zeros(1, prompt_seq_len, cross_attn_dim, dtype=torch.float32)
+            print(f"[PromptAnchor] Fallback zero prompt anchors ({exc})", flush=True)
+    zeros = torch.zeros(1, prompt_seq_len, cross_attn_dim, dtype=torch.float32)
+    return zeros, zeros.clone()
 
 
 class _ActionConditionedConvIn(nn.Module):
-    """Injects 1x1 spatial `action_map` directly into UNet `conv_in` so encoder blocks know what/where to restore."""
+    """Injects 1x1 spatial `action_map` directly into UNet `conv_in`."""
 
     def __init__(self, orig_conv_in: nn.Module, num_actions: int, out_channels: int, hidden_dim: int = 64):
         super().__init__()
@@ -286,7 +286,7 @@ class _ActionModulatedTimeEmbedding(nn.Module):
 
     def forward(self, *args, **kwargs):
         temb = self.orig_time_emb(*args, **kwargs)
-        action_cond, lambda_pix, lambda_sem = _get_generator_lora_state(temb.device)
+        action_cond, lambda_pix, lambda_sem, _spatial = _get_generator_lora_state(temb.device)
         if action_cond is None:
             return temb
 
@@ -305,7 +305,7 @@ class _ActionModulatedTimeEmbedding(nn.Module):
 
 
 class _SpatialModulatedUNetStage(nn.Module):
-    """Wraps a UNet block with 1x1 Spatial Action Modulation + optional spatially aligned 2D C-RADIO grid injection."""
+    """Wraps a UNet block with 1x1 Spatial Action Modulation + optional 2D C-RADIO grid injection."""
 
     def __init__(
         self,
@@ -375,88 +375,29 @@ class _SpatialModulatedUNetStage(nn.Module):
         return (mod_sample,) + out[1:] if isinstance(out, tuple) else mod_sample
 
 
-class _SepDilatedResBlock(nn.Module):
-    """Lightweight depthwise-separable + action-modulated pixel refinement block."""
+class PointwiseRadiometricHead(nn.Module):
+    """Strictly `1x1` (zero spatial receptive field!) Rational-Curve Tone & Warmth Adapter."""
 
-    def __init__(self, channels: int, num_actions: int, dilation: int = 1):
+    def __init__(self, num_actions: int, struct_indices: Sequence[int], hidden_dim: int = 32):
         super().__init__()
-        self.dw = nn.Conv2d(
-            channels, channels, kernel_size=3, padding=dilation, dilation=dilation, groups=channels
-        )
-        self.pw1 = nn.Conv2d(channels, channels, kernel_size=1)
-        self.pw2 = nn.Conv2d(channels, channels, kernel_size=1)
-        nn.init.zeros_(self.pw2.weight)
-        nn.init.zeros_(self.pw2.bias)
-        self.mod = PointwiseSpatialModulator(num_actions=num_actions, channels=channels, hidden_dim=32)
-
-    def forward(self, x: torch.Tensor, action_map: torch.Tensor) -> torch.Tensor:
-        h = F.silu(self.pw1(F.silu(self.dw(x))))
-        h = self.pw2(h)
-        return self.mod(x + h, action_map)
-
-
-class PixelSpaceRefiner(nn.Module):
-    """Native HxW Radiometric Curve + High-Frequency Edge Refiner bridging the 8x VAE bottleneck.
-
-    1. `tone_head` (strictly 1x1 conv with `x * (1 - x)` rational curve basis): delivers crisp,
-       halo-free directional `exposure` and `warmth` accuracy (>40 dB) at native pixel resolution.
-    2. `edge_stem` + `edge_blocks` + `pix_out`: recovers sub-pixel edge phase for motion/defocus
-       deblurring and preserves untouched pixel details across selective edits.
-    3. `sem_branch`: lightweight Stage-3 pixel micro-detail enhancer scaled by `detail_scale`.
-    """
-
-    def __init__(self, num_actions: int, base_ch: int = 40):
-        super().__init__()
-        # 1x1 Rational-Basis Tone & White-Balance Curve Head (src + vae + src*(1-src) + vae*(1-vae) + actions)
-        tone_in = 3 * 4 + num_actions
-        tone_out = nn.Conv2d(32, 3, kernel_size=1)
+        self.register_buffer("struct_indices", torch.tensor(list(struct_indices), dtype=torch.long), persistent=False)
+        tone_in = 9 + num_actions
+        tone_out = nn.Conv2d(hidden_dim, 3, kernel_size=1)
         nn.init.zeros_(tone_out.weight)
         nn.init.zeros_(tone_out.bias)
         self.tone_head = nn.Sequential(
-            nn.Conv2d(tone_in, 32, kernel_size=1),
+            nn.Conv2d(tone_in, hidden_dim, kernel_size=1),
             nn.SiLU(),
-            nn.Conv2d(32, 32, kernel_size=1),
+            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=1),
             nn.SiLU(),
             tone_out,
         )
 
-        # HxW Spatial Edge & Deconvolution Residual Branch
-        edge_in = 3 * 3 + num_actions  # [src, vae_toned, vae_toned - src, action_map]
-        self.edge_stem = nn.Sequential(
-            nn.Conv2d(edge_in, base_ch, kernel_size=3, padding=1),
-            nn.SiLU(),
-        )
-        self.edge_b1 = _SepDilatedResBlock(base_ch, num_actions, dilation=1)
-        self.edge_b2 = _SepDilatedResBlock(base_ch, num_actions, dilation=2)
-        self.pix_out = nn.Conv2d(base_ch, 3, kernel_size=3, padding=1)
-        nn.init.zeros_(self.pix_out.weight)
-        nn.init.zeros_(self.pix_out.bias)
-
-        # Stage-3 Semantic Micro-Texture Residual Branch (active only when detail_scale != 0)
-        sem_ch = max(16, base_ch // 2)
-        sem_out = nn.Conv2d(sem_ch, 3, kernel_size=1)
-        nn.init.zeros_(sem_out.weight)
-        nn.init.zeros_(sem_out.bias)
-        self.sem_branch = nn.Sequential(
-            nn.Conv2d(edge_in, sem_ch, kernel_size=3, padding=1),
-            nn.SiLU(),
-            nn.Conv2d(sem_ch, sem_ch, kernel_size=3, padding=1, groups=sem_ch),
-            nn.Conv2d(sem_ch, sem_ch, kernel_size=1),
-            nn.SiLU(),
-            sem_out,
-        )
-
     def pixel_stage_parameters(self) -> List[nn.Parameter]:
-        return (
-            list(self.tone_head.parameters())
-            + list(self.edge_stem.parameters())
-            + list(self.edge_b1.parameters())
-            + list(self.edge_b2.parameters())
-            + list(self.pix_out.parameters())
-        )
+        return list(self.tone_head.parameters())
 
     def semantic_stage_parameters(self) -> List[nn.Parameter]:
-        return list(self.sem_branch.parameters())
+        return []
 
     def forward(
         self,
@@ -466,31 +407,29 @@ class PixelSpaceRefiner(nn.Module):
         fidelity_scale: float = 1.0,
         detail_scale: float = 0.0,
     ) -> torch.Tensor:
+        del detail_scale
         s_f = src_01.float()
         v_f = vae_rgb_01.float()
         a_f = action_map.float()
         if a_f.shape[-2:] != v_f.shape[-2:]:
             a_f = F.interpolate(a_f, size=v_f.shape[-2:], mode="bilinear", align_corners=False)
 
-        out = v_f
-        if abs(fidelity_scale) >= 1e-6:
-            s_quad = s_f * (1.0 - s_f)
-            v_quad = v_f * (1.0 - v_f)
-            tone_delta = self.tone_head(torch.cat([s_f, v_f, s_quad, v_quad, a_f], dim=1))
-            v_toned = (v_f + float(fidelity_scale) * tone_delta).clamp(0.0, 1.0)
-
-            edge_in = torch.cat([s_f, v_toned, v_toned - s_f, a_f], dim=1)
-            h = self.edge_stem(edge_in)
-            h = self.edge_b1(h, a_f)
-            h = self.edge_b2(h, a_f)
-            edge_delta = self.pix_out(h)
-            out = (v_toned + float(fidelity_scale) * edge_delta).clamp(0.0, 1.0)
+        if self.struct_indices.numel() > 0:
+            s_idx = self.struct_indices.to(a_f.device)
+            struct_act = a_f.index_select(1, s_idx).abs().amax(dim=1, keepdim=True)
         else:
-            edge_in = torch.cat([s_f, out, out - s_f, a_f], dim=1)
+            struct_act = a_f.abs().amax(dim=1, keepdim=True)
 
-        if abs(detail_scale) >= 1e-6:
-            sem_delta = self.sem_branch(edge_in)
-            out = (out + float(detail_scale) * sem_delta).clamp(0.0, 1.0)
+        struct_blend = (struct_act / 0.08).clamp(0.0, 1.0)
+        base = s_f * (1.0 - struct_blend) + v_f * struct_blend
+
+        if abs(fidelity_scale) >= 1e-6:
+            quad = base * (1.0 - base)
+            sq = base * base
+            tone_delta = self.tone_head(torch.cat([base, quad, sq, a_f], dim=1))
+            out = (base + float(fidelity_scale) * tone_delta).clamp(0.0, 1.0)
+        else:
+            out = base
 
         return out.to(vae_rgb_01.dtype)
 
@@ -605,17 +544,15 @@ class _MockTinyUNet(nn.Module):
 
 
 class ControllableRestorer(nn.Module):
-    """Action-Conditioned Pretrained Restoration Model with Dual-LoRA, Dense C-RADIO & Pixel Refiner."""
+    """V5 Universal Slider-Routed Experts + Universal eVAE + Zero-VRAM Target-Anchored CSD Restorer."""
 
     def __init__(self, config):
         super().__init__()
         self.config = config
         backbone_key = config.GENERATOR_BACKBONE.lower()
 
-        # 1. Pretrained Vision Semantic Encoder + Self-Teacher LoRA
         self.semantic_encoder = SemanticEncoder(config)
 
-        # 2. Load Pretrained AutoencoderKL, UNet2DConditionModel & native DDPM schedule
         alphas_cumprod = _build_default_alphas_cumprod()
         prediction_type = "epsilon"
         repo_id = None
@@ -640,16 +577,30 @@ class ControllableRestorer(nn.Module):
         self.prediction_type = prediction_type
         self.register_buffer("alphas_cumprod", alphas_cumprod, persistent=False)
 
-        # Indices of objective structural sliders (used at inference to mute GAN texture synthesis on pure tone edits)
         deg_names = list(getattr(config, "DEGRADATION_TYPES", []))
         signed_set = set(getattr(config, "SIGNED_ACTION_TYPES", ["exposure", "warmth"]))
         struct_idx = [i for i, n in enumerate(deg_names) if n not in signed_set]
         self.register_buffer("struct_action_indices", torch.tensor(struct_idx, dtype=torch.long), persistent=False)
 
-        # 3. Wrap VAE with Blur-Aware Action-Gated Skip Bridges + Encoder & Decoder Dual-LoRA
+        # Universal eVAE (Slider-Routed Encoder Experts + Universal Spatial Skip Alignment + Frozen Decoder)
         self.skip_vae = SkipConnectedVAE(raw_vae, config)
 
-        # 4. Inject Action-Modulated Dual-LoRA into UNet
+        hypir_scale = (
+            float(getattr(config, "HYPIR_LORA_RANK_SCALE", 2.0))
+            if bool(getattr(config, "HYPIR_MODE", False))
+            else 1.0
+        )
+        unet_expert_specs = resolve_expert_specs(
+            getattr(config, "LORA_EXPERT_SPECS", None),
+            deg_names,
+            signed_types=signed_set,
+            default_rank=int(getattr(config, "UNET_LORA_RANK", 28)),
+            rank_scale=hypir_scale,
+        )
+        sem_rank = max(6, int(getattr(config, "SEM_DETAIL_LORA_RANK", 16)))
+        sem_alpha = float(getattr(config, "SEM_DETAIL_LORA_ALPHA", float(sem_rank)))
+
+        # Expandable Slider-Routed UIR-LoRA Experts + Strip/Multi-Scale Conv-LoRA + DoRA on UNet
         self.unet = raw_unet
         self.unet_pix_lora_params, self.unet_sem_lora_params = inject_generator_dual_lora(
             self.unet,
@@ -657,6 +608,11 @@ class ControllableRestorer(nn.Module):
             rank=config.UNET_LORA_RANK,
             alpha=config.UNET_LORA_ALPHA,
             include_conv=True,
+            expert_specs=unet_expert_specs,
+            sem_rank=sem_rank,
+            sem_alpha=sem_alpha,
+            use_dora=bool(getattr(config, "USE_DORA", True)),
+            unfreeze_norms=bool(getattr(config, "UNFREEZE_UNET_NORMS", False)),
         )
 
         if getattr(config, "GRADIENT_CHECKPOINTING", True) and hasattr(self.unet, "enable_gradient_checkpointing"):
@@ -665,7 +621,6 @@ class ControllableRestorer(nn.Module):
             except TypeError:
                 self.unet.enable_gradient_checkpointing()
 
-        # 5. Wrap UNet conv_in, down_blocks, mid_block, up_blocks & temb with Spatial + Dense C-RADIO Adapters
         cross_attn_dim = getattr(self.unet.config, "cross_attention_dim", 768)
         if isinstance(cross_attn_dim, (list, tuple)):
             cross_attn_dim = int(cross_attn_dim[-1])
@@ -678,25 +633,36 @@ class ControllableRestorer(nn.Module):
                 getattr(
                     config,
                     "DEFAULT_POS_PROMPT",
-                    "a high-resolution, sharp, clean, natural photograph, detailed texture, smooth gradients, accurate colors, crisp focus",
+                    "a high-resolution, sharp, clean, natural photograph, realistic micro-texture, smooth gradients, accurate colors, crisp optical focus",
                 )
             )
-            base_prompt_embeds = _precompute_openclip_prompt_embeds(
+            neg_prompt = str(
+                getattr(
+                    config,
+                    "DEFAULT_NEG_PROMPT",
+                    "blurry, motion blur, out of focus, camera shake, noisy, jpeg artifacts, oversharpened halos, ringing, wavy fake texture, checkerboard, plastic",
+                )
+            )
+            base_prompt_embeds, neg_prompt_embeds = _precompute_openclip_prompt_pair(
                 repo_id=repo_id,
-                prompt=pos_prompt,
+                pos_prompt=pos_prompt,
+                neg_prompt=neg_prompt,
                 cross_attn_dim=cross_attn_dim,
                 prompt_seq_len=prompt_seq_len,
             )
             prompt_seq_len = int(base_prompt_embeds.shape[1])
         else:
             base_prompt_embeds = torch.zeros(1, prompt_seq_len, cross_attn_dim, dtype=torch.float32)
+            neg_prompt_embeds = torch.zeros(1, prompt_seq_len, cross_attn_dim, dtype=torch.float32)
+
+        self.register_buffer("pos_prompt_embeds", base_prompt_embeds.clone(), persistent=False)
+        self.register_buffer("neg_prompt_embeds", neg_prompt_embeds.clone(), persistent=False)
 
         self.spatial_mod_params: List[nn.Parameter] = []
         self.temb_pix_params: List[nn.Parameter] = []
         self.temb_sem_params: List[nn.Parameter] = []
         self._attach_unet_spatial_overlays(config, cross_attn_dim=cross_attn_dim, prompt_seq_len=prompt_seq_len)
 
-        # 6. Action & Semantic Token Encoder anchored on SD-Turbo's 77-token OpenCLIP prompt embedding
         self.action_overlay = ActionOverlayEncoder(
             num_actions=config.NUM_ACTIONS,
             sem_spatial_dim=self.semantic_encoder.spatial_dim,
@@ -707,17 +673,18 @@ class ControllableRestorer(nn.Module):
             base_prompt_embeds=base_prompt_embeds,
         )
 
-        # 7. Native HxW Pixel-Space Radiometric Curve & High-Frequency Edge Refiner
-        refiner_ch = int(getattr(config, "PIXEL_REFINER_CHANNELS", 40))
-        self.pixel_refiner = PixelSpaceRefiner(num_actions=config.NUM_ACTIONS, base_ch=refiner_ch)
+        tone_hidden = int(getattr(config, "TONE_HEAD_HIDDEN_DIM", 32))
+        self.pixel_refiner = PointwiseRadiometricHead(
+            num_actions=config.NUM_ACTIONS,
+            struct_indices=struct_idx,
+            hidden_dim=tone_hidden,
+        )
 
-        # 8. Calibrated Step Scale
         latent_ch = int(getattr(self.unet.config, "out_channels", 4))
         init_scale = float(getattr(config, "INITIAL_VELOCITY_SCALE", 1.0))
         self.velocity_scale = nn.Parameter(torch.full((1, latent_ch, 1, 1), init_scale))
 
     def _attach_unet_spatial_overlays(self, config, cross_attn_dim: int, prompt_seq_len: int = 77):
-        """Probe exact runtime UNet block & `temb` dimensions and wrap with spatial + semantic modulators."""
         num_actions = config.NUM_ACTIONS
         mod_hidden = getattr(config, "SPATIAL_MOD_HIDDEN_DIM", 64)
         action_dim = int(getattr(config, "ACTION_HIDDEN_DIM", 128))
@@ -754,7 +721,7 @@ class ControllableRestorer(nn.Module):
             with torch.no_grad():
                 dummy_lat = torch.zeros(1, in_ch, 32, 32, device=unet_dev, dtype=unet_dtype)
                 dummy_t = torch.tensor(
-                    [int(getattr(config, "RESTORATION_MAX_TIMESTEP", 249))], device=unet_dev, dtype=torch.long
+                    [int(getattr(config, "RESTORATION_MAX_TIMESTEP", 279))], device=unet_dev, dtype=torch.long
                 )
                 dummy_enc = torch.zeros(1, prompt_seq_len, cross_attn_dim, device=unet_dev, dtype=unet_dtype)
                 self.unet(dummy_lat, dummy_t, encoder_hidden_states=dummy_enc)
@@ -762,7 +729,6 @@ class ControllableRestorer(nn.Module):
             for handle in hooks:
                 handle.remove()
 
-        # Layer-0 spatial action stem on conv_in
         if "conv_in" in probed_channels:
             wrapped_cin = _ActionConditionedConvIn(
                 self.unet.conv_in, num_actions, probed_channels["conv_in"], hidden_dim=mod_hidden
@@ -770,7 +736,6 @@ class ControllableRestorer(nn.Module):
             self.unet.conv_in = wrapped_cin
             self.spatial_mod_params.extend(list(wrapped_cin.act_stem.parameters()))
 
-        # Slider FiLM on UNet time embedding
         if temb_attr is not None and "temb" in probed_channels:
             orig_temb = getattr(self.unet, temb_attr)
             wrapped_temb = _ActionModulatedTimeEmbedding(orig_temb, action_dim, probed_channels["temb"]).to(
@@ -780,7 +745,6 @@ class ControllableRestorer(nn.Module):
             self.temb_pix_params.extend(list(wrapped_temb.pix_mlp.parameters()))
             self.temb_sem_params.extend(list(wrapped_temb.sem_mlp.parameters()))
 
-        # Encoder-side spatial action modulation on all down_blocks
         for idx in range(len(self.unet.down_blocks)):
             out_ch = probed_channels[f"down_{idx}"]
             wrapped_down = _SpatialModulatedUNetStage(
@@ -789,7 +753,6 @@ class ControllableRestorer(nn.Module):
             self.unet.down_blocks[idx] = wrapped_down
             self.spatial_mod_params.extend(list(wrapped_down.spatial_mod.parameters()))
 
-        # Mid-block + decoder up_blocks with spatially aligned 2D C-RADIO feature grid injection!
         mid_ch = probed_channels["mid"]
         wrapped_mid = _SpatialModulatedUNetStage(
             self.unet.mid_block, mid_ch, num_actions, mod_hidden, sem_dim=sem_dim
@@ -799,7 +762,7 @@ class ControllableRestorer(nn.Module):
         self.spatial_mod_params.extend(list(wrapped_mid.sem_grid_proj.parameters()))
 
         num_up = len(self.unet.up_blocks)
-        sem_up_idx = min(1, num_up - 1)  # Inject dense 2D C-RADIO grid into mid-resolution decoder stage too
+        sem_up_idx = min(1, num_up - 1)
         for idx in range(num_up):
             out_ch = probed_channels[f"up_{idx}"]
             use_sem = sem_dim if idx == sem_up_idx else None
@@ -812,7 +775,6 @@ class ControllableRestorer(nn.Module):
                 self.spatial_mod_params.extend(list(wrapped_up.sem_grid_proj.parameters()))
 
     def get_stage_parameter_groups(self) -> Dict[str, List[nn.Parameter]]:
-        """Return cleanly separated parameter groups for 3-phase staged or joint training."""
         vision_params = list(self.semantic_encoder.vision_lora_params)
         pixel_params = (
             list(self.unet_pix_lora_params)
@@ -837,7 +799,6 @@ class ControllableRestorer(nn.Module):
         }
 
     def set_training_stage(self, stage: str):
-        """Configure parameter `requires_grad` flags for 'align_warmup', 'pixel_stage', 'semantic_stage', or 'joint'."""
         groups = self.get_stage_parameter_groups()
         for p in self.parameters():
             p.requires_grad = False
@@ -859,7 +820,6 @@ class ControllableRestorer(nn.Module):
             raise ValueError(f"Unknown training stage: {stage}")
 
     def trainable_state_dict(self) -> Dict[str, torch.Tensor]:
-        """Export only the lightweight adapter/LoRA/skip/overlay/refiner weights (~50 MB instead of ~4 GB)."""
         groups = self.get_stage_parameter_groups()
         keep_ids = {id(p) for group in groups.values() for p in group}
         out: Dict[str, torch.Tensor] = {}
@@ -869,7 +829,6 @@ class ControllableRestorer(nn.Module):
         return out
 
     def load_trainable_state_dict(self, state_dict: Dict[str, torch.Tensor], strict: bool = False):
-        """Load lightweight adapter weights directly."""
         if any(k.startswith("module.") for k in state_dict.keys()):
             state_dict = {k.replace("module.", "", 1): v for k, v in state_dict.items()}
 
@@ -913,18 +872,39 @@ class ControllableRestorer(nn.Module):
 
     @staticmethod
     def clear_runtime_contexts() -> None:
-        """Clear device-scoped LoRA & spatial overlay references after backward() finishes."""
         clear_generator_lora_state()
         clear_spatial_action_map()
 
     def _compute_inference_detail_scale(self, action_map: torch.Tensor, detail_scale: float) -> float:
-        """Mute generative detail branch on pure tone/WB edits where no structural restoration is requested."""
         if abs(detail_scale) < 1e-6 or self.struct_action_indices.numel() == 0:
             return float(detail_scale)
         idx = self.struct_action_indices.to(action_map.device)
         struct_max = float(action_map.float().index_select(1, idx).abs().max().item())
         gate = min(1.0, max(0.0, struct_max / 0.25))
         return float(detail_scale) * gate
+
+    def _resolve_unet_timesteps(self, t_cont: torch.Tensor, action_map: torch.Tensor, bsz: int) -> torch.Tensor:
+        """Slider-driven adaptive timestep (`FideDiff` principle without a blind estimator) or fixed HYPIR step."""
+        num_sched = int(self.alphas_cumprod.numel())
+        if t_cont.ndim == 0:
+            t_cont = t_cont.unsqueeze(0)
+        if t_cont.shape[0] == 1 and bsz > 1:
+            t_cont = t_cont.expand(bsz)
+
+        if bool(getattr(self.config, "HYPIR_MODE", False)):
+            fixed_t = int(getattr(self.config, "HYPIR_FIXED_TIMESTEP", 200))
+            return torch.full((bsz,), fixed_t, device=action_map.device, dtype=torch.long).clamp(1, num_sched - 1)
+
+        max_t = float(getattr(self.config, "RESTORATION_MAX_TIMESTEP", 279))
+        min_t = float(getattr(self.config, "RESTORATION_MIN_TIMESTEP", max_t))
+        if bool(getattr(self.config, "ADAPTIVE_TIMESTEP", True)) and self.struct_action_indices.numel() > 0:
+            s_idx = self.struct_action_indices.to(action_map.device)
+            s_peak = action_map.float().index_select(1, s_idx).abs().amax(dim=(1, 2, 3)).clamp(0.0, 1.0)
+            eff_t = min_t + (max_t - min_t) * torch.pow(s_peak, 0.75)
+        else:
+            eff_t = torch.full((bsz,), max_t, device=action_map.device, dtype=torch.float32)
+
+        return (t_cont.float() * eff_t).round().long().clamp(1, num_sched - 1)
 
     def _predict_clean_latent(
         self,
@@ -937,15 +917,8 @@ class ControllableRestorer(nn.Module):
         fidelity_scale: float,
         detail_scale: float,
     ) -> torch.Tensor:
-        """Predict clean target latent `hat_z_0` via pre-scaled SD-Turbo ADD step (default t=249)."""
-        if t_cont.ndim == 0:
-            t_cont = t_cont.unsqueeze(0)
-        if t_cont.shape[0] == 1 and z_t.shape[0] > 1:
-            t_cont = t_cont.expand(z_t.shape[0])
-
-        max_t = int(getattr(self.config, "RESTORATION_MAX_TIMESTEP", 249))
-        num_sched = int(self.alphas_cumprod.numel())
-        t_unet = (t_cont.float() * float(max_t)).round().long().clamp(1, num_sched - 1)
+        bsz = z_t.shape[0]
+        t_unet = ControllableRestorer._resolve_unet_timesteps(self, t_cont, action_map, bsz)
 
         abar_table = (
             self.alphas_cumprod
@@ -953,12 +926,11 @@ class ControllableRestorer(nn.Module):
             else self.alphas_cumprod.to(z_t.device)
         )
         alpha_bar = abar_table.index_select(0, t_unet).view(-1, 1, 1, 1).float()
-        sqrt_alpha_bar = torch.sqrt(alpha_bar.clamp(min=1e-6))        # = 0.8218 at t=249
-        sqrt_one_minus = torch.sqrt((1.0 - alpha_bar).clamp(min=0.0))  # = 0.5697 at t=249
-        sigma_t = sqrt_one_minus / sqrt_alpha_bar                      # = 0.6932 at t=249
+        sqrt_alpha_bar = torch.sqrt(alpha_bar.clamp(min=1e-6))
+        sqrt_one_minus = torch.sqrt((1.0 - alpha_bar).clamp(min=0.0))
+        sigma_t = sqrt_one_minus / sqrt_alpha_bar
 
         unet_dtype = infer_module_dtype(self.unet, fallback=z_t.dtype)
-        # Pre-scale z_t by sqrt_alpha_bar so frozen SD-Turbo UNet sees its exact native training amplitude!
         z_scaled = z_t.float() if self.prediction_type == "sample" else (sqrt_alpha_bar * z_t.float())
         z_in = z_scaled.to(unet_dtype)
         if self.training and torch.is_grad_enabled() and not z_in.requires_grad:
@@ -969,6 +941,7 @@ class ControllableRestorer(nn.Module):
             lambda_pix=fidelity_scale,
             lambda_sem=detail_scale,
             device=z_in.device,
+            spatial_action_map=action_map,
         ):
             with _spatial_action_context(action_map, sem_grid=sem_grid, device=z_in.device):
                 raw_pred = self.unet(
@@ -982,22 +955,98 @@ class ControllableRestorer(nn.Module):
         if self.prediction_type == "sample":
             return z_t.float() + self.velocity_scale * (raw_pred - z_t.float())
 
-        # Exact algebraic DDPM inversion of pre-scaled `z_in = sqrt_alpha_bar * z_t`:
-        # (sqrt_alpha_bar * z_t - sqrt_one_minus * eps) / sqrt_alpha_bar == z_t - sigma_t * eps (1.0x unit gain!)
         eps_pred = self.velocity_scale * raw_pred
         return z_t.float() - sigma_t * eps_pred
+
+    def compute_target_anchored_csd_loss(
+        self,
+        hat_z_0: torch.Tensor,
+        z_tgt: torch.Tensor,
+        action_map: torch.Tensor,
+    ) -> torch.Tensor:
+        """Zero-extra-VRAM Target-Anchored Classifier Score Distillation (`PiSA-SR` CSD + `TSD-SR` TSD).
+
+        Temporarily disables all LoRAs & spatial overlays (`lambda_pix=0, lambda_sem=0`) on the already-loaded
+        frozen base UNet under `torch.no_grad()` to compute a target-tethered + negative-prompt score gradient
+        without allocating a second UNet or storing teacher activations!
+        """
+        if bool(getattr(self.config, "HYPIR_MODE", False)):
+            return hat_z_0.new_zeros((), dtype=torch.float32)
+
+        bsz = hat_z_0.shape[0]
+        dev = hat_z_0.device
+        num_sched = int(self.alphas_cumprod.numel())
+        t_low, t_high = getattr(self.config, "CSD_TIMESTEP_RANGE", (40, 320))
+        t_low = max(1, min(int(t_low), num_sched - 1))
+        t_high = max(t_low + 1, min(int(t_high), num_sched))
+
+        with torch.no_grad():
+            t_csd = torch.randint(t_low, t_high, (bsz,), device=dev, dtype=torch.long)
+            abar_table = self.alphas_cumprod if self.alphas_cumprod.device == dev else self.alphas_cumprod.to(dev)
+            abar = abar_table.index_select(0, t_csd).view(-1, 1, 1, 1).float()
+            sqrt_ab = torch.sqrt(abar.clamp(min=1e-6))
+            sqrt_om = torch.sqrt((1.0 - abar).clamp(min=1e-6))
+
+            eps = torch.randn_like(hat_z_0.float())
+            z_stu_det = hat_z_0.detach().float()
+            z_gt_det = z_tgt.detach().float()
+
+            z_t_stu = sqrt_ab * z_stu_det + sqrt_om * eps
+            z_t_gt = sqrt_ab * z_gt_det + sqrt_om * eps
+
+            unet_dtype = infer_module_dtype(self.unet, fallback=hat_z_0.dtype)
+            pos_emb = self.pos_prompt_embeds.to(device=dev, dtype=unet_dtype).expand(bsz, -1, -1)
+            neg_emb = self.neg_prompt_embeds.to(device=dev, dtype=unet_dtype).expand(bsz, -1, -1)
+
+            def _to_eps(raw_out: torch.Tensor, z_noisy: torch.Tensor) -> torch.Tensor:
+                if self.prediction_type == "v_prediction":
+                    return sqrt_om * z_noisy + sqrt_ab * raw_out
+                if self.prediction_type == "sample":
+                    return z_noisy - raw_out
+                return raw_out
+
+            with generator_lora_context(
+                None, lambda_pix=0.0, lambda_sem=0.0, device=dev, spatial_action_map=None
+            ), _spatial_action_context(None, sem_grid=None, device=dev):
+                cat_z = torch.cat([z_t_stu, z_t_stu], dim=0).to(unet_dtype)
+                cat_t = torch.cat([t_csd, t_csd], dim=0)
+                cat_emb = torch.cat([pos_emb, neg_emb], dim=0)
+                raw_pn = self.unet(cat_z, cat_t, encoder_hidden_states=cat_emb).sample.float()
+                raw_pos, raw_neg = raw_pn.chunk(2, dim=0)
+
+                raw_gt = self.unet(
+                    z_t_gt.to(unet_dtype), t_csd, encoder_hidden_states=pos_emb
+                ).sample.float()
+
+            eps_stu_pos = _to_eps(raw_pos, z_t_stu)
+            eps_stu_neg = _to_eps(raw_neg, z_t_stu)
+            eps_gt_pos = _to_eps(raw_gt, z_t_gt)
+
+            cfg_scale = float(getattr(self.config, "CSD_CFG_SCALE", 4.5))
+            # TSD target anchor `(eps_stu_pos - eps_gt_pos)` + PiSA-SR negative-prompt suppression `(pos - neg)`
+            score_dir = (eps_stu_pos - eps_gt_pos) + 0.30 * cfg_scale * (eps_stu_pos - eps_stu_neg)
+            norm_scale = score_dir.std(dim=(1, 2, 3), keepdim=True, unbiased=False).clamp(min=1e-4)
+            step_delta = (score_dir / norm_scale) * 0.08
+            target_csd = (z_stu_det - step_delta).detach()
+
+            if self.struct_action_indices.numel() > 0:
+                s_idx = self.struct_action_indices.to(dev)
+                act_gate = action_map.float().index_select(1, s_idx).abs().amax(dim=(1, 2, 3)).clamp(0.0, 1.0)
+            else:
+                act_gate = action_map.float().abs().amax(dim=(1, 2, 3)).clamp(0.0, 1.0)
+            act_gate = act_gate.view(-1, 1, 1, 1)
+
+        return 0.5 * (((hat_z_0.float() - target_csd) ** 2) * act_gate).mean()
 
     def _apply_zero_action_lock(
         self, src_01: torch.Tensor, pred_01: torch.Tensor, action_map: torch.Tensor
     ) -> torch.Tensor:
-        """Guarantee exact pixel preservation wherever all signed/unsigned sliders at (y, x) equal 0."""
         thresh = max(1e-4, float(getattr(self.config, "ZERO_ACTION_LOCK_THRESHOLD", 0.03)))
-        max_abs_act = action_map.float().abs().amax(dim=1, keepdim=True)  # [B, 1, H, W]
+        max_abs_act = action_map.float().abs().amax(dim=1, keepdim=True)
         gate = (max_abs_act / thresh).clamp(0.0, 1.0)
         return (src_01 + gate * (pred_01 - src_01)).clamp(0.0, 1.0)
 
     def forward_align_only(self, src_01: torch.Tensor, clean_01: torch.Tensor) -> torch.Tensor:
-        """Fast Phase-1 forward pass updating only the Vision Encoder Self-Teacher LoRA."""
         align_loss, _ = self.semantic_encoder.compute_self_teacher_loss(src_01, clean_01)
         return align_loss.reshape(1)
 
@@ -1010,7 +1059,7 @@ class ControllableRestorer(nn.Module):
         fidelity_scale: float = 1.0,
         detail_scale: float = 0.0,
     ) -> Dict[str, torch.Tensor]:
-        """Full training pass with Dense C-RADIO UNet conditioning & HxW PixelSpaceRefiner."""
+        """Full training pass returning RGB prediction, clean latent `z_tgt`, and universal `evae_loss`."""
         bsz, _, h, w = src_01.shape
         action_map = self.action_overlay.ensure_spatial_map(action_input, h, w)
 
@@ -1029,27 +1078,32 @@ class ControllableRestorer(nn.Module):
         )
         sem_grid = sem_out["grid"]
 
+        # Encode clean/selective target `tgt_01` with frozen base AutoencoderKL (LoRA OFF, 0 autograd VRAM)
+        # collecting both `z_tgt` AND clean `tgt_skips` for OSDD-style universal eVAE skip supervision!
+        with torch.no_grad(), generator_lora_context(
+            None, lambda_pix=0.0, lambda_sem=0.0, device=tgt_01.device, spatial_action_map=None
+        ):
+            z_tgt, tgt_skips = self.skip_vae.encode_target_latents(tgt_01, return_skips=True)
+            z_tgt = z_tgt.detach()
+
         use_bridge = torch.rand(1, device=src_01.device).item() < getattr(
             self.config, "MULTI_STEP_TRAIN_PROB", 0.0
         )
-        z_tgt = None
-        if use_bridge:
-            with torch.no_grad(), generator_lora_context(
-                None, lambda_pix=0.0, lambda_sem=0.0, device=tgt_01.device
-            ):
-                z_tgt = self.skip_vae.encode_target_latents(tgt_01)
 
         set_generator_lora_state(
             global_action_cond,
             lambda_pix=fidelity_scale,
             lambda_sem=detail_scale,
             device=src_01.device,
+            spatial_action_map=action_map,
         )
         set_spatial_action_map(action_map, sem_grid=sem_grid, device=src_01.device)
 
         z_src, enc_skips = self.skip_vae.encode_with_skips(src_01)
+        evae_loss = self.skip_vae.compute_evae_alignment_loss(enc_skips, tgt_skips)
+        del tgt_skips
 
-        if use_bridge and z_tgt is not None:
+        if use_bridge:
             t_vec = torch.empty(bsz, device=src_01.device).uniform_(0.35, 1.0)
             t_4d = t_vec.view(bsz, 1, 1, 1)
             z_t = (1.0 - t_4d) * z_tgt + t_4d * z_src
@@ -1069,18 +1123,21 @@ class ControllableRestorer(nn.Module):
         )
 
         vae_rgb = self.skip_vae.decode_with_skips(hat_z_0, enc_skips, action_map)
-        refined_rgb = self.pixel_refiner(
+        toned_rgb = self.pixel_refiner(
             src_01=src_01,
             vae_rgb_01=vae_rgb,
             action_map=action_map,
             fidelity_scale=fidelity_scale,
             detail_scale=detail_scale,
         )
-        pred_rgb = self._apply_zero_action_lock(src_01, refined_rgb, action_map)
+        pred_rgb = self._apply_zero_action_lock(src_01, toned_rgb, action_map)
 
         return {
             "pred": pred_rgb,
+            "hat_z_0": hat_z_0,
+            "z_tgt": z_tgt,
             "align_loss": align_loss.reshape(1),
+            "evae_loss": evae_loss.reshape(1),
             "t": t_vec,
         }
 
@@ -1143,7 +1200,6 @@ class ControllableRestorer(nn.Module):
         detail_scale: float,
         return_trajectory: bool = False,
     ):
-        """Run controllable restoration on a single patch/tile."""
         bsz, _, h, w = src_01.shape
         action_map = self.action_overlay.ensure_spatial_map(action_input, h, w)
 
@@ -1183,6 +1239,7 @@ class ControllableRestorer(nn.Module):
                 lambda_pix=fidelity_scale,
                 lambda_sem=eff_detail,
                 device=cur_padded.device,
+                spatial_action_map=act_padded,
             ):
                 z_enc, enc_skips = self.skip_vae.encode_with_skips(cur_padded)
                 t_ones = torch.ones(bsz, device=cur_padded.device, dtype=torch.float32)
@@ -1201,14 +1258,14 @@ class ControllableRestorer(nn.Module):
                 )[:, :, :h, :w]
 
             del z_enc, hat_z_0, enc_skips, cross_tokens, global_action_cond, sem_grid
-            refined_rgb = self.pixel_refiner(
+            toned_rgb = self.pixel_refiner(
                 src_01=cur_rgb,
                 vae_rgb_01=vae_rgb,
                 action_map=act_step,
                 fidelity_scale=fidelity_scale,
                 detail_scale=eff_detail,
             )
-            step_rgb = self._apply_zero_action_lock(src_01, refined_rgb, action_map)
+            step_rgb = self._apply_zero_action_lock(src_01, toned_rgb, action_map)
 
             if steps == 1:
                 cur_rgb = step_rgb
@@ -1237,7 +1294,6 @@ class ControllableRestorer(nn.Module):
         tile_size: Optional[int] = None,
         tile_overlap: Optional[int] = None,
     ):
-        """Controllable restoration (auto-tiled for 2K/4K images; signed-safe zero-action lock)."""
         steps = int(steps or getattr(self.config, "DEFAULT_INFERENCE_STEPS", 1))
         fidelity_scale = (
             float(self.config.DEFAULT_FIDELITY_SCALE) if fidelity_scale is None else float(fidelity_scale)
@@ -1342,7 +1398,6 @@ class ControllableRestorer(nn.Module):
         detail_scale: Optional[float] = None,
         align_only: bool = False,
     ):
-        """Unified DataParallel-friendly forward pass for Stage-1 align, Stage-2/3 train, and inference."""
         if align_only:
             if clean_01 is None:
                 raise ValueError("clean_01 is required when align_only=True")
@@ -1377,6 +1432,7 @@ class _GeneratorParallelStage(nn.Module):
         self.config = restorer.config
         self.prediction_type = restorer.prediction_type
         self.register_buffer("alphas_cumprod", restorer.alphas_cumprod.clone(), persistent=False)
+        self.register_buffer("struct_action_indices", restorer.struct_action_indices.clone(), persistent=False)
         self.action_overlay = restorer.action_overlay
         self.skip_vae = restorer.skip_vae
         self.unet = restorer.unet
@@ -1397,27 +1453,30 @@ class _GeneratorParallelStage(nn.Module):
         bsz = src_01.shape[0]
         cross_tokens, global_action_cond = self.action_overlay(action_map, sem_tokens, sem_global)
 
+        with torch.no_grad(), generator_lora_context(
+            None, lambda_pix=0.0, lambda_sem=0.0, device=tgt_01.device, spatial_action_map=None
+        ):
+            z_tgt, tgt_skips = self.skip_vae.encode_target_latents(tgt_01, return_skips=True)
+            z_tgt = z_tgt.detach()
+
         use_bridge = torch.rand(1, device=src_01.device).item() < getattr(
             self.config, "MULTI_STEP_TRAIN_PROB", 0.0
         )
-        z_tgt = None
-        if use_bridge:
-            with torch.no_grad(), generator_lora_context(
-                None, lambda_pix=0.0, lambda_sem=0.0, device=tgt_01.device
-            ):
-                z_tgt = self.skip_vae.encode_target_latents(tgt_01)
 
         set_generator_lora_state(
             global_action_cond,
             lambda_pix=fidelity_scale,
             lambda_sem=detail_scale,
             device=src_01.device,
+            spatial_action_map=action_map,
         )
         set_spatial_action_map(action_map, sem_grid=sem_grid, device=src_01.device)
 
         z_src, enc_skips = self.skip_vae.encode_with_skips(src_01)
+        evae_loss = self.skip_vae.compute_evae_alignment_loss(enc_skips, tgt_skips)
+        del tgt_skips
 
-        if use_bridge and z_tgt is not None:
+        if use_bridge:
             t_vec = torch.empty(bsz, device=src_01.device).uniform_(0.35, 1.0)
             t_4d = t_vec.view(bsz, 1, 1, 1)
             z_t = (1.0 - t_4d) * z_tgt + t_4d * z_src
@@ -1438,7 +1497,7 @@ class _GeneratorParallelStage(nn.Module):
         )
 
         vae_rgb = self.skip_vae.decode_with_skips(hat_z_0, enc_skips, action_map)
-        refined_rgb = self.pixel_refiner(
+        toned_rgb = self.pixel_refiner(
             src_01=src_01,
             vae_rgb_01=vae_rgb,
             action_map=action_map,
@@ -1447,8 +1506,14 @@ class _GeneratorParallelStage(nn.Module):
         )
         thresh = max(1e-4, float(getattr(self.config, "ZERO_ACTION_LOCK_THRESHOLD", 0.03)))
         gate = (action_map.float().abs().amax(dim=1, keepdim=True) / thresh).clamp(0.0, 1.0)
-        pred_rgb = (src_01 + gate * (refined_rgb - src_01)).clamp(0.0, 1.0)
-        return {"pred": pred_rgb, "t": t_vec}
+        pred_rgb = (src_01 + gate * (toned_rgb - src_01)).clamp(0.0, 1.0)
+        return {
+            "pred": pred_rgb,
+            "hat_z_0": hat_z_0,
+            "z_tgt": z_tgt,
+            "evae_loss": evae_loss.reshape(1),
+            "t": t_vec,
+        }
 
 
 class SplitMultiGPURestorer(nn.Module):
@@ -1499,7 +1564,10 @@ class SplitMultiGPURestorer(nn.Module):
             )
             return {
                 "pred": gen_out["pred"],
+                "hat_z_0": gen_out["hat_z_0"],
+                "z_tgt": gen_out["z_tgt"],
                 "align_loss": align_loss.reshape(1),
+                "evae_loss": gen_out["evae_loss"].mean().reshape(1),
                 "t": gen_out["t"],
             }
         return raw_model.sample(

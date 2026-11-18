@@ -93,7 +93,7 @@ class ControllableInferencer:
         if missing_k or unexp_k:
             print(
                 f"[Warning] Checkpoint had {len(missing_k)} missing / {len(unexp_k)} legacy adapter keys. "
-                f"Make sure you are loading a V4 orthogonal-control checkpoint!"
+                f"Make sure you are loading a compatible V5 checkpoint!"
             )
         return missing_k, unexp_k
 
@@ -303,8 +303,15 @@ class ControllableInferencer:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Controllable Pretrained Image Restoration CLI (V4)")
+    parser = argparse.ArgumentParser(description="Controllable Pretrained Image Restoration CLI (V5)")
     parser.add_argument("--model", type=str, required=False, default=None, help="Path to model_best.pt / model_latest.pt")
+    parser.add_argument(
+        "--backbone",
+        type=str,
+        choices=["sd-2.1-base", "sd-turbo", "sd-1.5", "bk-sdm-small", "tiny-sd", "bk-sdm-tiny", "mock_tiny"],
+        default=None,
+        help="Optional generator backbone override when running without a checkpoint",
+    )
     parser.add_argument("--image", type=str, required=True, help="Path to input image")
     parser.add_argument("--output-dir", type=str, default="./restored", help="Directory to save restored result")
     parser.add_argument(
@@ -346,6 +353,8 @@ def main():
     args = parser.parse_args()
 
     cfg = Config()
+    if args.backbone:
+        cfg.GENERATOR_BACKBONE = args.backbone
     if args.mock:
         cfg.GENERATOR_BACKBONE = "mock_tiny"
         cfg.SEMANTIC_ENCODER_TYPE = "mock_tiny"

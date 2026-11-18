@@ -370,7 +370,7 @@ def build_gradio_app(
                             value=default_det,
                             step=0.05,
                             label="Generative Texture Detail (detail_scale)",
-                            info="0.0 = conservative pixel-faithful PSNR | 0.65-1.0 = crisp generative edge/texture detail",
+                            info="0.0 = strict pixel-faithful PSNR | 0.35 = natural crispness | 0.75-1.0 = strong detail",
                         )
 
                         with gr.Accordion("Localized Spatial Mask / 1-Click Semantic Object Control", open=False):

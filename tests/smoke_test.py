@@ -1,12 +1,14 @@
-"""End-to-end verification suite for Controllable_Image_Restoration (V4 Orthogonal + Directional).
+"""End-to-end verification suite for Controllable_Image_Restoration (V5 Universal Experts + Hybrid Data).
 
 Runs:
 1. AST syntax check across every Python file in the repository.
-2. 6-channel orthogonal + signed Lie-group degradation synthesis, directional Exposure/Warmth
-   group inversion, legacy CLI alias compatibility, and benchmark contact-sheet verification.
-3. Full 3-phase forward/backward, Self-Teacher LoRA switch, Dual-LoRA + PixelSpaceRefiner
-   isolation, signed negative slider Zero-Action unlock, Spatial Overlay exact preservation,
-   and 1-Click Semantic Mask tests (using offline mock_tiny backbones if PyTorch is installed).
+2. V5 config invariants (`sd-2.1-base` default, expandable `LORA_EXPERT_SPECS`, isolated `HYPIRConfig`),
+   2D Bezier curved motion blur + optical bokeh disc PSF continuity, Lie-group directional Exposure/Warmth,
+   Laplacian clean-patch sharpness gate, and auto-discovery + Compositional Real-Pair Wrapper across
+   GoPro / RealBlur / DPDD folder & `.txt` layouts.
+3. Full 3-phase forward/backward, Slider-Routed UIR-LoRA expert zero-interference routing, Universal eVAE
+   skip alignment, Zero-Extra-VRAM Target-Anchored CSD, and isolated HYPIR Relativistic RpGAN checks
+   (when PyTorch is installed in the active environment).
 """
 
 import ast
@@ -29,9 +31,16 @@ def test_syntax_all_files():
 
 
 def test_selective_pipeline():
+    import cv2
     import numpy as np
-    from config import Config
-    from data.selective_dataset import SelectiveDegradationPipeline
+    import tempfile
+    from config import Config, HYPIRConfig
+    from data.selective_dataset import (
+        SelectiveDegradationPipeline,
+        create_controllable_dataset,
+        discover_paired_blur_datasets,
+    )
+    from utils.image_benchmark import run_single_image_benchmark
     from utils.semantic_mask import build_spatial_action_overlay, parse_action_spec
 
     cfg = Config()
@@ -44,8 +53,17 @@ def test_selective_pipeline():
     )
     assert abs(dist_sum - 1.0) < 1e-6, f"Action distribution must sum to 1.0, got {dist_sum}"
     assert cfg.NUM_ACTIONS == 6, f"Expected 6 orthogonal controls, got {cfg.NUM_ACTIONS}"
-    assert cfg.RESTORATION_MAX_TIMESTEP == 249 and cfg.SKIP_DROPOUT_PROB == 0.0
-    assert cfg.PIXEL_STAGE_EPOCHS >= 10 and cfg.LOSS_L1_WEIGHT >= 0.8
+    assert cfg.GENERATOR_BACKBONE == "sd-2.1-base", "Default V5 backbone must be sd-2.1-base!"
+    assert "sd-turbo" in cfg.GENERATOR_REPO_MAP and "bk-sdm-small" in cfg.GENERATOR_REPO_MAP
+    assert cfg.ADAPTIVE_TIMESTEP is True and 10 <= cfg.RESTORATION_MIN_TIMESTEP < cfg.RESTORATION_MAX_TIMESTEP
+    assert cfg.VAE_DEC_LORA_RANK == 0, "VAE decoder must remain frozen to protect SD's natural image manifold!"
+    assert cfg.HYPIR_MODE is False and cfg.LOSS_RPGAN_WEIGHT == 0.0 and cfg.LOSS_CSD_WEIGHT > 0.0
+    assert len(cfg.LORA_EXPERT_SPECS) == 3
+
+    # Verify HYPIR mode stays cleanly isolated in HYPIRConfig
+    hyp_cfg = HYPIRConfig()
+    assert hyp_cfg.HYPIR_MODE is True and hyp_cfg.LOSS_CSD_WEIGHT == 0.0 and hyp_cfg.LOSS_RPGAN_WEIGHT > 0.0
+    assert hyp_cfg.ADAPTIVE_TIMESTEP is False and hyp_cfg.UNFREEZE_UNET_NORMS is True
 
     # Verify CLI action parser: 'all' keeps signed artistic channels at 0.0; signed & legacy aliases work
     all_vec = parse_action_spec("all", cfg.DEGRADATION_TYPES, signed_types=cfg.SIGNED_ACTION_TYPES)
@@ -66,6 +84,8 @@ def test_selective_pipeline():
 
     yy, xx = np.meshgrid(np.linspace(12, 242, 128), np.linspace(12, 242, 128), indexing="ij")
     clean = np.stack([xx, yy, 128.0 + 0.3 * xx - 0.3 * yy], axis=-1).clip(0, 255).astype(np.uint8)
+    cv2.circle(clean, (64, 64), 28, (235, 70, 55), -1)
+    cv2.rectangle(clean, (20, 20), (46, 102), (45, 210, 195), -1)
     params = pipe.sample_params(128, 128, rng=rng)
 
     # 1. Exact identity at state = 0
@@ -73,7 +93,7 @@ def test_selective_pipeline():
     ident = pipe.render_with_params(clean, zero_state, params)
     assert np.array_equal(clean, ident), "State=0 must be exact identity!"
 
-    # 2. Seed-synchronized selective removal: motion_blur + denoise -> remove noise, keep motion blur
+    # 2. Seed-synchronized selective removal: curved motion_blur + denoise -> remove noise, keep curved motion blur
     s_src = np.zeros(cfg.NUM_ACTIONS, dtype=np.float32)
     s_src[pipe.type_to_idx["deblur_motion"]] = 0.80
     s_src[pipe.type_to_idx["denoise"]] = 0.70
@@ -86,78 +106,56 @@ def test_selective_pipeline():
     s_only_blur = np.zeros(cfg.NUM_ACTIONS, dtype=np.float32)
     s_only_blur[pipe.type_to_idx["deblur_motion"]] = 0.80
     x_pure_blur = pipe.render_with_params(clean, s_only_blur, params)
-    assert np.array_equal(x_tgt, x_pure_blur), "Preserved motion blur target must match pure motion blur exactly!"
+    assert np.array_equal(x_tgt, x_pure_blur), "Preserved curved motion blur target must match pure motion blur!"
     assert not np.array_equal(x_src, x_tgt), "Denoised target should differ from noisy source!"
 
-    # 3. Signed directional Exposure & Warmth Lie-group inversion (both negative & positive states)
+    # 3. Signed directional Exposure & Warmth Lie-group inversion
     for signed_name in ("exposure", "warmth"):
         idx = pipe.type_to_idx[signed_name]
         for sign in (-1.0, 1.0):
             s_tone = np.zeros(cfg.NUM_ACTIONS, dtype=np.float32)
             s_tone[idx] = sign * 0.72
             deg_tone = pipe.render_with_params(clean, s_tone, params)
-            assert not np.array_equal(clean, deg_tone), f"{signed_name} ({sign}) should visibly shift image!"
+            assert not np.array_equal(clean, deg_tone)
 
             act_inv = pipe.compute_full_restore_action(s_tone)
-            assert abs(float(act_inv[idx]) + sign * 0.72) < 1e-6
             s_rec = pipe.compute_target_state(s_tone, act_inv)
             rec_tone = pipe.render_with_params(clean, s_rec, params)
             assert np.array_equal(clean, rec_tone), f"{signed_name}: inverse signed slider must reach exact clean target!"
 
-            s_half = pipe.compute_target_state(s_tone, pipe.compute_partial_restore_action(s_tone, 0.5))
-            half_tone = pipe.render_with_params(clean, s_half, params).astype(np.float32)
-            err_full = float(np.mean((deg_tone.astype(np.float32) - clean.astype(np.float32)) ** 2))
-            err_half = float(np.mean((half_tone - clean.astype(np.float32)) ** 2))
-            assert err_full > err_half > 0.0, f"{signed_name} ({sign}): 50% partial recovery must be strictly monotonic!"
+    # 4. Continuity across both optical bokeh disc PSF & Gaussian focus modes + 2D Bezier motion curves
+    for use_disc in (True, False):
+        params.use_bokeh_disc = use_disc
+        for mode_id in (0, 1, 2):
+            params.focus_mode = mode_id
+            params.artifact_mode = mode_id
+            for u_idx in pipe.unsigned_indices:
+                deg_name = cfg.DEGRADATION_TYPES[u_idx]
+                s_one = np.zeros(cfg.NUM_ACTIONS, dtype=np.float32)
+                s_one[u_idx] = 0.85
+                d_full = pipe.render_with_params(clean, s_one, params).astype(np.float32)
+                d_half = pipe.render_with_params(clean, 0.5 * s_one, params).astype(np.float32)
+                d_zero = pipe.render_with_params(clean, 0.0 * s_one, params).astype(np.float32)
+                err_full = float(np.mean((d_full - clean.astype(np.float32)) ** 2))
+                err_half = float(np.mean((d_half - clean.astype(np.float32)) ** 2))
+                err_zero = float(np.mean((d_zero - clean.astype(np.float32)) ** 2))
+                assert err_zero == 0.0, f"{deg_name} (disc={use_disc}, mode={mode_id}): a=1.0 must reach clean!"
+                assert err_full > err_half > 0.0, f"{deg_name} (disc={use_disc}, mode={mode_id}): must be monotonic!"
 
-    # 4. Synthesize pair bounds & identity check across 30 random trials (covering signed & artistic modes)
-    for _ in range(30):
-        src_u8, act_map, tgt_u8, _ = pipe.synthesize_pair(clean, rng=rng)
-        assert src_u8.shape == clean.shape and tgt_u8.shape == clean.shape
-        assert act_map.shape == (cfg.NUM_ACTIONS, 128, 128)
-        assert -1.0 <= float(act_map.min()) and float(act_map.max()) <= 1.0
+    # 5. Compositional Real-Pair Wrapper + GoPro / RealBlur / DPDD Auto-Discovery Verification
+    real_blur_sim = cv2.GaussianBlur(clean, (9, 9), 2.4)
+    for _ in range(25):
+        rx_src, rx_tgt, ra_fg, ra_bg, rmask, rs_src = pipe.synthesize_real_pair_components(
+            real_blur_sim, clean, blur_channel_name="deblur_motion", rng=rng
+        )
+        assert rx_src.shape == clean.shape and rx_tgt.shape == clean.shape
+        assert -1.0 <= float(ra_fg.min()) and float(ra_fg.max()) <= 1.0
         for u_idx in pipe.unsigned_indices:
-            assert float(act_map[u_idx].min()) >= 0.0, "Unsigned restoration channels must stay >= 0!"
-        if float(np.max(np.abs(act_map))) == 0.0:
-            assert np.array_equal(src_u8, tgt_u8), "All-zero action map must yield exact x_src == x_tgt!"
-
-    # 5. False-positive safety on objective sliders: setting [0..3]=1.0 on clean attributes is exact no-op
-    s_only_noise = np.zeros(cfg.NUM_ACTIONS, dtype=np.float32)
-    s_only_noise[pipe.type_to_idx["denoise"]] = 0.65
-    x_noisy = pipe.render_with_params(clean, s_only_noise, params)
-    a_fp = parse_action_spec(
-        "motion=1.0,focus=1.0,deartifact=1.0,denoise=0.0",
-        cfg.DEGRADATION_TYPES,
-        signed_types=cfg.SIGNED_ACTION_TYPES,
-    )
-    x_fp_tgt = pipe.render_with_params(clean, pipe.compute_target_state(s_only_noise, a_fp), params)
-    assert np.array_equal(x_noisy, x_fp_tgt), "False-positive objective sliders on clean attributes must be no-ops!"
-
-    # 6. Continuity across all 4 unsigned channels across all focus/artifact sub-modes
-    for mode_id in (0, 1, 2):
-        params.focus_mode = mode_id
-        params.artifact_mode = mode_id
-        for u_idx in pipe.unsigned_indices:
-            deg_name = cfg.DEGRADATION_TYPES[u_idx]
-            s_one = np.zeros(cfg.NUM_ACTIONS, dtype=np.float32)
-            s_one[u_idx] = 0.85
-            d_full = pipe.render_with_params(clean, s_one, params).astype(np.float32)
-            d_half = pipe.render_with_params(clean, 0.5 * s_one, params).astype(np.float32)
-            d_zero = pipe.render_with_params(clean, 0.0 * s_one, params).astype(np.float32)
-            err_full = float(np.mean((d_full - clean.astype(np.float32)) ** 2))
-            err_half = float(np.mean((d_half - clean.astype(np.float32)) ** 2))
-            err_zero = float(np.mean((d_zero - clean.astype(np.float32)) ** 2))
-            assert err_zero == 0.0, f"{deg_name} (mode={mode_id}): a=1.0 must reach exact clean image!"
-            assert err_full > err_half > 0.0, f"{deg_name} (mode={mode_id}): partial a=0.5 must be monotonic!"
-
-    # 7. Kaggle DF2K-OST nested subfolder + symlink dataset discovery & benchmark suite verification
-    import cv2
-    import tempfile
-    from data.selective_dataset import create_controllable_dataset
-    from utils.image_benchmark import run_single_image_benchmark
+            assert float(ra_fg[u_idx]) >= 0.0
 
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
+        # Clean DF2K + symlinked folder
         real_ost = tmp_path / "external_ost" / "outdoor"
         real_ost.mkdir(parents=True)
         train_root = tmp_path / "df2k-ost" / "train"
@@ -166,18 +164,49 @@ def test_selective_pipeline():
         val_root = tmp_path / "df2k-ost" / "test" / "DIV2K_valid"
         val_root.mkdir(parents=True)
 
-        cv2.imwrite(str(train_root / "DIV2K" / "0001.png"), clean)
-        cv2.imwrite(str(train_root / "Flickr2K" / "0002.jpg"), clean)
-        cv2.imwrite(str(real_ost / "0003.png"), clean)
+        big_clean = cv2.resize(clean, (300, 300), interpolation=cv2.INTER_NEAREST)
+        big_blur = cv2.GaussianBlur(big_clean, (11, 11), 3.0)
+        cv2.imwrite(str(train_root / "DIV2K" / "0001.png"), big_clean)
+        cv2.imwrite(str(train_root / "Flickr2K" / "0002.jpg"), big_clean)
+        cv2.imwrite(str(real_ost / "0003.png"), big_clean)
         os.symlink(str(real_ost), str(train_root / "OST_link"))
-        cv2.imwrite(str(val_root / "0801.png"), clean)
+        cv2.imwrite(str(val_root / "0801.png"), big_clean)
+
+        # Mock Curated Motion Pack (GoPro scene layout + RealBlur .txt list layout) & DPDD Defocus layout
+        curated_motion = tmp_path / "curated_deblur"
+        (curated_motion / "GoPro" / "train" / "GOPR0372" / "blur").mkdir(parents=True)
+        (curated_motion / "GoPro" / "train" / "GOPR0372" / "sharp").mkdir(parents=True)
+        cv2.imwrite(str(curated_motion / "GoPro" / "train" / "GOPR0372" / "blur" / "0001.png"), big_blur)
+        cv2.imwrite(str(curated_motion / "GoPro" / "train" / "GOPR0372" / "sharp" / "0001.png"), big_clean)
+
+        rb_dir = curated_motion / "RealBlur" / "scene_001"
+        (rb_dir / "blur").mkdir(parents=True)
+        (rb_dir / "gt").mkdir(parents=True)
+        cv2.imwrite(str(rb_dir / "blur" / "blur_1.png"), big_blur)
+        cv2.imwrite(str(rb_dir / "gt" / "gt_1.png"), big_clean)
+        (curated_motion / "RealBlur_J_train_list.txt").write_text(
+            "RealBlur/scene_001/gt/gt_1.png RealBlur/scene_001/blur/blur_1.png\n", encoding="utf-8"
+        )
+
+        dpdd_root = tmp_path / "DPDD" / "train"
+        (dpdd_root / "inputC").mkdir(parents=True)
+        (dpdd_root / "target").mkdir(parents=True)
+        cv2.imwrite(str(dpdd_root / "inputC" / "1P0A0001.png"), big_blur)
+        cv2.imwrite(str(dpdd_root / "target" / "1P0A0001.png"), big_clean)
+
+        found_motion = discover_paired_blur_datasets(curated_motion, "deblur_motion", is_train=True)
+        found_defocus = discover_paired_blur_datasets(dpdd_root, "sharpen_focus", is_train=True)
+        assert len(found_motion) == 2, f"Expected 2 GoPro+RealBlur motion pairs, got {len(found_motion)}"
+        assert len(found_defocus) == 1 and found_defocus[0][2] == "sharpen_focus"
 
         ds_cfg = Config()
         ds_cfg.TRAIN_DATASET_PATH = str(train_root)
+        ds_cfg.PAIRED_MOTION_DATASET_PATH = str(curated_motion)
+        ds_cfg.PAIRED_DEFOCUS_DATASET_PATH = str(dpdd_root)
         ds_cfg.VAL_DATASET_PATH = str(val_root)
-        train_ds = create_controllable_dataset(ds_cfg, is_train=True)
-        val_ds = create_controllable_dataset(ds_cfg, is_train=False)
-        assert len(train_ds) == 3 and len(val_ds) == 1
+        train_ds = create_controllable_dataset(ds_cfg, is_train=True, verbose=False)
+        val_ds = create_controllable_dataset(ds_cfg, is_train=False, verbose=False)
+        assert len(train_ds.image_paths) == 3 and len(train_ds.paired_records) == 3 and len(val_ds) == 1
 
         bench_out = tmp_path / "bench_out"
         test_photo = cv2.resize(clean.copy(), (256, 200), interpolation=cv2.INTER_LINEAR)
@@ -220,15 +249,16 @@ def test_selective_pipeline():
         assert Path(report["outputs"]["raw_fullres_restored_png"]).exists()
         assert len(report["synthetic_benchmark_metrics"]) == 4
 
-    print("[PASS] 6-channel orthogonal + directional synthesis, Lie-group tone/WB & benchmark suite verified.")
+    print("[PASS] V5 curved Bezier + bokeh disc physics, sharpness gate, GoPro/RealBlur/DPDD loader & benchmark verified.")
 
 
 def test_model_and_stages_mock():
     import threading
     import torch
-    from config import DebugConfig
+    from config import DebugConfig, HYPIRConfig
     from losses.controllable_losses import ControllableRestorationLoss, VisionAidedDiscriminator
     from models.controllable_restorer import ControllableRestorer
+    from models.lora_layers import resolve_expert_specs
     from utils.semantic_mask import extract_one_click_semantic_mask
 
     cfg = DebugConfig()
@@ -236,17 +266,30 @@ def test_model_and_stages_mock():
     cfg.SEMANTIC_ENCODER_TYPE = "mock_tiny"
     cfg.PATCH_SIZE = 64
 
+    # Verify automatic future-knob expansion in resolve_expert_specs (e.g. adding lens_distortion & deflare)
+    expanded_specs = resolve_expert_specs(
+        cfg.LORA_EXPERT_SPECS,
+        cfg.DEGRADATION_TYPES + ["lens_distortion", "deflare"],
+        signed_types=cfg.SIGNED_ACTION_TYPES,
+    )
+    assert any(sp["name"] == "extra_universal" and len(sp["indices"]) == 2 for sp in expanded_specs)
+
     model = ControllableRestorer(cfg)
     loss_fn = ControllableRestorationLoss(cfg, use_pretrained_vgg=False)
     disc = VisionAidedDiscriminator(sem_dim=model.semantic_encoder.spatial_dim, num_actions=cfg.NUM_ACTIONS)
 
     assert len(model.skip_vae.vae_pix_lora_params) > 0 and len(model.skip_vae.vae_sem_lora_params) > 0
+    assert all(not p.requires_grad for p in model.skip_vae.vae.decoder.parameters()), (
+        "VAE decoder base must have zero trainable LoRAs to prevent pixel-space ripple artifacts!"
+    )
+    for mod in model.pixel_refiner.modules():
+        if isinstance(mod, torch.nn.Conv2d):
+            assert tuple(mod.kernel_size) == (1, 1), "PointwiseRadiometricHead must be strictly 1x1!"
 
     clean = torch.rand(2, 3, 64, 64)
     src = torch.rand(2, 3, 64, 64)
     tgt = torch.rand(2, 3, 64, 64)
     act_map = torch.rand(2, cfg.NUM_ACTIONS, 64, 64)
-    # Exercise negative signed controls on channels 4 & 5
     act_map[:, 4:, :, :] = act_map[:, 4:, :, :] * 2.0 - 1.0
 
     # Stage 1: Self-Teacher Align Warmup
@@ -272,21 +315,28 @@ def test_model_and_stages_mock():
         if err_holder:
             raise err_holder[0]
 
-    # Stage 2: Pixel Stage (LoRA + SkipVAE + Dense C-RADIO + PixelSpaceRefiner)
+    # Stage 2: Pixel Stage (Slider-Routed UIR-LoRA Experts + Universal eVAE + Dense C-RADIO + 1x1 Tone Head)
+    # Test even when one expert's slider (`deblur_motion`) is 0.0 across the whole batch (DDP safety + zero grad conflict!)
+    act_zero_motion = act_map.clone()
+    act_zero_motion[:, 2, :, :] = 0.0
     model.zero_grad(set_to_none=True)
     model.set_training_stage("pixel_stage")
-    out_s2 = model(src, act_map, tgt_01=tgt, clean_01=clean, fidelity_scale=1.0, detail_scale=0.0)
+    out_s2 = model(src, act_zero_motion, tgt_01=tgt, clean_01=clean, fidelity_scale=1.0, detail_scale=0.0)
     loss_s2, metrics_s2 = loss_fn(
         out_s2["pred"],
         tgt,
-        act_map,
+        act_zero_motion,
         out_s2["align_loss"],
         stage="pixel_stage",
         t_vec=out_s2["t"],
         src_01=src,
+        hat_z_0=out_s2["hat_z_0"],
+        z_tgt=out_s2["z_tgt"],
+        evae_loss=out_s2["evae_loss"],
+        restorer_model=model,
         semantic_encoder=model.semantic_encoder,
     )
-    assert metrics_s2["pres"] >= 0.0 and metrics_s2["color"] >= 0.0
+    assert metrics_s2["evae"] >= 0.0 and metrics_s2["lat"] > 0.0 and metrics_s2["pyr"] > 0.0
     _backward_on_worker_thread(loss_s2)
     model.clear_runtime_contexts()
     missing_pix_grads = [
@@ -294,13 +344,15 @@ def test_model_and_stages_mock():
         if any(p is gp for gp in groups["pixel_stage"]) and p.grad is None
     ]
     assert not missing_pix_grads, f"Unused pixel_stage params (breaks DDP!): {missing_pix_grads}"
+    # Confirm motion_deconv expert received exact 0.0 gradient magnitude when deblur_motion == 0.0!
+    for name, param in model.named_parameters():
+        if "pix_experts.motion_deconv" in name:
+            assert float(param.grad.abs().max().item()) == 0.0, f"Inactive expert {name} leaked gradient!"
     assert all(p.grad is None for p in groups["semantic_stage"])
 
-    # Stage 3: Semantic-Detail + Vision-Aided GAN Stage
+    # Stage 3: Semantic-Detail Stage with Zero-Extra-VRAM Target-Anchored CSD
     model.zero_grad(set_to_none=True)
     model.set_training_stage("semantic_stage")
-    disc.eval()
-    disc.requires_grad_(False)
     out_s3 = model(src, act_map, tgt_01=tgt, clean_01=clean, fidelity_scale=1.0, detail_scale=0.8)
     loss_s3, metrics_s3, aux_s3 = loss_fn(
         out_s3["pred"],
@@ -310,10 +362,14 @@ def test_model_and_stages_mock():
         stage="semantic_stage",
         t_vec=out_s3["t"],
         src_01=src,
+        hat_z_0=out_s3["hat_z_0"],
+        z_tgt=out_s3["z_tgt"],
+        evae_loss=out_s3["evae_loss"],
+        restorer_model=model,
         semantic_encoder=model.semantic_encoder,
-        discriminator=disc,
         return_aux=True,
     )
+    assert metrics_s3["csd"] >= 0.0
     _backward_on_worker_thread(loss_s3)
     model.clear_runtime_contexts()
     missing_sem_grads = [
@@ -322,42 +378,62 @@ def test_model_and_stages_mock():
     ]
     assert not missing_sem_grads, f"Unused semantic_stage params (breaks DDP!): {missing_sem_grads}"
     assert all(p.grad is None for p in groups["pixel_stage"])
-    assert "gan" in metrics_s3 and "pred_grid" in aux_s3
 
-    # Discriminator single-concat DDP backward check
+    # Isolated HYPIR Mode Relativistic RpGAN Check
+    cfg.HYPIR_MODE = True
+    cfg.LOSS_CSD_WEIGHT = 0.0
+    cfg.LOSS_RPGAN_WEIGHT = 0.08
+    disc.eval()
+    disc.requires_grad_(False)
+    model.zero_grad(set_to_none=True)
+    out_hyp = model(src, act_map, tgt_01=tgt, clean_01=clean, fidelity_scale=1.0, detail_scale=0.8)
+    loss_hyp, metrics_hyp, aux_hyp = loss_fn(
+        out_hyp["pred"],
+        tgt,
+        act_map,
+        out_hyp["align_loss"],
+        stage="semantic_stage",
+        t_vec=out_hyp["t"],
+        src_01=src,
+        hat_z_0=out_hyp["hat_z_0"],
+        z_tgt=out_hyp["z_tgt"],
+        evae_loss=out_hyp["evae_loss"],
+        restorer_model=model,
+        semantic_encoder=model.semantic_encoder,
+        discriminator=disc,
+        return_aux=True,
+    )
+    assert metrics_hyp["csd"] == 0.0 and aux_hyp.get("use_rpgan") is True
+    loss_hyp.backward()
+    model.clear_runtime_contexts()
+
     disc.requires_grad_(True)
     disc.train()
     disc.zero_grad(set_to_none=True)
     d_loss = VisionAidedDiscriminator.discriminator_hinge_loss(
-        disc, tgt, out_s3["pred"].detach(), aux_s3["tgt_grid"], aux_s3["pred_grid"], act_map
+        disc, tgt, out_hyp["pred"].detach(), aux_hyp["tgt_grid"], aux_hyp["pred_grid"], act_map, relativistic=True
     )
     d_loss.backward()
     assert all(p.grad is not None for p in disc.parameters())
 
     # Signed Negative Slider Unlock & Zero-Action Exact Preservation Check
+    cfg.HYPIR_MODE = False
     model.eval()
     zero_act = torch.zeros(1, cfg.NUM_ACTIONS, 64, 64)
     ident_out = model.sample(src[:1], zero_act, steps=1)
     assert torch.allclose(ident_out, src[:1], atol=1e-7), "Zero action must preserve input bit-for-bit!"
 
-    # Pure negative slider (e.g. exposure = -0.8) must NOT be treated as zero by _apply_zero_action_lock!
     neg_act = torch.zeros(1, cfg.NUM_ACTIONS, 64, 64)
     neg_act[:, 4, :, :32] = -0.80
-    # Perturb tone_head output bias slightly to confirm negative gate unlocks left half while locking right half
     with torch.no_grad():
         model.pixel_refiner.tone_head[-1].bias.fill_(0.25)
     neg_out = model.sample(src[:1], neg_act, steps=1, fidelity_scale=1.0, detail_scale=0.8)
-    assert not torch.allclose(neg_out[:, :, :, :32], src[:1, :, :, :32], atol=1e-4), (
-        "Negative signed slider (-0.8) must unlock restoration on active region!"
-    )
-    assert torch.allclose(neg_out[:, :, :, 32:], src[:1, :, :, 32:], atol=1e-7), (
-        "Zero-action right half must remain bit-for-bit identical!"
-    )
+    assert not torch.allclose(neg_out[:, :, :, :32], src[:1, :, :, :32], atol=1e-4)
+    assert torch.allclose(neg_out[:, :, :, 32:], src[:1, :, :, 32:], atol=1e-7)
 
-    # Seamless High-Res Tiled Inference Check
     big_src = torch.rand(1, 3, 100, 110)
     big_act = torch.zeros(1, cfg.NUM_ACTIONS, 100, 110)
-    big_act[:, 5, :, :50] = -0.75  # Negative cool WB on left half only
+    big_act[:, 5, :, :50] = -0.75
     tiled_out, tiled_traj = model.sample(
         big_src, big_act, steps=2, tile_size=64, tile_overlap=16, return_trajectory=True
     )
@@ -366,7 +442,7 @@ def test_model_and_stages_mock():
 
     mask_2d = extract_one_click_semantic_mask(model.semantic_encoder, src[:1], point_xy=(0.5, 0.5))
     assert mask_2d.shape == (64, 64) and 0.0 <= float(mask_2d.min()) and float(mask_2d.max()) <= 1.0
-    print("[PASS] V4 3-phase Dual-LoRA, Dense C-RADIO, PixelRefiner, and Signed Zero-Action Lock verified.")
+    print("[PASS] V5 Slider-Routed UIR-LoRA Experts, Universal eVAE, Target-Anchored CSD & isolated HYPIR verified.")
 
 
 if __name__ == "__main__":

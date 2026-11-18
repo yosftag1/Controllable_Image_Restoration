@@ -50,7 +50,7 @@ PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-from config import Config, DebugConfig
+from config import Config, DebugConfig, HYPIRConfig
 from data.selective_dataset import (
     SelectiveDegradationPipeline,
     create_controllable_dataset,
@@ -532,22 +532,34 @@ def save_checkpoint(
         "optimizer_state_dict": optimizer.state_dict() if optimizer is not None else None,
         "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
         "model_config": {
-            "MODEL_VERSION": getattr(config, "MODEL_VERSION", "v4_orthogonal_directional"),
+            "MODEL_VERSION": getattr(config, "MODEL_VERSION", "v5_universal_experts"),
             "DEGRADATION_TYPES": list(config.DEGRADATION_TYPES),
             "SIGNED_ACTION_TYPES": list(getattr(config, "SIGNED_ACTION_TYPES", ["exposure", "warmth"])),
+            "LORA_EXPERT_SPECS": [dict(sp) for sp in getattr(config, "LORA_EXPERT_SPECS", [])],
             "SEMANTIC_ENCODER_TYPE": config.SEMANTIC_ENCODER_TYPE,
             "RADIO_MODEL_ID": getattr(config, "RADIO_MODEL_ID", "nvidia/C-RADIOv3-B"),
             "GENERATOR_BACKBONE": config.GENERATOR_BACKBONE,
-            "RESTORATION_MAX_TIMESTEP": getattr(config, "RESTORATION_MAX_TIMESTEP", 249),
+            "ADAPTIVE_TIMESTEP": bool(getattr(config, "ADAPTIVE_TIMESTEP", True)),
+            "RESTORATION_MIN_TIMESTEP": getattr(config, "RESTORATION_MIN_TIMESTEP", 49),
+            "RESTORATION_MAX_TIMESTEP": getattr(config, "RESTORATION_MAX_TIMESTEP", 279),
+            "HYPIR_MODE": bool(getattr(config, "HYPIR_MODE", False)),
+            "HYPIR_FIXED_TIMESTEP": getattr(config, "HYPIR_FIXED_TIMESTEP", 200),
+            "HYPIR_LORA_RANK_SCALE": getattr(config, "HYPIR_LORA_RANK_SCALE", 2.0),
             "PROMPT_SEQ_LEN": getattr(config, "PROMPT_SEQ_LEN", 77),
             "UNET_LORA_RANK": config.UNET_LORA_RANK,
             "UNET_LORA_ALPHA": config.UNET_LORA_ALPHA,
+            "SEM_DETAIL_LORA_RANK": getattr(config, "SEM_DETAIL_LORA_RANK", 16),
+            "SEM_DETAIL_LORA_ALPHA": getattr(config, "SEM_DETAIL_LORA_ALPHA", 16.0),
+            "USE_DORA": bool(getattr(config, "USE_DORA", True)),
+            "UNFREEZE_UNET_NORMS": bool(getattr(config, "UNFREEZE_UNET_NORMS", False)),
             "VAE_ENC_LORA_RANK": config.VAE_ENC_LORA_RANK,
-            "VAE_DEC_LORA_RANK": getattr(config, "VAE_DEC_LORA_RANK", config.VAE_ENC_LORA_RANK),
+            "VAE_ENC_LORA_ALPHA": getattr(config, "VAE_ENC_LORA_ALPHA", float(config.VAE_ENC_LORA_RANK)),
+            "VAE_DEC_LORA_RANK": getattr(config, "VAE_DEC_LORA_RANK", 0),
+            "VAE_DEC_LORA_ALPHA": getattr(config, "VAE_DEC_LORA_ALPHA", 0.0),
             "VISION_LORA_RANK": config.VISION_LORA_RANK,
             "ACTION_HIDDEN_DIM": config.ACTION_HIDDEN_DIM,
             "SPATIAL_MOD_HIDDEN_DIM": config.SPATIAL_MOD_HIDDEN_DIM,
-            "PIXEL_REFINER_CHANNELS": getattr(config, "PIXEL_REFINER_CHANNELS", 40),
+            "TONE_HEAD_HIDDEN_DIM": getattr(config, "TONE_HEAD_HIDDEN_DIM", 32),
         },
     }
     if filename == "model_latest.pt" and raw_disc is not None:
@@ -789,6 +801,7 @@ def train(
     remaining_pixel_epochs: int = None,
     epochs_overridden: bool = False,
     pixel_epochs_overridden: bool = False,
+    allow_schema_expand: bool = False,
 ):
     is_ddp = (
         "LOCAL_RANK" in os.environ
@@ -831,11 +844,17 @@ def train(
         if is_main:
             mode_tag = f"DDP ({world_size} GPUs)" if is_ddp else f"{device} (GPUs: {num_gpus})"
             gckpt_tag = "ON" if getattr(config, "GRADIENT_CHECKPOINTING", True) else "OFF"
+            t_tag = (
+                f"fixed_hypir_t={getattr(config, 'HYPIR_FIXED_TIMESTEP', 200)}"
+                if getattr(config, "HYPIR_MODE", False)
+                else f"t={getattr(config, 'RESTORATION_MIN_TIMESTEP', 49)}..{config.RESTORATION_MAX_TIMESTEP}"
+            )
+            exp_names = [sp.get("name", "?") for sp in getattr(config, "LORA_EXPERT_SPECS", [])]
             print(
                 f"Device: {mode_tag} | Global Batch Size: {config.BATCH_SIZE} "
                 f"({max(1, config.BATCH_SIZE // max(1, world_size))}/GPU) | "
-                f"Backbone: {config.GENERATOR_BACKBONE} (t={config.RESTORATION_MAX_TIMESTEP}) | "
-                f"Vision: {config.SEMANTIC_ENCODER_TYPE} | Controls: {config.NUM_ACTIONS} | "
+                f"Backbone: {config.GENERATOR_BACKBONE} ({t_tag}) | "
+                f"Experts: {exp_names} | Vision: {config.SEMANTIC_ENCODER_TYPE} | Controls: {config.NUM_ACTIONS} | "
                 f"AMP: {'ENABLED' if use_amp else 'DISABLED'} | GradCkpt: {gckpt_tag}",
                 flush=True,
             )
@@ -897,11 +916,19 @@ def train(
                 ckpt_cfg = ckpt.get("model_config") if isinstance(ckpt.get("model_config"), dict) else {}
                 ckpt_degs = ckpt_cfg.get("DEGRADATION_TYPES")
                 if ckpt_degs is not None and list(ckpt_degs) != list(config.DEGRADATION_TYPES):
-                    raise RuntimeError(
-                        f"Checkpoint at {resume_path} uses legacy {len(ckpt_degs)}-slider schema {ckpt_degs}, "
-                        f"which is incompatible with V4 {len(config.DEGRADATION_TYPES)}-control schema "
-                        f"{config.DEGRADATION_TYPES}. Start V4 training fresh without --resume!"
-                    )
+                    if not allow_schema_expand:
+                        raise RuntimeError(
+                            f"Checkpoint at {resume_path} uses {len(ckpt_degs)}-slider schema {ckpt_degs}, "
+                            f"which differs from current {len(config.DEGRADATION_TYPES)}-control schema "
+                            f"{config.DEGRADATION_TYPES}. Pass --allow-schema-expand to warm-start matching "
+                            f"named LoRA experts when adding new knobs, or start V5 fresh without --resume!"
+                        )
+                    if is_main:
+                        print(
+                            f"[SchemaExpand] Warm-starting matching named LoRA experts from {ckpt_degs} -> "
+                            f"{config.DEGRADATION_TYPES}",
+                            flush=True,
+                        )
 
                 adapter_state = ckpt.get("trainable_state_dict") or ckpt.get("model_state_dict")
                 if adapter_state is not None:
@@ -910,7 +937,7 @@ def train(
                         print(
                             f"[Warning] Partial adapter match on resume "
                             f"(missing={len(missing_keys)}, unexpected={len(unexpected_keys)}). "
-                            f"If resuming from an older V1-V3 checkpoint, start V4 fresh without --resume!",
+                            f"If resuming from an older V1-V4 single-LoRA checkpoint, start V5 fresh without --resume!",
                             flush=True,
                         )
                 start_epoch = int(ckpt.get("epoch", 0)) + 1
@@ -1069,7 +1096,10 @@ def train(
                 if device.type == "cuda":
                     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
-                gan_w = float(getattr(config, "LOSS_GAN_WEIGHT", 0.08))
+                gan_w = max(
+                    float(getattr(config, "LOSS_GAN_WEIGHT", 0.0)),
+                    float(getattr(config, "LOSS_RPGAN_WEIGHT", 0.0)),
+                )
                 if stage in ("semantic_stage", "joint") and gan_w > 0.0:
                     raw_disc = VisionAidedDiscriminator(
                         sem_dim=raw_model.semantic_encoder.spatial_dim,
@@ -1211,6 +1241,10 @@ def train(
                                 stage=stage,
                                 t_vec=out["t"],
                                 src_01=src,
+                                hat_z_0=out.get("hat_z_0"),
+                                z_tgt=out.get("z_tgt"),
+                                evae_loss=out.get("evae_loss"),
+                                restorer_model=raw_model,
                                 semantic_encoder=raw_model.semantic_encoder,
                                 discriminator=raw_disc,
                                 return_aux=True,
@@ -1252,6 +1286,7 @@ def train(
                             real_grid=aux["tgt_grid"],
                             fake_grid=aux["pred_grid"],
                             action_map=act_map,
+                            relativistic=bool(aux.get("use_rpgan", False)),
                         )
                     if disc_scaler is not None and use_amp:
                         disc_scaler.scale(d_loss).backward()
@@ -1288,20 +1323,22 @@ def train(
                             loss_parts = f"loss={avg_tot:.4f} align={avg_al:.4f}"
                         elif stage == "pixel_stage":
                             avg_l1 = running.get("l1", 0.0) / step_idx
-                            avg_col = running.get("color", 0.0) / step_idx
-                            avg_perc = running.get("perc", 0.0) / step_idx
+                            avg_lat = running.get("lat", 0.0) / step_idx
+                            avg_ev = running.get("evae", 0.0) / step_idx
+                            avg_pyr = running.get("pyr", 0.0) / step_idx
                             loss_parts = (
-                                f"loss={avg_tot:.4f} l1={avg_l1:.4f} col={avg_col:.4f} "
-                                f"perc={avg_perc:.4f} align={avg_al:.4f}"
+                                f"loss={avg_tot:.4f} l1={avg_l1:.4f} lat={avg_lat:.4f} "
+                                f"evae={avg_ev:.4f} pyr={avg_pyr:.4f}"
                             )
                         else:
                             avg_l1 = running.get("l1", 0.0) / step_idx
-                            avg_col = running.get("color", 0.0) / step_idx
+                            avg_lat = running.get("lat", 0.0) / step_idx
+                            avg_csd = running.get("csd", 0.0) / step_idx
                             avg_perc = running.get("perc", 0.0) / step_idx
-                            avg_d = running.get("d_loss", 0.0) / step_idx
+                            avg_hf = running.get("hf_g", 0.0) / step_idx
                             loss_parts = (
-                                f"loss={avg_tot:.4f} l1={avg_l1:.4f} col={avg_col:.4f} "
-                                f"perc={avg_perc:.4f} d={avg_d:.3f}"
+                                f"loss={avg_tot:.4f} l1={avg_l1:.4f} lat={avg_lat:.4f} "
+                                f"csd={avg_csd:.4f} perc={avg_perc:.4f} hfg={avg_hf:.4f}"
                             )
                         print(
                             f"[Epoch {epoch:03d}/{config.EPOCHS} | {stage}] "
@@ -1407,18 +1444,51 @@ def train(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train Controllable Pretrained Image Restoration Model (V4)")
+    parser = argparse.ArgumentParser(description="Train Controllable Pretrained Image Restoration Model (V5)")
     parser.add_argument("--debug", action="store_true", help="Use DebugConfig for quick verification")
+    parser.add_argument(
+        "--hypir-mode",
+        action="store_true",
+        help="Run isolated HYPIR experimental mode (deterministic fixed step + 2x LoRA rank + RpGAN, no CSD)",
+    )
     parser.add_argument("--mock", action="store_true", help="Use offline mock_tiny backbones (no HF downloads)")
     parser.add_argument("--no-ddp", action="store_true", help="Disable automatic multi-GPU DDP worker launch")
-    parser.add_argument("--data-root", type=str, default=None, help="Dataset root (DIV2K or image folder)")
-    parser.add_argument("--train-root", type=str, default=None, help="Explicit training image folder (e.g. Kaggle df2k-ost/train)")
-    parser.add_argument("--val-root", type=str, default=None, help="Explicit validation image folder (e.g. Kaggle DIV2K_valid)")
+    parser.add_argument("--data-root", type=str, default=None, help="Dataset root (DIV2K, LSDIR, or image folder)")
+    parser.add_argument("--train-root", type=str, default=None, help="Clean reference folder(s), comma-separated allowed")
+    parser.add_argument("--val-root", type=str, default=None, help="Validation reference image folder (e.g. DIV2K_valid)")
+    parser.add_argument(
+        "--paired-motion-root",
+        type=str,
+        default=None,
+        help="Real motion-deblurring dataset root(s) (e.g. GoPro / HIDE / RealBlur curated Kaggle pack)",
+    )
+    parser.add_argument(
+        "--paired-defocus-root",
+        type=str,
+        default=None,
+        help="Real optical-defocus dataset root(s) (e.g. DPDD / RealDOF)",
+    )
+    parser.add_argument(
+        "--paired-prob",
+        type=float,
+        default=None,
+        help="Fraction of training batches sampled from real paired camera datasets (default: 0.35)",
+    )
     parser.add_argument("--output-dir", type=str, default=None, help="Output directory for sweep grids")
     parser.add_argument("--checkpoint-dir", type=str, default=None, help="Directory for adapter checkpoints")
     parser.add_argument("--log-dir", type=str, default=None, help="Directory for training logs")
-    parser.add_argument("--resume", type=str, default=None, help="Path to V4 model_latest.pt / model_best.pt checkpoint")
-    parser.add_argument("--backbone", type=str, choices=["sd-turbo", "tiny-sd", "bk-sdm-tiny", "mock_tiny"], default=None)
+    parser.add_argument("--resume", type=str, default=None, help="Path to V5 model_latest.pt / model_best.pt checkpoint")
+    parser.add_argument(
+        "--allow-schema-expand",
+        action="store_true",
+        help="Allow warm-starting existing named LoRA experts when adding new control sliders",
+    )
+    parser.add_argument(
+        "--backbone",
+        type=str,
+        choices=["sd-2.1-base", "sd-turbo", "sd-1.5", "bk-sdm-small", "tiny-sd", "bk-sdm-tiny", "mock_tiny"],
+        default=None,
+    )
     parser.add_argument("--vision-encoder", type=str, choices=["c_radio", "dinov3_siglip2", "mock_tiny"], default=None)
     parser.add_argument("--radio-id", type=str, default=None, help="Override HF repo ID for C-RADIO (e.g. nvidia/C-RADIOv3-B)")
     parser.add_argument("--training-mode", type=str, choices=["staged", "joint"], default=None)
@@ -1440,7 +1510,17 @@ def main():
     parser.add_argument("--tqdm", action="store_true", help="Use interactive tqdm progress bar instead of line logs")
     args = parser.parse_args()
 
-    config = DebugConfig() if args.debug else Config()
+    if args.debug:
+        config = DebugConfig()
+        if args.hypir_mode:
+            for k in dir(HYPIRConfig):
+                if k.isupper():
+                    setattr(config, k, getattr(HYPIRConfig, k))
+    elif args.hypir_mode:
+        config = HYPIRConfig()
+    else:
+        config = Config()
+
     if args.mock:
         config.GENERATOR_BACKBONE = "mock_tiny"
         config.SEMANTIC_ENCODER_TYPE = "mock_tiny"
@@ -1458,6 +1538,12 @@ def main():
         config.TRAIN_DATASET_PATH = args.train_root
     if args.val_root:
         config.VAL_DATASET_PATH = args.val_root
+    if args.paired_motion_root:
+        config.PAIRED_MOTION_DATASET_PATH = args.paired_motion_root
+    if args.paired_defocus_root:
+        config.PAIRED_DEFOCUS_DATASET_PATH = args.paired_defocus_root
+    if args.paired_prob is not None:
+        config.PAIRED_REAL_PROB = float(np.clip(args.paired_prob, 0.0, 1.0))
     if args.output_dir:
         config.OUTPUT_DIR = args.output_dir
     if args.checkpoint_dir:
@@ -1517,6 +1603,7 @@ def main():
         remaining_pixel_epochs=args.remaining_pixel_epochs,
         epochs_overridden=(args.epochs is not None),
         pixel_epochs_overridden=(args.pixel_epochs is not None),
+        allow_schema_expand=args.allow_schema_expand,
     )
 
 
