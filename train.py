@@ -623,8 +623,8 @@ def _launch_ddp_subprocess(num_gpus: int, config: Config = None) -> None:
         env["AGY_PARENT_IPYTHON"] = "1"
     else:
         env.pop("AGY_PARENT_IPYTHON", None)
-    if "--tqdm" not in sys.argv[1:]:
-        env.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+    # Keep HF download progress bars visible on Rank 0 (lines 26-27 mute non-zero ranks automatically)
+    env.pop("HF_HUB_DISABLE_PROGRESS_BARS", None)
 
     cmd = [
         sys.executable,
@@ -1438,7 +1438,18 @@ def train(
 
             if is_ddp:
                 dist.barrier()
-    finally:
+    except BaseException as fatal_err:
+        if not isinstance(fatal_err, KeyboardInterrupt):
+            import traceback
+
+            sys.stdout.write(f"\n[Rank {rank} Fatal Error] {fatal_err}\n")
+            traceback.print_exc(file=sys.stdout)
+            sys.stdout.flush()
+            if is_ddp:
+                # Exit immediately so torchrun terminates sibling ranks in <1s instead of hanging dist.barrier()!
+                os._exit(1)
+        raise
+    else:
         if is_ddp and dist.is_initialized():
             dist.destroy_process_group()
 

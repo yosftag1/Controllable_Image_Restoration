@@ -120,7 +120,7 @@ class SemanticEncoder(nn.Module):
                     inject_vision_lora(self.radio, rank=rank, alpha=alpha, dropout=dropout)
                 )
                 if os.environ.get("RANK", "0") == "0":
-                    print(f"[SemanticEncoder] Loaded {chosen_id} (patch_size={self.patch_size})")
+                    print(f"[SemanticEncoder] Loaded {chosen_id} (patch_size={self.patch_size})", flush=True)
             except ModuleNotFoundError as mod_err:
                 print(
                     f"[Warning] {chosen_id} remote code requires '{mod_err.name}' "

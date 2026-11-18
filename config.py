@@ -31,13 +31,26 @@ class Config:
     #   with negative prompts in Stage 3 (`LoRA OFF` on the same frozen base UNet!).
     GENERATOR_BACKBONE = "sd-2.1-base"
 
+    # Note: Stability AI retired `stabilityai/stable-diffusion-2-1-base`; we default to the
+    # verified diffusers mirror `sd2-community/stable-diffusion-2-1-base` with automatic mirror fallback!
     GENERATOR_REPO_MAP = {
-        "sd-2.1-base": "stabilityai/stable-diffusion-2-1-base",
+        "sd-2.1-base": "sd2-community/stable-diffusion-2-1-base",
         "sd-turbo": "stabilityai/sd-turbo",
         "sd-1.5": "stable-diffusion-v1-5/stable-diffusion-v1-5",
         "bk-sdm-small": "nota-ai/bk-sdm-small",
         "tiny-sd": "segmind/tiny-sd",
         "bk-sdm-tiny": "nota-ai/bk-sdm-tiny",
+    }
+    GENERATOR_FALLBACK_REPOS = {
+        "sd-2.1-base": [
+            "sd2-community/stable-diffusion-2-1-base",
+            "Manojb/stable-diffusion-2-1-base",
+            "stable-diffusion-v1-5/stable-diffusion-v1-5",
+        ],
+        "sd-1.5": [
+            "stable-diffusion-v1-5/stable-diffusion-v1-5",
+            "runwayml/stable-diffusion-v1-5",
+        ],
     }
 
     # Expandable Task-Routed Pixel LoRA Experts (UIR-LoRA + Strip/Multi-Scale Conv-LoRA):

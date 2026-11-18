@@ -164,8 +164,19 @@ def _precompute_openclip_prompt_pair(
     try:
         from transformers import AutoTokenizer, CLIPTextModel
 
+        if is_rank0:
+            print(f"[PromptAnchor] Computing pos/neg CLIP prompt anchors from '{repo_id}'...", flush=True)
         tokenizer = load_hf_public_safe(AutoTokenizer.from_pretrained, repo_id, subfolder="tokenizer")
-        text_encoder = load_hf_public_safe(CLIPTextModel.from_pretrained, repo_id, subfolder="text_encoder")
+        try:
+            text_encoder = load_hf_public_safe(
+                CLIPTextModel.from_pretrained,
+                repo_id,
+                subfolder="text_encoder",
+                variant="fp16",
+                torch_dtype=torch.float32,
+            )
+        except Exception:
+            text_encoder = load_hf_public_safe(CLIPTextModel.from_pretrained, repo_id, subfolder="text_encoder")
         text_encoder.eval()
         max_len = int(getattr(tokenizer, "model_max_length", prompt_seq_len) or prompt_seq_len)
         if max_len <= 0 or max_len > 256:
@@ -563,9 +574,60 @@ class ControllableRestorer(nn.Module):
         else:
             from diffusers import AutoencoderKL, DDPMScheduler, UNet2DConditionModel
 
-            repo_id = config.GENERATOR_REPO_MAP.get(backbone_key, config.GENERATOR_BACKBONE)
-            raw_vae = load_hf_public_safe(AutoencoderKL.from_pretrained, repo_id, subfolder="vae")
-            raw_unet = load_hf_public_safe(UNet2DConditionModel.from_pretrained, repo_id, subfolder="unet")
+            primary_repo = config.GENERATOR_REPO_MAP.get(backbone_key, config.GENERATOR_BACKBONE)
+            fallback_map = getattr(config, "GENERATOR_FALLBACK_REPOS", {})
+            candidate_repos = list(fallback_map.get(backbone_key, [primary_repo]))
+            if primary_repo not in candidate_repos:
+                candidate_repos.insert(0, primary_repo)
+
+            is_rank0 = os.environ.get("RANK", "0") == "0"
+            raw_vae = None
+            raw_unet = None
+            last_repo_err = None
+            for cand_repo in candidate_repos:
+                try:
+                    if is_rank0:
+                        print(f"[Restorer] Loading VAE & UNet from '{cand_repo}'...", flush=True)
+                    try:
+                        raw_vae = load_hf_public_safe(
+                            AutoencoderKL.from_pretrained,
+                            cand_repo,
+                            subfolder="vae",
+                            variant="fp16",
+                            torch_dtype=torch.float32,
+                        )
+                    except Exception:
+                        raw_vae = load_hf_public_safe(AutoencoderKL.from_pretrained, cand_repo, subfolder="vae")
+
+                    try:
+                        raw_unet = load_hf_public_safe(
+                            UNet2DConditionModel.from_pretrained,
+                            cand_repo,
+                            subfolder="unet",
+                            variant="fp16",
+                            torch_dtype=torch.float32,
+                        )
+                    except Exception:
+                        raw_unet = load_hf_public_safe(
+                            UNet2DConditionModel.from_pretrained, cand_repo, subfolder="unet"
+                        )
+                    repo_id = cand_repo
+                    if is_rank0:
+                        print(f"[Restorer] Loaded generator backbone '{repo_id}'", flush=True)
+                    break
+                except Exception as repo_err:
+                    last_repo_err = repo_err
+                    if is_rank0:
+                        print(
+                            f"[Restorer] Repo '{cand_repo}' unavailable ({repo_err}); trying next mirror...",
+                            flush=True,
+                        )
+
+            if raw_vae is None or raw_unet is None:
+                raise RuntimeError(
+                    f"Could not load generator backbone '{backbone_key}' from candidates {candidate_repos}: {last_repo_err}"
+                )
+
             try:
                 sched = load_hf_public_safe(DDPMScheduler.from_pretrained, repo_id, subfolder="scheduler")
                 if getattr(sched, "alphas_cumprod", None) is not None:

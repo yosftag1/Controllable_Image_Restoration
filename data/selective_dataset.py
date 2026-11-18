@@ -718,7 +718,7 @@ class ControllableRestorationDataset(_TorchDataset):
         self._decoded_ring = []
 
     def __len__(self):
-        return max(len(self.image_paths), len(self.paired_records))
+        return len(self.image_paths) if self.image_paths else len(self.paired_records)
 
     def set_curriculum_boost(self, boost: float) -> None:
         self.pipeline.curriculum_single_boost = float(np.clip(boost, 0.0, 1.0))
@@ -956,6 +956,16 @@ def unpack_batch_action_map(batch: dict, device) -> "torch.Tensor":
 _IMG_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff"}
 _BLUR_DIR_NAMES = {"blur", "blur_gamma", "blurred", "defocus", "input", "inputc", "source"}
 _SHARP_DIR_NAMES = {"sharp", "gt", "groundtruth", "ground_truth", "target", "clean"}
+# Exclude synthetic low-res face/OCR subsets (`CelebA`, `Text`) & dark un-tonemapped linear RAW (`RealBlur_R`)
+# inside curated collections so paired training stays 100% high-res natural sRGB photography!
+_EXCLUDED_PAIR_SUBSTRINGS = ("celeba", "text", "bmvc", "widerface", "realblur_r", "realblur-r")
+
+
+def _is_excluded_pair_token(path_or_name: str, exclude_domain_subsets: bool = True) -> bool:
+    if not exclude_domain_subsets:
+        return False
+    low = path_or_name.lower()
+    return any(tok in low for tok in _EXCLUDED_PAIR_SUBSTRINGS)
 
 
 def _collect_images(folder: Path) -> List[Path]:
@@ -993,8 +1003,9 @@ def discover_paired_blur_datasets(
     roots_spec,
     default_channel: str = "deblur_motion",
     is_train: bool = True,
+    exclude_domain_subsets: bool = True,
 ) -> List[Tuple[Path, Path, str]]:
-    """Auto-discover paired `(blur_path, sharp_path, blur_channel)` across GoPro, HIDE, RealBlur & DPDD!"""
+    """Auto-discover paired `(blur_path, sharp_path, blur_channel)` across GoPro, HIDE, RealBlur-J & DPDD!"""
     if not roots_spec:
         return []
     if isinstance(roots_spec, (str, Path)):
@@ -1011,11 +1022,12 @@ def discover_paired_blur_datasets(
         root_path = Path(r_str)
         root_pairs: List[Tuple[Path, Path, str]] = []
 
-        # 1. Check RealBlur-style `.txt` pair index files first
-        for cur_dir, _dirs, files in os.walk(r_str, followlinks=True):
+        # 1. Check RealBlur-style `.txt` pair index files first (pruning CelebA/Text/RAW subtrees immediately)
+        for cur_dir, dirs, files in os.walk(r_str, followlinks=True):
+            dirs[:] = [d for d in dirs if not _is_excluded_pair_token(d, exclude_domain_subsets)]
             for fname in files:
                 low_f = fname.lower()
-                if not low_f.endswith(".txt"):
+                if not low_f.endswith(".txt") or _is_excluded_pair_token(low_f, exclude_domain_subsets):
                     continue
                 if is_train and ("test" in low_f or "val" in low_f) and "train" not in low_f:
                     continue
@@ -1030,6 +1042,10 @@ def discover_paired_blur_datasets(
                     parts = line.strip().split()
                     if len(parts) != 2:
                         continue
+                    if _is_excluded_pair_token(parts[0], exclude_domain_subsets) or _is_excluded_pair_token(
+                        parts[1], exclude_domain_subsets
+                    ):
+                        continue
                     p0, p1 = Path(cur_dir) / parts[0], Path(cur_dir) / parts[1]
                     if not (p0.exists() and p1.exists()):
                         p0, p1 = root_path / parts[0], root_path / parts[1]
@@ -1043,6 +1059,7 @@ def discover_paired_blur_datasets(
 
         # 2. Discover sibling `(blur, sharp)` / `(inputC, target)` / `(blur, GT)` directory pairs
         for cur_dir, dirs, _files in os.walk(r_str, followlinks=True):
+            dirs[:] = [d for d in dirs if not _is_excluded_pair_token(d, exclude_domain_subsets)]
             lower_map: Dict[str, str] = {d.lower(): d for d in dirs}
             blur_subs = [lower_map[k] for k in lower_map if k in _BLUR_DIR_NAMES]
             sharp_subs = [lower_map[k] for k in lower_map if k in _SHARP_DIR_NAMES]

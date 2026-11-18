@@ -54,6 +54,7 @@ def test_selective_pipeline():
     assert abs(dist_sum - 1.0) < 1e-6, f"Action distribution must sum to 1.0, got {dist_sum}"
     assert cfg.NUM_ACTIONS == 6, f"Expected 6 orthogonal controls, got {cfg.NUM_ACTIONS}"
     assert cfg.GENERATOR_BACKBONE == "sd-2.1-base", "Default V5 backbone must be sd-2.1-base!"
+    assert cfg.GENERATOR_REPO_MAP["sd-2.1-base"] == "sd2-community/stable-diffusion-2-1-base"
     assert "sd-turbo" in cfg.GENERATOR_REPO_MAP and "bk-sdm-small" in cfg.GENERATOR_REPO_MAP
     assert cfg.ADAPTIVE_TIMESTEP is True and 10 <= cfg.RESTORATION_MIN_TIMESTEP < cfg.RESTORATION_MAX_TIMESTEP
     assert cfg.VAE_DEC_LORA_RANK == 0, "VAE decoder must remain frozen to protect SD's natural image manifold!"
@@ -188,6 +189,13 @@ def test_selective_pipeline():
             "RealBlur/scene_001/gt/gt_1.png RealBlur/scene_001/blur/blur_1.png\n", encoding="utf-8"
         )
 
+        # Also verify synthetic CelebA / Text / linear-RAW RealBlur_R subtrees are auto-pruned!
+        for noisy_sub in ("CelebA", "Text_OCR", "RealBlur_R"):
+            (curated_motion / noisy_sub / "blur").mkdir(parents=True)
+            (curated_motion / noisy_sub / "sharp").mkdir(parents=True)
+            cv2.imwrite(str(curated_motion / noisy_sub / "blur" / "bad.png"), big_blur)
+            cv2.imwrite(str(curated_motion / noisy_sub / "sharp" / "bad.png"), big_clean)
+
         dpdd_root = tmp_path / "DPDD" / "train"
         (dpdd_root / "inputC").mkdir(parents=True)
         (dpdd_root / "target").mkdir(parents=True)
@@ -196,7 +204,7 @@ def test_selective_pipeline():
 
         found_motion = discover_paired_blur_datasets(curated_motion, "deblur_motion", is_train=True)
         found_defocus = discover_paired_blur_datasets(dpdd_root, "sharpen_focus", is_train=True)
-        assert len(found_motion) == 2, f"Expected 2 GoPro+RealBlur motion pairs, got {len(found_motion)}"
+        assert len(found_motion) == 2, f"Expected 2 GoPro+RealBlur-J motion pairs (CelebA/Text pruned), got {len(found_motion)}"
         assert len(found_defocus) == 1 and found_defocus[0][2] == "sharpen_focus"
 
         ds_cfg = Config()
@@ -206,7 +214,7 @@ def test_selective_pipeline():
         ds_cfg.VAL_DATASET_PATH = str(val_root)
         train_ds = create_controllable_dataset(ds_cfg, is_train=True, verbose=False)
         val_ds = create_controllable_dataset(ds_cfg, is_train=False, verbose=False)
-        assert len(train_ds.image_paths) == 3 and len(train_ds.paired_records) == 3 and len(val_ds) == 1
+        assert len(train_ds) == 3 and len(train_ds.image_paths) == 3 and len(train_ds.paired_records) == 3 and len(val_ds) == 1
 
         bench_out = tmp_path / "bench_out"
         test_photo = cv2.resize(clean.copy(), (256, 200), interpolation=cv2.INTER_LINEAR)

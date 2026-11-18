@@ -1,6 +1,6 @@
 # Controllable Pretrained Image Restoration (V5)
 
-An **orthogonal, spatially controllable & expandable universal image restoration framework** built on **Semantic Vision Foundation Models** (`nvidia/C-RADIOv3-B` default, `nvidia/C-RADIOv2-B`, or `DINOv3 / DINOv2-Registers + SigLIP 2`) and **Pretrained Diffusion Score Priors** (`stabilityai/stable-diffusion-2-1-base` default, plus `sd-turbo`, `sd-1.5`, `bk-sdm-small`, and `tiny-sd`).
+An **orthogonal, spatially controllable & expandable universal image restoration framework** built on **Semantic Vision Foundation Models** (`nvidia/C-RADIOv3-B` default, `nvidia/C-RADIOv2-B`, or `DINOv3 / DINOv2-Registers + SigLIP 2`) and **Pretrained Diffusion Score Priors** (`sd2-community/stable-diffusion-2-1-base` default, plus `sd-turbo`, `sd-1.5`, `bk-sdm-small`, and `tiny-sd`).
 
 Instead of forcing every photo into an uncontrolled blind restoration or training task-specific blur estimators, V5 keeps **100% of control inside your 6-Channel Spatial Control Overlay** $\mathbf{A}(y, x)$ plus a single **Generative Texture Detail** dial ($\lambda_{\text{det}} \in [0, 1]$), and makes adding future knobs (e.g., lens distortion, lens flare) plug-and-play:
 
