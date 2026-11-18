@@ -225,7 +225,7 @@ class Config:
     NUM_WORKERS = 4
     DATALOADER_PREFETCH_FACTOR = 4
     DECODE_CACHE_SIZE = 16
-    CROPS_PER_DECODE = 6
+    CROPS_PER_DECODE = 8
     DEVICE = "cuda"
     USE_AMP = True
     GRADIENT_CHECKPOINTING = True
@@ -266,7 +266,8 @@ class Config:
     CSD_CFG_SCALE = 4.5                   # Negative-prompt suppression strength in Target-Anchored CSD
     CSD_TIMESTEP_RANGE = (40, 320)        # TSD-SR DASM low-to-mid noise band for texture crispness without drift
     LOSS_CONTRAST_WEIGHT = 0.0
-    LOSS_PIXEL_STAGE_SEM_WEIGHT = 0.10
+    # Disabled in Stage 2 (`pixel_stage` already uses latent+eVAE+L1+pyramid+VGG; avoids a 2nd uncheckpointed C-RADIO backward!)
+    LOSS_PIXEL_STAGE_SEM_WEIGHT = 0.0
     LOSS_SEM_CONSISTENCY_WEIGHT = 0.22
     LOSS_GAN_WEIGHT = 0.0
     PERCEPTUAL_LAYERS = ["relu2_2", "relu3_4", "relu4_4"]

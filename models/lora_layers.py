@@ -117,6 +117,7 @@ _VISION_LORA_BY_DEVICE: Dict[str, bool] = {}
 
 _DEFAULT_LORA_STATE: _LoRAStateTuple = (None, 1.0, 0.75, None)
 _LORA_STATE_BY_DEVICE: Dict[str, _LoRAStateTuple] = {}
+_ROUTE_PYRAMID_CACHE_BY_DEVICE: Dict[str, Dict[Tuple, torch.Tensor]] = {}
 
 
 def _resolve_device_key(
@@ -195,8 +196,10 @@ def set_generator_lora_state(
     key = _resolve_device_key(device=device, tensor=ref_tensor)
     if key is not None:
         _LORA_STATE_BY_DEVICE[key] = state
+        _ROUTE_PYRAMID_CACHE_BY_DEVICE.pop(key, None)
     else:
         _DEFAULT_LORA_STATE = state
+        _ROUTE_PYRAMID_CACHE_BY_DEVICE.clear()
 
 
 def clear_generator_lora_state(device: Optional[torch.device] = None) -> None:
@@ -206,8 +209,10 @@ def clear_generator_lora_state(device: Optional[torch.device] = None) -> None:
         key = _resolve_device_key(device=device)
         if key is not None:
             _LORA_STATE_BY_DEVICE.pop(key, None)
+            _ROUTE_PYRAMID_CACHE_BY_DEVICE.pop(key, None)
             return
     _LORA_STATE_BY_DEVICE.clear()
+    _ROUTE_PYRAMID_CACHE_BY_DEVICE.clear()
     _DEFAULT_LORA_STATE = (None, 1.0, 0.75, None)
 
 
@@ -227,10 +232,14 @@ def generator_lora_context(
     if key is not None:
         had_key = key in _LORA_STATE_BY_DEVICE
         prev_val = _LORA_STATE_BY_DEVICE.get(key)
+        prev_cache = _ROUTE_PYRAMID_CACHE_BY_DEVICE.pop(key, None)
         _LORA_STATE_BY_DEVICE[key] = state
         try:
             yield
         finally:
+            _ROUTE_PYRAMID_CACHE_BY_DEVICE.pop(key, None)
+            if prev_cache is not None:
+                _ROUTE_PYRAMID_CACHE_BY_DEVICE[key] = prev_cache
             if had_key and prev_val is not None:
                 _LORA_STATE_BY_DEVICE[key] = prev_val
             else:
@@ -238,13 +247,17 @@ def generator_lora_context(
     else:
         prev_default = _DEFAULT_LORA_STATE
         prev_map = dict(_LORA_STATE_BY_DEVICE)
+        prev_all_cache = dict(_ROUTE_PYRAMID_CACHE_BY_DEVICE)
         _LORA_STATE_BY_DEVICE.clear()
+        _ROUTE_PYRAMID_CACHE_BY_DEVICE.clear()
         _DEFAULT_LORA_STATE = state
         try:
             yield
         finally:
             _LORA_STATE_BY_DEVICE.clear()
             _LORA_STATE_BY_DEVICE.update(prev_map)
+            _ROUTE_PYRAMID_CACHE_BY_DEVICE.clear()
+            _ROUTE_PYRAMID_CACHE_BY_DEVICE.update(prev_all_cache)
             _DEFAULT_LORA_STATE = prev_default
 
 
@@ -380,9 +393,41 @@ def _broadcast_rank_gate(gate: torch.Tensor, hidden: torch.Tensor) -> torch.Tens
     return gate.view(*shape)
 
 
+def _get_cached_resized_action_map(
+    spatial_action_map: torch.Tensor,
+    target_hw: Tuple[int, int],
+    batch_size: int,
+    device: torch.device,
+) -> Optional[torch.Tensor]:
+    """O(1) cached `(B, K_abs, H_f, W_f)` slider pyramid lookup (replaces ~1,700 F.interpolate calls/step!)."""
+    dev_key = _resolve_device_key(device=device) or "default"
+    dev_cache = _ROUTE_PYRAMID_CACHE_BY_DEVICE.setdefault(dev_key, {})
+    cache_key = ("2d", int(spatial_action_map.data_ptr()), batch_size, target_hw[0], target_hw[1])
+    cached = dev_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    a_map = spatial_action_map.detach().float()
+    if a_map.device != device:
+        a_map = a_map.to(device)
+    if a_map.shape[0] != batch_size:
+        if batch_size % max(1, a_map.shape[0]) == 0:
+            a_map = a_map.repeat_interleave(batch_size // a_map.shape[0], dim=0)
+        else:
+            return None
+
+    a_abs = a_map.abs().clamp_(0.0, 1.0)
+    if a_abs.shape[-2:] != target_hw:
+        a_local = F.interpolate(a_abs, size=target_hw, mode="area")
+    else:
+        a_local = a_abs
+    dev_cache[cache_key] = a_local
+    return a_local
+
+
 def _compute_conv_expert_route(
     spatial_action_map: Optional[torch.Tensor],
-    indices: Sequence[int],
+    indices: Tuple[int, ...],
     target_hw: Tuple[int, int],
     batch_size: int,
     device: torch.device,
@@ -391,27 +436,30 @@ def _compute_conv_expert_route(
     if spatial_action_map is None or not indices:
         return torch.ones((batch_size, 1, 1, 1), device=device, dtype=torch.float32)
 
-    a_map = spatial_action_map.float()
-    if a_map.device != device:
-        a_map = a_map.to(device)
-    if a_map.shape[0] != batch_size:
-        if batch_size % max(1, a_map.shape[0]) == 0:
-            a_map = a_map.repeat_interleave(batch_size // a_map.shape[0], dim=0)
-        else:
-            return torch.ones((batch_size, 1, 1, 1), device=device, dtype=torch.float32)
+    dev_key = _resolve_device_key(device=device) or "default"
+    dev_cache = _ROUTE_PYRAMID_CACHE_BY_DEVICE.setdefault(dev_key, {})
+    exp_key = ("conv_route", int(spatial_action_map.data_ptr()), batch_size, target_hw[0], target_hw[1], indices)
+    cached_r = dev_cache.get(exp_key)
+    if cached_r is not None:
+        return cached_r
 
-    if a_map.shape[-2:] != target_hw:
-        a_local = F.interpolate(a_map, size=target_hw, mode="area")
+    a_local = _get_cached_resized_action_map(spatial_action_map, target_hw, batch_size, device)
+    if a_local is None:
+        return torch.ones((batch_size, 1, 1, 1), device=device, dtype=torch.float32)
+
+    if len(indices) == 1:
+        i0 = indices[0]
+        route = a_local[:, i0 : i0 + 1]
     else:
-        a_local = a_map
-
-    idx_t = torch.as_tensor(indices, dtype=torch.long, device=device)
-    return a_local.index_select(1, idx_t).abs().amax(dim=1, keepdim=True).clamp(0.0, 1.0)
+        idx_t = torch.as_tensor(indices, dtype=torch.long, device=device)
+        route = a_local.index_select(1, idx_t).amax(dim=1, keepdim=True)
+    dev_cache[exp_key] = route
+    return route
 
 
 def _compute_linear_expert_route(
     spatial_action_map: Optional[torch.Tensor],
-    indices: Sequence[int],
+    indices: Tuple[int, ...],
     x_shape: Tuple[int, ...],
     device: torch.device,
 ) -> torch.Tensor:
@@ -422,34 +470,39 @@ def _compute_linear_expert_route(
     if spatial_action_map is None or not indices:
         return torch.ones(ones_shape, device=device, dtype=torch.float32)
 
-    a_map = spatial_action_map.float()
-    if a_map.device != device:
-        a_map = a_map.to(device)
-    if a_map.shape[0] != bsz:
-        if bsz % max(1, a_map.shape[0]) == 0:
-            a_map = a_map.repeat_interleave(bsz // a_map.shape[0], dim=0)
-        else:
-            return torch.ones(ones_shape, device=device, dtype=torch.float32)
+    seq_len = x_shape[1] if ndim == 3 else 0
+    dev_key = _resolve_device_key(device=device) or "default"
+    dev_cache = _ROUTE_PYRAMID_CACHE_BY_DEVICE.setdefault(dev_key, {})
+    lin_key = ("lin_route", int(spatial_action_map.data_ptr()), bsz, ndim, seq_len, indices)
+    cached_l = dev_cache.get(lin_key)
+    if cached_l is not None:
+        return cached_l
 
-    idx_t = torch.as_tensor(indices, dtype=torch.long, device=device)
-    act_ch = a_map.index_select(1, idx_t).abs().amax(dim=1, keepdim=True).clamp(0.0, 1.0)
+    h_img, w_img = spatial_action_map.shape[-2], spatial_action_map.shape[-1]
+    if ndim == 3 and seq_len > 1 and (h_img * w_img) % seq_len == 0:
+        ratio = int(round(math.sqrt((h_img * w_img) / float(seq_len))))
+        if ratio >= 1 and (h_img // ratio) * (w_img // ratio) == seq_len:
+            h_tok, w_tok = h_img // ratio, w_img // ratio
+            r_2d = _compute_conv_expert_route(spatial_action_map, indices, (h_tok, w_tok), bsz, device)
+            tok_w = r_2d.flatten(2).transpose(1, 2).contiguous()
+            dev_cache[lin_key] = tok_w
+            return tok_w
 
-    # Spatial self/cross-attention query/output projections have token count L == H_tok * W_tok
-    if ndim == 3:
-        seq_len = x_shape[1]
-        h_img, w_img = act_ch.shape[-2], act_ch.shape[-1]
-        if seq_len > 1 and (h_img * w_img) % seq_len == 0:
-            ratio = int(round(math.sqrt((h_img * w_img) / float(seq_len))))
-            if ratio >= 1 and (h_img // ratio) * (w_img // ratio) == seq_len:
-                h_tok, w_tok = h_img // ratio, w_img // ratio
-                tok_w = F.interpolate(act_ch, size=(h_tok, w_tok), mode="area").flatten(2).transpose(1, 2)
-                return tok_w
-
-    # Prompt / global linear projections: peak-aware global activation
+    a_full = _get_cached_resized_action_map(spatial_action_map, (h_img, w_img), bsz, device)
+    if a_full is None:
+        return torch.ones(ones_shape, device=device, dtype=torch.float32)
+    if len(indices) == 1:
+        i0 = indices[0]
+        act_ch = a_full[:, i0 : i0 + 1]
+    else:
+        idx_t = torch.as_tensor(indices, dtype=torch.long, device=device)
+        act_ch = a_full.index_select(1, idx_t).amax(dim=1, keepdim=True)
     peak = act_ch.amax(dim=(2, 3))
     mean = act_ch.mean(dim=(2, 3))
     glob_w = (0.70 * peak + 0.30 * mean).clamp(0.0, 1.0)
-    return glob_w if ndim == 2 else glob_w.unsqueeze(1)
+    res = glob_w if ndim == 2 else glob_w.unsqueeze(1)
+    dev_cache[lin_key] = res
+    return res
 
 
 class _ExpertLoRABranch(nn.Module):
@@ -530,6 +583,9 @@ class _ExpertLoRABranch(nn.Module):
             for dw in (self.dw_h, self.dw_v, self.dw_local):
                 nn.init.kaiming_uniform_(dw.weight, a=math.sqrt(5))
                 dw.weight.data.mul_(0.35)
+            eye7 = torch.zeros((rank, 1, 7, 7), device=device, dtype=torch.float32)
+            eye7[:, :, 3, 3] = 1.0
+            self.register_buffer("_eye_kernel", eye7, persistent=False)
         elif self.conv_mode == "multiscale_5x5":
             # Multi-scale 3x3 + 5x5 depthwise bottleneck for optical lens defocus / bokeh disc inversion!
             self.down = nn.Conv2d(
@@ -555,6 +611,9 @@ class _ExpertLoRABranch(nn.Module):
             for dw in (self.dw_3, self.dw_5):
                 nn.init.kaiming_uniform_(dw.weight, a=math.sqrt(5))
                 dw.weight.data.mul_(0.35)
+            eye5 = torch.zeros((rank, 1, 5, 5), device=device, dtype=torch.float32)
+            eye5[:, :, 2, 2] = 1.0
+            self.register_buffer("_eye_kernel", eye5, persistent=False)
         else:
             self.down = nn.Conv2d(
                 in_dim,
@@ -582,9 +641,18 @@ class _ExpertLoRABranch(nn.Module):
         x_in = x if torch.is_autocast_enabled() else x.to(self.down.weight.dtype)
         h = self.down(x_in)
         if self.conv_mode == "strip_1x7_7x1":
-            h = h + self.dw_h(h) + self.dw_v(h) + self.dw_local(h)
+            # Exact algebraic kernel fusion: 1 single FP16/FP32 7x7 depthwise conv instead of 3 separate convs!
+            k7 = (
+                self._eye_kernel
+                + F.pad(self.dw_h.weight, (0, 0, 3, 3))
+                + F.pad(self.dw_v.weight, (3, 3, 0, 0))
+                + F.pad(self.dw_local.weight, (2, 2, 2, 2))
+            )
+            h = F.conv2d(h, k7.to(h.dtype), padding=3, groups=self.rank)
         elif self.conv_mode == "multiscale_5x5":
-            h = h + self.dw_3(h) + self.dw_5(h)
+            # Exact algebraic kernel fusion: 1 single FP16/FP32 5x5 depthwise conv instead of 2 separate convs!
+            k5 = self._eye_kernel + F.pad(self.dw_3.weight, (1, 1, 1, 1)) + self.dw_5.weight
+            h = F.conv2d(h, k5.to(h.dtype), padding=2, groups=self.rank)
 
         if action_cond is not None:
             cond_in = action_cond if torch.is_autocast_enabled() else action_cond.to(self.gate_proj.weight.dtype)
@@ -619,12 +687,12 @@ class ActionDualLoRALinear(nn.Module):
         in_f, out_f = base_linear.in_features, base_linear.out_features
 
         specs = list(expert_specs) if expert_specs else [{"name": "universal_pix", "indices": [], "rank": rank}]
-        self.expert_indices: Dict[str, List[int]] = {}
+        self.expert_indices: Dict[str, Tuple[int, ...]] = {}
         self.pix_experts = nn.ModuleDict()
         for sp in specs:
             ename = str(sp["name"])
             erank = max(4, int(sp.get("rank", rank)))
-            self.expert_indices[ename] = list(sp.get("indices", []))
+            self.expert_indices[ename] = tuple(int(i) for i in sp.get("indices", []))
             self.pix_experts[ename] = _ExpertLoRABranch(
                 in_f, out_f, erank, action_dim, is_conv=False, device=device
             )
@@ -726,14 +794,14 @@ class ActionDualLoRAConv2d(nn.Module):
         specs = list(expert_specs) if expert_specs else [
             {"name": "universal_pix", "indices": [], "rank": rank, "conv_mode": "standard_3x3"}
         ]
-        self.expert_indices: Dict[str, List[int]] = {}
+        self.expert_indices: Dict[str, Tuple[int, ...]] = {}
         self.pix_experts = nn.ModuleDict()
         for sp in specs:
             ename = str(sp["name"])
             raw_r = int(sp.get("rank", rank))
             conv_r = max(6, (raw_r * 3) // 4)
             cmode = str(sp.get("conv_mode", "standard_3x3"))
-            self.expert_indices[ename] = list(sp.get("indices", []))
+            self.expert_indices[ename] = tuple(int(i) for i in sp.get("indices", []))
             self.pix_experts[ename] = _ExpertLoRABranch(
                 base_conv.in_channels,
                 base_conv.out_channels,

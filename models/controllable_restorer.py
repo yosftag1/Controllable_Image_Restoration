@@ -1070,15 +1070,11 @@ class ControllableRestorer(nn.Module):
             with generator_lora_context(
                 None, lambda_pix=0.0, lambda_sem=0.0, device=dev, spatial_action_map=None
             ), _spatial_action_context(None, sem_grid=None, device=dev):
-                cat_z = torch.cat([z_t_stu, z_t_stu], dim=0).to(unet_dtype)
-                cat_t = torch.cat([t_csd, t_csd], dim=0)
-                cat_emb = torch.cat([pos_emb, neg_emb], dim=0)
-                raw_pn = self.unet(cat_z, cat_t, encoder_hidden_states=cat_emb).sample.float()
-                raw_pos, raw_neg = raw_pn.chunk(2, dim=0)
-
-                raw_gt = self.unet(
-                    z_t_gt.to(unet_dtype), t_csd, encoder_hidden_states=pos_emb
-                ).sample.float()
+                cat_z = torch.cat([z_t_stu, z_t_stu, z_t_gt], dim=0).to(unet_dtype)
+                cat_t = torch.cat([t_csd, t_csd, t_csd], dim=0)
+                cat_emb = torch.cat([pos_emb, neg_emb, pos_emb], dim=0)
+                raw_all = self.unet(cat_z, cat_t, encoder_hidden_states=cat_emb).sample.float()
+                raw_pos, raw_neg, raw_gt = raw_all.chunk(3, dim=0)
 
             eps_stu_pos = _to_eps(raw_pos, z_t_stu)
             eps_stu_neg = _to_eps(raw_neg, z_t_stu)
