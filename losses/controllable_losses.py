@@ -97,51 +97,54 @@ class MultiLayerVGGPerceptual(nn.Module):
             x = block(x)
             with torch.no_grad():
                 y_in = block(y_in)
-            y_det = y_in.detach()
 
-            if spatial_weight is not None:
-                w_l = F.adaptive_avg_pool2d(spatial_weight.float(), output_size=x.shape[-2:])
-                w_l = w_l / w_l.mean(dim=(2, 3), keepdim=True).clamp(min=1e-4)
-            else:
-                w_l = None
+            with torch.amp.autocast(device_type=x.device.type, enabled=False):
+                x_f = x.float()
+                y_f = y_in.detach().float()
 
-            x_unit = x / torch.sqrt(torch.sum(x * x, dim=1, keepdim=True) + 1e-8)
-            y_unit = y_det / torch.sqrt(torch.sum(y_det * y_det, dim=1, keepdim=True) + 1e-8)
-            lpips_map = 0.5 * ((x_unit - y_unit) ** 2).sum(dim=1, keepdim=True)
+                if spatial_weight is not None:
+                    w_l = F.adaptive_avg_pool2d(spatial_weight.float(), output_size=x_f.shape[-2:])
+                    w_l = w_l / w_l.mean(dim=(2, 3), keepdim=True).clamp(min=1e-4)
+                else:
+                    w_l = None
 
-            if w_l is not None:
-                pos_dist = (lpips_map * w_l).mean(dim=(1, 2, 3))
-            else:
-                pos_dist = lpips_map.mean(dim=(1, 2, 3))
+                x_unit = x_f / torch.sqrt(torch.sum(x_f * x_f, dim=1, keepdim=True) + 1e-8)
+                y_unit = y_f / torch.sqrt(torch.sum(y_f * y_f, dim=1, keepdim=True) + 1e-8)
+                lpips_map = 0.5 * ((x_unit - y_unit) ** 2).sum(dim=1, keepdim=True)
 
-            if use_dists_texture:
-                tex_dist = pred_01.new_zeros((x.shape[0],), dtype=torch.float32)
-                win_cnt = 0
-                ch_scale = y_det.abs().mean(dim=(0, 2, 3), keepdim=True).clamp(min=1e-2)
-                xn = x / ch_scale
-                yn = y_det / ch_scale
-                for win_k, win_s in ((8, 4), (16, 8)):
-                    if xn.shape[-2] >= win_k and xn.shape[-1] >= win_k:
-                        mu_x = F.avg_pool2d(xn, kernel_size=win_k, stride=win_s)
-                        mu_y = F.avg_pool2d(yn, kernel_size=win_k, stride=win_s)
-                        var_x = (F.avg_pool2d(xn * xn, kernel_size=win_k, stride=win_s) - mu_x * mu_x).clamp(min=0.0)
-                        var_y = (F.avg_pool2d(yn * yn, kernel_size=win_k, stride=win_s) - mu_y * mu_y).clamp(min=0.0)
-                        std_x = torch.sqrt(var_x + 1e-6)
-                        std_y = torch.sqrt(var_y + 1e-6)
-                        patch_err = (0.30 * (mu_x - mu_y).abs() + 0.70 * (std_x - std_y).abs()).mean(
-                            dim=1, keepdim=True
-                        )
-                        if spatial_weight is not None:
-                            w_p = F.adaptive_avg_pool2d(spatial_weight.float(), output_size=patch_err.shape[-2:])
-                            w_p = w_p / w_p.mean(dim=(2, 3), keepdim=True).clamp(min=1e-4)
-                            tex_dist = tex_dist + (patch_err * w_p).mean(dim=(1, 2, 3))
-                        else:
-                            tex_dist = tex_dist + patch_err.mean(dim=(1, 2, 3))
-                        win_cnt += 1
-                if win_cnt > 0:
-                    pos_dist = 0.40 * pos_dist + 0.60 * (tex_dist / float(win_cnt))
+                if w_l is not None:
+                    pos_dist = (lpips_map * w_l).mean(dim=(1, 2, 3))
+                else:
+                    pos_dist = lpips_map.mean(dim=(1, 2, 3))
 
-            total_pos = total_pos + sw * pos_dist.mean()
+                if use_dists_texture:
+                    tex_dist = pred_01.new_zeros((x_f.shape[0],), dtype=torch.float32)
+                    win_cnt = 0
+                    ch_scale = y_f.abs().mean(dim=(0, 2, 3), keepdim=True).clamp(min=0.05)
+                    xn = x_f / ch_scale
+                    yn = y_f / ch_scale
+                    for win_k, win_s in ((8, 4), (16, 8)):
+                        if xn.shape[-2] >= win_k and xn.shape[-1] >= win_k:
+                            mu_x = F.avg_pool2d(xn, kernel_size=win_k, stride=win_s)
+                            mu_y = F.avg_pool2d(yn, kernel_size=win_k, stride=win_s)
+                            var_x = (F.avg_pool2d(xn * xn, kernel_size=win_k, stride=win_s) - mu_x * mu_x).clamp(min=0.0)
+                            var_y = (F.avg_pool2d(yn * yn, kernel_size=win_k, stride=win_s) - mu_y * mu_y).clamp(min=0.0)
+                            std_x = torch.sqrt(var_x + 1e-6)
+                            std_y = torch.sqrt(var_y + 1e-6)
+                            patch_err = (0.30 * (mu_x - mu_y).abs() + 0.70 * (std_x - std_y).abs()).mean(
+                                dim=1, keepdim=True
+                            )
+                            if spatial_weight is not None:
+                                w_p = F.adaptive_avg_pool2d(spatial_weight.float(), output_size=patch_err.shape[-2:])
+                                w_p = w_p / w_p.mean(dim=(2, 3), keepdim=True).clamp(min=1e-4)
+                                tex_dist = tex_dist + (patch_err * w_p).mean(dim=(1, 2, 3))
+                            else:
+                                tex_dist = tex_dist + patch_err.mean(dim=(1, 2, 3))
+                            win_cnt += 1
+                    if win_cnt > 0:
+                        pos_dist = 0.40 * pos_dist + 0.60 * (tex_dist / float(win_cnt))
+
+                total_pos = total_pos + sw * pos_dist.mean()
 
         return total_pos
 
