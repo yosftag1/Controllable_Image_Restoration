@@ -2,12 +2,13 @@
 
 Stage 1 (`pixel_stage`):
   - Charbonnier L1 (`LOSS_L1_WEIGHT`)
-  - Latent Charbonnier (`LOSS_LATENT_WEIGHT`)
+  - 2-Step Latent Charbonnier (`0.35 * hat_z_1 + 0.65 * hat_z_0`) (`LOSS_LATENT_WEIGHT`)
   - Light VGG LPIPS (`LOSS_PIXEL_STAGE_PERCEPTUAL_WEIGHT`)
   - Idle-only preservation (`LOSS_PRESERVE_WEIGHT`)
 
 Stage 2 (`semantic_stage`):
-  - 4x Low-Pass Charbonnier L1 (`LOSS_SEMANTIC_STAGE_LP_L1_WEIGHT`)
+  - 4x Low-Pass Charbonnier L1 (`LOSS_SEMANTIC_STAGE_LP_L1_WEIGHT`) + gentle Full-Res Subpixel Anchor
+    (`LOSS_SEMANTIC_STAGE_FULL_L1_WEIGHT`) to prevent 1-2px fine-detail jitter
   - 2x Low-Pass Latent Charbonnier (`LOSS_SEMANTIC_STAGE_LATENT_LP_WEIGHT`)
   - Full-res VGG LPIPS + DISTS Local Patch Texture (`LOSS_PERCEPTUAL_WEIGHT`)
   - Zero-Drift Target-Anchored CSD (`LOSS_CSD_WEIGHT`)
@@ -146,7 +147,7 @@ class MultiLayerVGGPerceptual(nn.Module):
 
 
 class ControllableRestorationLoss(nn.Module):
-    """Clean 4-term controllable restoration objective (Charbonnier, Latent, VGG/DISTS, Idle-Preservation + CSD)."""
+    """Clean 4-term controllable restoration objective (Charbonnier, 2-Step Latent, VGG/DISTS, Idle + CSD)."""
 
     def __init__(self, config, use_pretrained_vgg: bool = True):
         super().__init__()
@@ -223,6 +224,7 @@ class ControllableRestorationLoss(nn.Module):
         stage: str = "pixel_stage",
         src_01: Optional[torch.Tensor] = None,
         hat_z_0: Optional[torch.Tensor] = None,
+        hat_z_1: Optional[torch.Tensor] = None,
         z_tgt: Optional[torch.Tensor] = None,
         restorer_model: Optional[nn.Module] = None,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
@@ -235,28 +237,45 @@ class ControllableRestorationLoss(nn.Module):
             tgt_lp4 = self._lowpass_4x(target_01)
             w_lp4 = F.adaptive_avg_pool2d(spatial_w, output_size=pred_lp4.shape[-2:])
             w_lp4 = w_lp4 / w_lp4.mean(dim=(2, 3), keepdim=True).clamp(min=1e-4)
-            loss_l1 = self.charbonnier_loss(pred_lp4, tgt_lp4, w_lp4)
+            loss_l1_lp = self.charbonnier_loss(pred_lp4, tgt_lp4, w_lp4)
+            full_w = float(getattr(self.config, "LOSS_SEMANTIC_STAGE_FULL_L1_WEIGHT", 0.15))
+            lp_w = float(getattr(self.config, "LOSS_SEMANTIC_STAGE_LP_L1_WEIGHT", 0.70))
+            if full_w > 0.0:
+                loss_l1_full = self.charbonnier_loss(pred_01, target_01, spatial_w)
+                l1_term = lp_w * loss_l1_lp + full_w * loss_l1_full
+                loss_l1 = l1_term / max(1e-6, lp_w + full_w)
+            else:
+                l1_term = lp_w * loss_l1_lp
+                loss_l1 = loss_l1_lp
         else:
             loss_l1 = self.charbonnier_loss(pred_01, target_01, spatial_w)
+            l1_term = float(self.config.LOSS_L1_WEIGHT) * loss_l1
 
-        loss_latent = (
-            self.latent_reconstruction_loss(
+        if hat_z_0 is not None and z_tgt is not None:
+            loss_z0 = self.latent_reconstruction_loss(
                 hat_z_0, z_tgt, spatial_weight=spatial_w, lowpass_only=is_detail_stage
             )
-            if (hat_z_0 is not None and z_tgt is not None)
-            else pred_01.new_zeros((), dtype=torch.float32)
-        )
+            if (
+                not is_detail_stage
+                and hat_z_1 is not None
+                and hat_z_1 is not hat_z_0
+                and hat_z_1.requires_grad
+            ):
+                loss_z1 = self.latent_reconstruction_loss(
+                    hat_z_1, z_tgt, spatial_weight=spatial_w, lowpass_only=False
+                )
+                loss_latent = 0.35 * loss_z1 + 0.65 * loss_z0
+            else:
+                loss_latent = loss_z0
+        else:
+            loss_latent = pred_01.new_zeros((), dtype=torch.float32)
+
         loss_preserve = (
             self.idle_preservation_loss(pred_01, src_01, action_map)
             if src_01 is not None
             else pred_01.new_zeros((), dtype=torch.float32)
         )
 
-        l1_weight = (
-            float(getattr(self.config, "LOSS_SEMANTIC_STAGE_LP_L1_WEIGHT", 0.75))
-            if is_detail_stage
-            else float(self.config.LOSS_L1_WEIGHT)
-        )
         lat_weight = (
             float(getattr(self.config, "LOSS_SEMANTIC_STAGE_LATENT_LP_WEIGHT", 0.25))
             if is_detail_stage
@@ -269,11 +288,7 @@ class ControllableRestorationLoss(nn.Module):
             else float(self.config.LOSS_PERCEPTUAL_WEIGHT)
         )
 
-        total = (
-            l1_weight * loss_l1
-            + lat_weight * loss_latent
-            + preserve_weight * loss_preserve
-        )
+        total = l1_term + lat_weight * loss_latent + preserve_weight * loss_preserve
 
         loss_perc = pred_01.new_zeros((), dtype=torch.float32)
         if perc_w > 0.0:

@@ -48,12 +48,33 @@ SHORT_ALIASES: Dict[str, str] = {
     "upscale": "sharpen_focus",
     "downsample": "sharpen_focus",
     "downsample_upsample": "sharpen_focus",
-    # 5. Signed directional exposure [-1, +1] (- = darken, + = brighten)
+    # 5. Lens flare & veiling glare removal [0, 1]
+    "flare": "deflare",
+    "deflare": "deflare",
+    "lens_flare": "deflare",
+    "glare": "deflare",
+    # 6. Window / glass reflection removal [0, 1]
+    "reflection": "dereflection",
+    "dereflection": "dereflection",
+    "glass": "dereflection",
+    "refl": "dereflection",
+    # 7. Chromatic aberration removal [0, 1]
+    "ca": "dechromatic",
+    "chromatic": "dechromatic",
+    "dechromatic": "dechromatic",
+    "fringing": "dechromatic",
+    "aberration": "dechromatic",
+    # 8. Atmospheric haze / fog removal [0, 1]
+    "haze": "dehaze",
+    "dehaze": "dehaze",
+    "fog": "dehaze",
+    "mist": "dehaze",
+    # 9. Signed directional exposure [-1, +1] (- = darken, + = brighten)
     "exposure": "exposure",
     "exposure_issue": "exposure",
     "ev": "exposure",
     "light": "exposure",
-    # 6. Signed directional white balance / warmth [-1, +1] (- = cool, + = warm)
+    # 10. Signed directional white balance / warmth [-1, +1] (- = cool, + = warm)
     "warmth": "warmth",
     "wb": "warmth",
     "temp": "warmth",

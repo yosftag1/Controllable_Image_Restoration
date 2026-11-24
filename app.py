@@ -82,6 +82,38 @@ SLIDER_SPECS: List[Tuple[str, str, str, float, float, float]] = [
         1.0,
     ),
     (
+        "deflare",
+        "Lens Flare & Glare Removal",
+        "0.0 = preserve sunlight flare | 1.0 = remove starbursts, veiling glare & lens ghosts",
+        0.0,
+        1.0,
+        1.0,
+    ),
+    (
+        "dereflection",
+        "Glass Reflection Removal",
+        "0.0 = preserve window reflections | 1.0 = remove double-pane glass ghosts",
+        0.0,
+        1.0,
+        1.0,
+    ),
+    (
+        "dechromatic",
+        "Chromatic Aberration Removal",
+        "0.0 = preserve | 1.0 = remove radial purple/cyan lens color fringing",
+        0.0,
+        1.0,
+        1.0,
+    ),
+    (
+        "dehaze",
+        "Haze & Fog Removal",
+        "0.0 = preserve atmospheric mist | 1.0 = clear haze & restore scene contrast",
+        0.0,
+        1.0,
+        1.0,
+    ),
+    (
         "exposure",
         "Exposure (Darken  ↔  Keep  ↔  Brighten)",
         "-1.0 = darken washed highlights | 0.0 = keep mood lighting | +1.0 = brighten dark shadows",
@@ -99,15 +131,16 @@ SLIDER_SPECS: List[Tuple[str, str, str, float, float, float]] = [
     ),
 ]
 
-# Order matches SLIDER_SPECS: [denoise, deartifact, deblur_motion, sharpen_focus, exposure, warmth]
+# Order matches SLIDER_SPECS: [denoise, deartifact, deblur_motion, sharpen_focus, deflare, dereflection, dechromatic, dehaze, exposure, warmth]
 RESTORE_PRESETS = {
-    "Restore All Artifacts (Keep Original Tone & WB)": [1.0, 1.0, 1.0, 1.0, 0.0, 0.0],
-    "Identity / Zero-Action Lock ('none')": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-    "Night Action Shot (Denoise + Brighten +0.65, KEEP Motion Blur)": [1.0, 0.4, 0.0, 0.0, 0.65, 0.0],
-    "Portrait Bokeh Cleanup (Denoise + Deband + Cool WB, KEEP Bokeh)": [1.0, 1.0, 0.0, 0.0, 0.0, -0.35],
-    "Washed-Out Overexposed Fix (Darken -0.60 + Sharpen + Deband)": [0.3, 1.0, 0.0, 1.0, -0.60, 0.0],
-    "Old Compressed Web Photo (DeJPEG + Sharpen Focus)": [0.4, 1.0, 0.3, 1.0, 0.0, 0.0],
-    "Artistic Golden-Hour Grade Only (Zero Structural Change)": [0.0, 0.0, 0.0, 0.0, 0.25, 0.50],
+    "Restore All Artifacts (Keep Original Tone & WB)": [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0],
+    "Identity / Zero-Action Lock ('none')": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+    "Night Action Shot (Denoise + Brighten +0.65, KEEP Motion Blur)": [1.0, 0.4, 0.0, 0.0, 0.5, 0.0, 0.3, 0.0, 0.65, 0.0],
+    "Portrait Bokeh Cleanup (Denoise + Deband + Cool WB, KEEP Bokeh)": [1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.3, 0.0, 0.0, -0.35],
+    "Backlit Window Shot (Deflare + Dereflection + Dehaze + CA)": [0.3, 0.3, 0.0, 0.5, 1.0, 1.0, 1.0, 0.8, 0.0, 0.0],
+    "Washed-Out Overexposed Fix (Darken -0.60 + Sharpen + Deband)": [0.3, 1.0, 0.0, 1.0, 0.5, 0.0, 0.3, 0.5, -0.60, 0.0],
+    "Old Compressed Web Photo (DeJPEG + Sharpen Focus)": [0.4, 1.0, 0.3, 1.0, 0.0, 0.0, 0.2, 0.0, 0.0, 0.0],
+    "Artistic Golden-Hour Grade Only (Zero Structural Change)": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.25, 0.50],
 }
 
 SYNTH_RECIPES = {
@@ -117,7 +150,23 @@ SYNTH_RECIPES = {
         "deartifact": 0.0,
         "deblur_motion": 0.75,
         "sharpen_focus": 0.0,
+        "deflare": 0.0,
+        "dereflection": 0.0,
+        "dechromatic": 0.0,
+        "dehaze": 0.0,
         "exposure": -0.68,
+        "warmth": 0.0,
+    },
+    "Backlit Window Shot (Flare + Glass Reflection + Haze + CA)": {
+        "denoise": 0.0,
+        "deartifact": 0.0,
+        "deblur_motion": 0.0,
+        "sharpen_focus": 0.0,
+        "deflare": 0.75,
+        "dereflection": 0.80,
+        "dechromatic": 0.85,
+        "dehaze": 0.55,
+        "exposure": 0.0,
         "warmth": 0.0,
     },
     "Washout + Bokeh + Warm Cast (Bright +0.65 + Defocus + Banding + Warm +0.55)": {
@@ -125,6 +174,10 @@ SYNTH_RECIPES = {
         "deartifact": 0.65,
         "deblur_motion": 0.0,
         "sharpen_focus": 0.70,
+        "deflare": 0.0,
+        "dereflection": 0.0,
+        "dechromatic": 0.45,
+        "dehaze": 0.0,
         "exposure": 0.65,
         "warmth": 0.55,
     },
@@ -133,6 +186,10 @@ SYNTH_RECIPES = {
         "deartifact": 0.80,
         "deblur_motion": 0.40,
         "sharpen_focus": 0.75,
+        "deflare": 0.0,
+        "dereflection": 0.0,
+        "dechromatic": 0.0,
+        "dehaze": 0.0,
         "exposure": 0.0,
         "warmth": -0.50,
     },
@@ -330,9 +387,9 @@ def build_gradio_app(
                             )
                             restore_btn = gr.Button("Restore Image", variant="primary", scale=2)
 
-                        gr.Markdown("#### A. Structural & Artifact Restoration (`0.0` = Preserve, `1.0` = Full Fix)")
+                        gr.Markdown("#### A. Structural & Optical Artifact Restoration (`0.0` = Preserve, `1.0` = Full Fix)")
                         slider_controls = []
-                        for row_idx in (0, 2):
+                        for row_idx in (0, 2, 4, 6):
                             with gr.Row():
                                 for _, label_txt, info_txt, lo_v, hi_v, def_v in SLIDER_SPECS[row_idx : row_idx + 2]:
                                     s = gr.Slider(
@@ -347,7 +404,7 @@ def build_gradio_app(
 
                         gr.Markdown("#### B. Directional Tone & White Balance (`-1.0`  ↔  `0.0` Keep  ↔  `+1.0`)")
                         with gr.Row():
-                            for _, label_txt, info_txt, lo_v, hi_v, def_v in SLIDER_SPECS[4:6]:
+                            for _, label_txt, info_txt, lo_v, hi_v, def_v in SLIDER_SPECS[8:10]:
                                 s = gr.Slider(
                                     minimum=lo_v,
                                     maximum=hi_v,
@@ -414,7 +471,7 @@ def build_gradio_app(
                                 interactive=False,
                             )
 
-                        with gr.Accordion("Advanced High-Res Tiling", open=False):
+                        with gr.Accordion("Advanced High-Res Tiling & Full-Frame Lens Distortion", open=False):
                             tile_slider = gr.Slider(
                                 minimum=0,
                                 maximum=1024,
@@ -422,6 +479,14 @@ def build_gradio_app(
                                 step=64,
                                 label="Seamless Tile Size (px)",
                                 info="512 recommended for 2K/4K photos (0 = untiled)",
+                            )
+                            lens_k1_slider = gr.Slider(
+                                minimum=-0.35,
+                                maximum=0.35,
+                                value=0.0,
+                                step=0.01,
+                                label="Full-Frame Lens Distortion Correction (k1)",
+                                info="- = correct barrel fisheye | 0.0 = none | + = correct pincushion",
                             )
 
                     with gr.Column(scale=6):
@@ -478,7 +543,7 @@ def build_gradio_app(
 
                         synth_sliders = []
                         default_recipe = SYNTH_RECIPES["Night Handheld (Dark Exposure -0.68 + Heavy Noise + Motion Blur)"]
-                        for row_idx in (0, 2, 4):
+                        for row_idx in (0, 2, 4, 6, 8):
                             with gr.Row():
                                 for deg_key, label_txt, _, lo_v, hi_v, _ in SLIDER_SPECS[row_idx : row_idx + 2]:
                                     s = gr.Slider(
@@ -644,6 +709,7 @@ def build_gradio_app(
             clean_gt_np: Optional[np.ndarray],
             d_scale: float,
             tile_val: int,
+            lens_k1_val: float,
             *slider_vals,
         ):
             rgb = _ensure_rgb_u8(img_np)
@@ -696,6 +762,7 @@ def build_gradio_app(
                     fidelity_scale=1.0,
                     detail_scale=float(d_scale),
                     tile_size=int(tile_val),
+                    lens_distortion_k1=float(lens_k1_val),
                 )
             elapsed_ms = (time.perf_counter() - t0) * 1000.0
 
@@ -747,6 +814,7 @@ def build_gradio_app(
                 clean_ref_state,
                 detail_slider,
                 tile_slider,
+                lens_k1_slider,
                 *slider_controls,
             ],
             outputs=[
@@ -801,7 +869,7 @@ def build_gradio_app(
             full_act = synth_pipeline.compute_full_restore_action(state_vec)
             suggested = [round(float(x) * 20.0) / 20.0 for x in full_act.tolist()]
             if all(abs(v) < 1e-4 for v in suggested):
-                suggested = [1.0, 1.0, 1.0, 1.0, 0.0, 0.0]
+                suggested = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0]
             return (
                 deg_rgb,
                 clean_rgb,

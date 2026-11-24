@@ -1,13 +1,14 @@
-"""End-to-End Controllable Pretrained Restoration Model (Clean SD-2.1 Baseline).
+"""End-to-End Controllable Pretrained Restoration Model (2-Step SD-2.1 + Shared/Specialist LoRA-MoE).
 
 Architecture:
 1. Frozen `DINOv2-with-Registers` semantic encoder for scene context & 1-click object masks.
-2. Fixed single-timestep `SD-2.1-Base` UNet (`t=199`) with unified `pix_branch` LoRA +
-   Stage-2 `sem_branch` LoRA + zero-extra-VRAM zero-drift Target-Anchored CSD.
-3. Clean 2-path spatial conditioning: `_ActionConditionedConvIn` + 1x1 SPADE
-   `PointwiseSpatialModulator` across UNet blocks + `ActionOverlayEncoder` cross-attention.
-4. `SkipConnectedVAE` (lightweight encoder LoRA + action-gated skip bridges + 100% frozen decoder)
-   + strictly 1x1 `PointwiseRadiometricHead`.
+2. 2-Step Latent Refinement on `SD-2.1-Base` (`t=299 -> 99`):
+   - Step 1 (`t=299`): coarse structural deblurring & denoising
+   - Step 2 (`t=99`): fine-edge & micro-texture polish (with `sem_branch` in Stage 2)
+3. Shared Base LoRA (`r=20`) + Additive Slider-Routed Specialist Experts (`r=8` each)
+   + Stage-2 `sem_branch` (`r=16`) + zero-extra-VRAM zero-drift Target-Anchored CSD.
+4. Clean 2-path spatial conditioning (`_ActionConditionedConvIn` + 1x1 SPADE + `ActionOverlayEncoder`)
+   + `SkipConnectedVAE` (fine-skip fade with `detail_scale`) + 1x1 `PointwiseRadiometricHead`.
 """
 
 from contextlib import contextmanager
@@ -29,6 +30,7 @@ from .lora_layers import (
     infer_module_device,
     infer_module_dtype,
     inject_generator_dual_lora,
+    resolve_expert_specs,
     set_generator_lora_state,
 )
 from .semantic_encoder import SemanticEncoder, load_hf_public_safe
@@ -432,7 +434,7 @@ class _MockTinyUNet(nn.Module):
 
 
 class ControllableRestorer(nn.Module):
-    """Clean SD-2.1-Base Controllable Restorer with Dual-Branch LoRA & Zero-Drift Target-Anchored CSD."""
+    """2-Step SD-2.1-Base Controllable Restorer with Shared+Specialist LoRA-MoE & Zero-Drift CSD."""
 
     def __init__(self, config):
         super().__init__()
@@ -523,14 +525,21 @@ class ControllableRestorer(nn.Module):
 
         self.skip_vae = SkipConnectedVAE(raw_vae, config)
 
+        unet_expert_specs = resolve_expert_specs(
+            getattr(config, "LORA_EXPERT_SPECS", None),
+            deg_names,
+            signed_types=signed_set,
+            default_rank=8,
+        )
         sem_rank = max(4, int(getattr(config, "SEM_DETAIL_LORA_RANK", 16)))
         sem_alpha = float(getattr(config, "SEM_DETAIL_LORA_ALPHA", float(sem_rank)))
 
         self.unet = raw_unet
         self.unet_pix_lora_params, self.unet_sem_lora_params = inject_generator_dual_lora(
             self.unet,
-            rank=int(getattr(config, "UNET_LORA_RANK", 32)),
-            alpha=float(getattr(config, "UNET_LORA_ALPHA", 32.0)),
+            rank=int(getattr(config, "UNET_LORA_RANK", 20)),
+            alpha=float(getattr(config, "UNET_LORA_ALPHA", 20.0)),
+            expert_specs=unet_expert_specs,
             sem_rank=sem_rank,
             sem_alpha=sem_alpha,
             include_conv=True,
@@ -617,11 +626,10 @@ class ControllableRestorer(nn.Module):
             hooks.append(blk.register_forward_hook(_make_probe_hook(f"up_{idx}")))
 
         try:
+            t_probe = self._get_restoration_timesteps()[0]
             with torch.no_grad():
                 dummy_lat = torch.zeros(1, in_ch, 32, 32, device=unet_dev, dtype=unet_dtype)
-                dummy_t = torch.tensor(
-                    [int(getattr(config, "RESTORATION_TIMESTEP", 199))], device=unet_dev, dtype=torch.long
-                )
+                dummy_t = torch.tensor([t_probe], device=unet_dev, dtype=torch.long)
                 dummy_enc = torch.zeros(1, prompt_seq_len, cross_attn_dim, device=unet_dev, dtype=unet_dtype)
                 self.unet(dummy_lat, dummy_t, encoder_hidden_states=dummy_enc)
         finally:
@@ -756,11 +764,15 @@ class ControllableRestorer(nn.Module):
         gate = min(1.0, max(0.0, struct_max / 0.25))
         return float(detail_scale) * gate
 
-    def _resolve_unet_timesteps(self, bsz: int, device: torch.device) -> torch.Tensor:
-        """Fixed single-step denoising timestep for consistent 1-step SD-2.1 adaptation."""
+    def _get_restoration_timesteps(self) -> Tuple[int, ...]:
         num_sched = int(self.alphas_cumprod.numel())
-        fixed_t = int(getattr(self.config, "RESTORATION_TIMESTEP", 199))
-        return torch.full((bsz,), fixed_t, device=device, dtype=torch.long).clamp(1, num_sched - 1)
+        raw = getattr(self.config, "RESTORATION_TIMESTEPS", None)
+        if raw is None:
+            raw = (int(getattr(self.config, "RESTORATION_TIMESTEP", 199)),)
+        elif isinstance(raw, int):
+            raw = (raw,)
+        steps = tuple(max(1, min(num_sched - 1, int(t))) for t in raw)
+        return steps if steps else (min(199, num_sched - 1),)
 
     def _predict_clean_latent(
         self,
@@ -769,9 +781,12 @@ class ControllableRestorer(nn.Module):
         action_map: torch.Tensor,
         fidelity_scale: float,
         detail_scale: float,
+        timestep_val: int,
     ) -> torch.Tensor:
         bsz = z_t.shape[0]
-        t_unet = self._resolve_unet_timesteps(bsz, z_t.device)
+        num_sched = int(self.alphas_cumprod.numel())
+        t_val = max(1, min(num_sched - 1, int(timestep_val)))
+        t_unet = torch.full((bsz,), t_val, device=z_t.device, dtype=torch.long)
 
         abar_table = (
             self.alphas_cumprod
@@ -789,7 +804,12 @@ class ControllableRestorer(nn.Module):
         if self.training and torch.is_grad_enabled() and not z_in.requires_grad:
             z_in = z_in.detach().requires_grad_(True)
 
-        with generator_lora_context(lambda_pix=fidelity_scale, lambda_sem=detail_scale, device=z_in.device):
+        with generator_lora_context(
+            lambda_pix=fidelity_scale,
+            lambda_sem=detail_scale,
+            device=z_in.device,
+            spatial_action_map=action_map,
+        ):
             with _spatial_action_context(action_map, device=z_in.device):
                 raw_pred = self.unet(
                     z_in,
@@ -844,9 +864,9 @@ class ControllableRestorer(nn.Module):
                     return z_noisy - raw_out
                 return raw_out
 
-            with generator_lora_context(lambda_pix=0.0, lambda_sem=0.0, device=dev), _spatial_action_context(
-                None, device=dev
-            ):
+            with generator_lora_context(
+                lambda_pix=0.0, lambda_sem=0.0, device=dev, spatial_action_map=None
+            ), _spatial_action_context(None, device=dev):
                 cat_z = torch.cat([z_t_stu, z_t_stu, z_t_gt, z_t_gt], dim=0).to(unet_dtype)
                 cat_t = torch.cat([t_csd, t_csd, t_csd, t_csd], dim=0)
                 cat_emb = torch.cat([pos_emb, neg_emb, pos_emb, neg_emb], dim=0)
@@ -858,8 +878,8 @@ class ControllableRestorer(nn.Module):
             eps_gt_pos = _to_eps(raw_gt_pos, z_t_gt)
             eps_gt_neg = _to_eps(raw_gt_neg, z_t_gt)
 
-            cfg_scale = float(getattr(self.config, "CSD_CFG_SCALE", 4.5))
-            step_mag = float(getattr(self.config, "CSD_STEP_SCALE", 0.15))
+            cfg_scale = float(getattr(self.config, "CSD_CFG_SCALE", 5.0))
+            step_mag = float(getattr(self.config, "CSD_STEP_SCALE", 0.30))
 
             score_dir = (eps_stu_pos - eps_gt_pos) + 0.25 * cfg_scale * (
                 (eps_stu_pos - eps_stu_neg) - (eps_gt_pos - eps_gt_neg)
@@ -894,30 +914,74 @@ class ControllableRestorer(nn.Module):
         fidelity_scale: float = 1.0,
         detail_scale: float = 0.0,
     ) -> Dict[str, torch.Tensor]:
-        """Training forward pass returning RGB prediction, UNet latent `hat_z_0`, and target `z_tgt`."""
+        """2-Step training forward pass returning RGB prediction, `hat_z_0`, `hat_z_1`, and `z_tgt`."""
         _, _, h, w = src_01.shape
         action_map = self.action_overlay.ensure_spatial_map(action_input, h, w)
 
         sem_out = self.semantic_encoder(src_01)
         cross_tokens = self.action_overlay(action_map, sem_out["tokens"], sem_out["global"])
 
-        with torch.no_grad(), generator_lora_context(lambda_pix=0.0, lambda_sem=0.0, device=tgt_01.device):
+        with torch.no_grad(), generator_lora_context(
+            lambda_pix=0.0, lambda_sem=0.0, device=tgt_01.device, spatial_action_map=None
+        ):
             z_tgt = self.skip_vae.encode_target_latents(tgt_01).detach()
 
-        set_generator_lora_state(lambda_pix=fidelity_scale, lambda_sem=detail_scale, device=src_01.device)
+        set_generator_lora_state(
+            lambda_pix=fidelity_scale,
+            lambda_sem=detail_scale,
+            device=src_01.device,
+            spatial_action_map=action_map,
+        )
         set_spatial_action_map(action_map, device=src_01.device)
 
         z_src, enc_skips = self.skip_vae.encode_with_skips(src_01)
+        t_list = self._get_restoration_timesteps()
 
-        hat_z_0 = self._predict_clean_latent(
-            z_t=z_src,
-            cross_tokens=cross_tokens,
-            action_map=action_map,
-            fidelity_scale=fidelity_scale,
-            detail_scale=detail_scale,
+        if len(t_list) >= 2:
+            pix_trainable = torch.is_grad_enabled() and any(
+                p.requires_grad for p in self.unet_pix_lora_params
+            )
+            if pix_trainable:
+                hat_z_1 = self._predict_clean_latent(
+                    z_t=z_src,
+                    cross_tokens=cross_tokens,
+                    action_map=action_map,
+                    fidelity_scale=fidelity_scale,
+                    detail_scale=0.0,
+                    timestep_val=t_list[0],
+                )
+            else:
+                with torch.no_grad():
+                    hat_z_1 = self._predict_clean_latent(
+                        z_t=z_src,
+                        cross_tokens=cross_tokens,
+                        action_map=action_map,
+                        fidelity_scale=fidelity_scale,
+                        detail_scale=0.0,
+                        timestep_val=t_list[0],
+                    )
+            hat_z_0 = self._predict_clean_latent(
+                z_t=hat_z_1.detach(),
+                cross_tokens=cross_tokens,
+                action_map=action_map,
+                fidelity_scale=fidelity_scale,
+                detail_scale=detail_scale,
+                timestep_val=t_list[-1],
+            )
+        else:
+            hat_z_0 = self._predict_clean_latent(
+                z_t=z_src,
+                cross_tokens=cross_tokens,
+                action_map=action_map,
+                fidelity_scale=fidelity_scale,
+                detail_scale=detail_scale,
+                timestep_val=t_list[0],
+            )
+            hat_z_1 = hat_z_0
+
+        vae_rgb = self.skip_vae.decode_with_skips(
+            hat_z_0, enc_skips, action_map, detail_scale=detail_scale
         )
-
-        vae_rgb = self.skip_vae.decode_with_skips(hat_z_0, enc_skips, action_map)
         toned_rgb = self.pixel_refiner(
             src_01=src_01,
             vae_rgb_01=vae_rgb,
@@ -929,6 +993,7 @@ class ControllableRestorer(nn.Module):
         return {
             "pred": pred_rgb,
             "hat_z_0": hat_z_0,
+            "hat_z_1": hat_z_1,
             "z_tgt": z_tgt,
         }
 
@@ -1000,6 +1065,7 @@ class ControllableRestorer(nn.Module):
             return src_01.clone()
 
         eff_detail = self._compute_inference_detail_scale(action_map, detail_scale)
+        t_list = self._get_restoration_timesteps()
 
         pad_h = (8 - h % 8) % 8
         pad_w = (8 - w % 8) % 8
@@ -1023,21 +1089,27 @@ class ControllableRestorer(nn.Module):
             del sem_out
 
             with generator_lora_context(
-                lambda_pix=fidelity_scale, lambda_sem=eff_detail, device=cur_padded.device
+                lambda_pix=fidelity_scale,
+                lambda_sem=eff_detail,
+                device=cur_padded.device,
+                spatial_action_map=act_padded,
             ):
-                z_enc, enc_skips = self.skip_vae.encode_with_skips(cur_padded)
-                hat_z_0 = self._predict_clean_latent(
-                    z_t=z_enc,
-                    cross_tokens=cross_tokens,
-                    action_map=act_padded,
-                    fidelity_scale=fidelity_scale,
-                    detail_scale=eff_detail,
-                )
+                z_cur, enc_skips = self.skip_vae.encode_with_skips(cur_padded)
+                for k_step, t_val in enumerate(t_list):
+                    d_s = eff_detail if k_step == len(t_list) - 1 else 0.0
+                    z_cur = self._predict_clean_latent(
+                        z_t=z_cur,
+                        cross_tokens=cross_tokens,
+                        action_map=act_padded,
+                        fidelity_scale=fidelity_scale,
+                        detail_scale=d_s,
+                        timestep_val=t_val,
+                    )
                 vae_rgb = self.skip_vae.decode_with_skips(
-                    hat_z_0, enc_skips, act_padded, release_skips=True
+                    z_cur, enc_skips, act_padded, detail_scale=eff_detail, release_skips=True
                 )[:, :, :h, :w]
 
-            del z_enc, hat_z_0, enc_skips, cross_tokens
+            del z_cur, enc_skips, cross_tokens
             toned_rgb = self.pixel_refiner(
                 src_01=cur_rgb,
                 vae_rgb_01=vae_rgb,

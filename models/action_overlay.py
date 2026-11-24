@@ -77,7 +77,7 @@ class ActionOverlayEncoder(nn.Module):
         sem_global_dim: int,
         cross_attn_dim: int,
         action_hidden_dim: int = 128,
-        tokens_per_action: int = 6,
+        tokens_per_action: int = 4,
         prompt_seq_len: int = 77,
         base_prompt_embeds: Optional[torch.Tensor] = None,
     ):
@@ -94,9 +94,10 @@ class ActionOverlayEncoder(nn.Module):
             embed_buf = torch.zeros(1, prompt_seq_len, cross_attn_dim, dtype=torch.float32)
 
         self.prompt_seq_len = prompt_seq_len
+        max_op_budget = (self.prompt_seq_len - 33) if self.prompt_seq_len >= 64 else (self.prompt_seq_len - 4)
         self.tokens_per_action = min(
             max(1, int(tokens_per_action)),
-            max(1, (self.prompt_seq_len - 4) // max(1, num_actions)),
+            max(1, max_op_budget // max(1, num_actions)),
         )
         self.op_token_count = self.num_actions * self.tokens_per_action
         avail_after_ops = max(1, self.prompt_seq_len - self.op_token_count - 1)

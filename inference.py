@@ -19,6 +19,7 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 from config import Config
+from data.selective_dataset import SelectiveDegradationPipeline
 from models.controllable_restorer import ControllableRestorer
 from train import cast_frozen_base_to_fp16
 from utils.image_benchmark import run_single_image_benchmark
@@ -159,8 +160,13 @@ class ControllableInferencer:
         return_trajectory: bool = False,
         tile_size: Optional[int] = None,
         tile_overlap: Optional[int] = None,
+        lens_distortion_k1: float = 0.0,
     ):
         """Restore an RGB uint8 image with global sliders, directional tone/WB, or 1-click semantic masks."""
+        if abs(float(lens_distortion_k1)) > 1e-4:
+            image_rgb_u8 = SelectiveDegradationPipeline.render_lens_distortion(
+                image_rgb_u8, k1=float(lens_distortion_k1)
+            )
         h, w = image_rgb_u8.shape[:2]
         src_t = (
             torch.from_numpy(image_rgb_u8.astype(np.float32) / 255.0)
@@ -352,6 +358,12 @@ def main():
     parser.add_argument("--steps", type=int, default=1, help="Number of passes (default: 1)")
     parser.add_argument("--tile-size", type=int, default=None, help="Seamless tile size for 2K/4K photos (default: 512)")
     parser.add_argument("--tile-overlap", type=int, default=None, help="Overlap margin between tiles (default: 96)")
+    parser.add_argument(
+        "--lens-k1",
+        type=float,
+        default=0.0,
+        help="Optional full-frame Brown-Conrady radial lens distortion correction k1 (-0.35..+0.35)",
+    )
     parser.add_argument("--benchmark", action="store_true", help="Run full Raw 'As-Is' + 4-Scenario Synthetic benchmark")
     parser.add_argument("--benchmark-size", type=int, default=512, help="Max side in px for benchmark panels (default: 512)")
     parser.add_argument("--benchmark-seed", type=int, default=1234, help="Deterministic seed for synthetic benchmark")
@@ -407,6 +419,7 @@ def main():
         return_trajectory=args.save_trajectory,
         tile_size=args.tile_size,
         tile_overlap=args.tile_overlap,
+        lens_distortion_k1=args.lens_k1,
     )
 
     out_dir = Path(args.output_dir)

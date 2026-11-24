@@ -1,14 +1,15 @@
-"""End-to-end verification suite for Controllable_Image_Restoration (Clean SD-2.1 Baseline).
+"""End-to-end verification suite for Controllable_Image_Restoration (2-Step SD-2.1 + LoRA-MoE).
 
 Runs:
 1. AST syntax check across every Python file in the repository.
-2. Clean config invariants (`sd-2.1-base` default, `RESTORATION_TIMESTEP=199`, `dinov2_reg`),
-   2D Bezier curved motion blur + optical bokeh disc PSF continuity, Lie-group directional Exposure/Warmth,
+2. Config invariants (`sd-2.1-base` default, `RESTORATION_TIMESTEPS=(299, 99)`, `LORA_EXPERT_SPECS`,
+   `dinov2_reg`), multi-pattern curved/tremor motion blur + custom blur helper + optical bokeh/CA +
+   4-mode artifact continuity + heteroscedastic noise, Lie-group directional Exposure/Warmth,
    Laplacian clean-patch sharpness gate, and auto-discovery + Compositional Real-Pair Wrapper across
    GoPro / RealBlur / DPDD folder & `.txt` layouts.
-3. Full 2-stage forward/backward (`pixel_stage` & `semantic_stage`), DDP gradient completeness,
-   zero-drift Target-Anchored CSD, frozen VAE decoder, 1x1 radiometric head, zero-action identity,
-   tiled inference, and 1-click semantic mask extraction (when PyTorch is installed).
+3. Full 2-step / 2-stage forward/backward (`pixel_stage` & `semantic_stage`), Shared+Specialist LoRA-MoE
+   zero-leakage routing, DDP gradient completeness, zero-drift Target-Anchored CSD, frozen VAE decoder,
+   1x1 radiometric head, zero-action identity, tiled inference, and 1-click semantic mask extraction.
 """
 
 import ast
@@ -52,30 +53,32 @@ def test_selective_pipeline():
         + cfg.ACTION_DIST_IDENTITY
     )
     assert abs(dist_sum - 1.0) < 1e-6, f"Action distribution must sum to 1.0, got {dist_sum}"
-    assert cfg.NUM_ACTIONS == 6, f"Expected 6 orthogonal controls, got {cfg.NUM_ACTIONS}"
+    assert cfg.NUM_ACTIONS == 10, f"Expected 10 orthogonal controls, got {cfg.NUM_ACTIONS}"
     assert cfg.SEMANTIC_ENCODER_TYPE == "dinov2_reg", "Default vision encoder must be dinov2_reg!"
     assert cfg.GENERATOR_BACKBONE == "sd-2.1-base", "Default backbone must be sd-2.1-base!"
     assert cfg.GENERATOR_REPO_MAP["sd-2.1-base"] == "sd2-community/stable-diffusion-2-1-base"
-    assert cfg.RESTORATION_TIMESTEP == 199
+    assert tuple(cfg.RESTORATION_TIMESTEPS) == (299, 99)
+    assert len(cfg.LORA_EXPERT_SPECS) == 4 and cfg.UNET_LORA_RANK == 20
+    assert cfg.MAX_COMPOUND_DEGRADATIONS == 4
     assert cfg.SKIP_DROPOUT_PROB > 0.0
     assert cfg.LOSS_CSD_WEIGHT > 0.0
 
     pil_cfg = PilotConfig()
-    assert pil_cfg.EPOCHS == 12 and pil_cfg.PIXEL_STAGE_EPOCHS == 9
+    assert pil_cfg.EPOCHS == 12 and pil_cfg.PIXEL_STAGE_EPOCHS == 8
     assert pil_cfg.MAX_STEPS_PER_EPOCH == 950 and pil_cfg.MIN_STEPS_PER_EPOCH == 950
 
     dbg_cfg = DebugConfig()
     assert dbg_cfg.EPOCHS == 2 and dbg_cfg.PIXEL_STAGE_EPOCHS == 1
 
     all_vec = parse_action_spec("all", cfg.DEGRADATION_TYPES, signed_types=cfg.SIGNED_ACTION_TYPES)
-    assert np.allclose(all_vec, [1.0, 1.0, 1.0, 1.0, 0.0, 0.0]), f"Unexpected 'all' vector: {all_vec}"
+    assert np.allclose(all_vec, [1.0] * 8 + [0.0, 0.0]), f"Unexpected 'all' vector: {all_vec}"
 
     legacy_vec = parse_action_spec(
-        "noise=0.8,jpeg=0.9,motion=0.7,sr=0.6,darken=0.5,cool=0.4",
+        "noise=0.8,jpeg=0.9,motion=0.7,sr=0.6,flare=0.5,reflection=0.4,ca=0.3,haze=0.2,darken=0.5,cool=0.4",
         cfg.DEGRADATION_TYPES,
         signed_types=cfg.SIGNED_ACTION_TYPES,
     )
-    assert np.allclose(legacy_vec, [0.8, 0.9, 0.7, 0.6, -0.5, -0.4]), f"Unexpected alias parse: {legacy_vec}"
+    assert np.allclose(legacy_vec, [0.8, 0.9, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, -0.5, -0.4]), f"Unexpected alias parse: {legacy_vec}"
 
     overlay_neg = build_spatial_action_overlay(16, 16, legacy_vec)
     assert float(overlay_neg.min()) == -0.5, "Spatial overlay must preserve negative signed controls!"
@@ -89,10 +92,17 @@ def test_selective_pipeline():
     cv2.rectangle(clean, (20, 20), (46, 102), (45, 210, 195), -1)
     params = pipe.sample_params(128, 128, rng=rng)
 
-    # 1. Exact identity at state = 0
+    # 1. Exact identity at state = 0 & custom motion blur helper
     zero_state = np.zeros(cfg.NUM_ACTIONS, dtype=np.float32)
     ident = pipe.render_with_params(clean, zero_state, params)
     assert np.array_equal(clean, ident), "State=0 must be exact identity!"
+
+    custom_id = pipe.render_custom_motion_blur(clean, length_px=0.0, angle_deg=35.0)
+    assert np.array_equal(clean, custom_id), "Custom motion blur with length=0 must be identity!"
+    custom_blur = pipe.render_custom_motion_blur(
+        clean, length_px=15.0, angle_deg=35.0, curve_bend=0.25, shake_jitter=0.30, pattern=1
+    )
+    assert custom_blur.shape == clean.shape and not np.array_equal(clean, custom_blur)
 
     # 2. Seed-synchronized selective removal: curved motion_blur + denoise -> remove noise, keep curved motion blur
     s_src = np.zeros(cfg.NUM_ACTIONS, dtype=np.float32)
@@ -124,12 +134,19 @@ def test_selective_pipeline():
             rec_tone = pipe.render_with_params(clean, s_rec, params)
             assert np.array_equal(clean, rec_tone), f"{signed_name}: inverse signed slider must reach exact clean target!"
 
-    # 4. Continuity across both optical bokeh disc PSF & Gaussian focus modes + 2D Bezier motion curves
-    for use_disc in (True, False):
+    # 4. Continuity across all 8 unsigned controls (incl. 5 flare styles, glass reflection, radial CA, haze)
+    params.motion_shake_jitter = 0.28
+    params.chroma_shift_px = 1.8
+    for use_disc, use_ca, het_n in ((True, True, True), (False, False, False)):
         params.use_bokeh_disc = use_disc
-        for mode_id in (0, 1, 2):
-            params.focus_mode = mode_id
-            params.artifact_mode = mode_id
+        params.use_chromatic_aberration = use_ca
+        params.heteroscedastic_noise = het_n
+        for mode_id in (0, 1, 2, 3, 4):
+            params.focus_mode = mode_id % 3
+            params.motion_pattern = mode_id % 3
+            params.artifact_mode = mode_id % 4
+            params.flare_style = mode_id
+            params._flare_cache = None
             for u_idx in pipe.unsigned_indices:
                 deg_name = cfg.DEGRADATION_TYPES[u_idx]
                 s_one = np.zeros(cfg.NUM_ACTIONS, dtype=np.float32)
@@ -142,6 +159,12 @@ def test_selective_pipeline():
                 err_zero = float(np.mean((d_zero - clean.astype(np.float32)) ** 2))
                 assert err_zero == 0.0, f"{deg_name} (disc={use_disc}, mode={mode_id}): a=1.0 must reach clean!"
                 assert err_full > err_half > 0.0, f"{deg_name} (disc={use_disc}, mode={mode_id}): must be monotonic!"
+
+    # Verify full-frame Brown-Conrady lens distortion helper
+    dist_id = pipe.render_lens_distortion(clean, k1=0.0, k2=0.0)
+    assert np.array_equal(clean, dist_id), "k1=0, k2=0 lens distortion must be exact identity!"
+    assert not np.array_equal(clean, pipe.render_lens_distortion(clean, k1=0.30))
+    assert not np.array_equal(clean, pipe.render_lens_distortion(clean, k1=-0.13))
 
     # 5. Compositional Real-Pair Wrapper + GoPro / RealBlur / DPDD Auto-Discovery Verification
     real_blur_sim = cv2.GaussianBlur(clean, (9, 9), 2.4)
@@ -283,7 +306,7 @@ def test_selective_pipeline():
         assert Path(report["outputs"]["raw_fullres_restored_png"]).exists()
         assert len(report["synthetic_benchmark_metrics"]) == 4
 
-    print("[PASS] Curved Bezier + bokeh disc physics, sharpness gate, GoPro/RealBlur/DPDD loader & benchmark verified.")
+    print("[PASS] Multi-pattern motion/custom blur, bokeh/CA, 4-mode artifacts, GoPro/RealBlur/DPDD loader & benchmark verified.")
 
 
 def test_model_and_stages_mock():
@@ -316,7 +339,7 @@ def test_model_and_stages_mock():
     src = torch.rand(2, 3, 64, 64)
     tgt = torch.rand(2, 3, 64, 64)
     act_map = torch.rand(2, cfg.NUM_ACTIONS, 64, 64)
-    act_map[:, 4:, :, :] = act_map[:, 4:, :, :] * 2.0 - 1.0
+    act_map[:, 8:, :, :] = act_map[:, 8:, :, :] * 2.0 - 1.0
 
     def _backward_on_worker_thread(loss_tensor):
         err_holder = []
@@ -335,17 +358,21 @@ def test_model_and_stages_mock():
 
     groups = model.get_stage_parameter_groups()
 
-    # Stage 1: Pixel Stage (Unified Pixel LoRA + SkipVAE + ActionOverlay + SpatialMod + 1x1 Tone Head)
+    # Stage 1: Pixel Stage (2-Step Refinement + Shared Base + Slider-Routed Specialists)
+    act_zero_motion = act_map.clone()
+    act_zero_motion[:, 2, :, :] = 0.0
     model.zero_grad(set_to_none=True)
     model.set_training_stage("pixel_stage")
-    out_s1 = model(src, act_map, tgt_01=tgt, fidelity_scale=1.0, detail_scale=0.0)
+    out_s1 = model(src, act_zero_motion, tgt_01=tgt, fidelity_scale=1.0, detail_scale=0.0)
+    assert "hat_z_1" in out_s1 and out_s1["hat_z_1"] is not out_s1["hat_z_0"]
     loss_s1, metrics_s1 = loss_fn(
         out_s1["pred"],
         tgt,
-        act_map,
+        act_zero_motion,
         stage="pixel_stage",
         src_01=src,
         hat_z_0=out_s1["hat_z_0"],
+        hat_z_1=out_s1["hat_z_1"],
         z_tgt=out_s1["z_tgt"],
         restorer_model=model,
     )
@@ -357,9 +384,13 @@ def test_model_and_stages_mock():
         if any(p is gp for gp in groups["pixel_stage"]) and p.grad is None
     ]
     assert not missing_pix_grads, f"Unused pixel_stage params (breaks DDP!): {missing_pix_grads}"
+    # Verify inactive specialist expert receives exact 0.0 gradient while shared_branch stays active!
+    for name, param in model.named_parameters():
+        if "pix_experts.motion_deconv" in name:
+            assert float(param.grad.abs().max().item()) == 0.0, f"Inactive expert {name} leaked gradient!"
     assert all(p.grad is None for p in groups["semantic_stage"])
 
-    # Stage 2: Semantic-Detail Stage with Zero-Drift Target-Anchored CSD
+    # Stage 2: Semantic-Detail Stage with Subpixel Anchor + Zero-Drift Target-Anchored CSD
     model.zero_grad(set_to_none=True)
     model.set_training_stage("semantic_stage")
     out_s2 = model(src, act_map, tgt_01=tgt, fidelity_scale=1.0, detail_scale=0.8)
@@ -370,6 +401,7 @@ def test_model_and_stages_mock():
         stage="semantic_stage",
         src_01=src,
         hat_z_0=out_s2["hat_z_0"],
+        hat_z_1=out_s2["hat_z_1"],
         z_tgt=out_s2["z_tgt"],
         restorer_model=model,
     )
@@ -395,16 +427,16 @@ def test_model_and_stages_mock():
     assert torch.allclose(ident_out, src[:1], atol=1e-7), "Zero action must preserve input bit-for-bit!"
 
     neg_act = torch.zeros(1, cfg.NUM_ACTIONS, 64, 64)
-    neg_act[:, 4, :, :32] = -0.80
+    neg_act[:, 8, :, :32] = -0.80
     with torch.no_grad():
         model.pixel_refiner.tone_head[-1].bias.fill_(0.25)
-    neg_out = model.sample(src[:1], neg_act, steps=1, fidelity_scale=1.0, detail_scale=0.5)
+    neg_out = model.sample(src[:1], neg_act, steps=1, fidelity_scale=1.0, detail_scale=0.65)
     assert not torch.allclose(neg_out[:, :, :, :32], src[:1, :, :, :32], atol=1e-4)
     assert torch.allclose(neg_out[:, :, :, 32:], src[:1, :, :, 32:], atol=1e-7)
 
     big_src = torch.rand(1, 3, 100, 110)
     big_act = torch.zeros(1, cfg.NUM_ACTIONS, 100, 110)
-    big_act[:, 5, :, :50] = -0.75
+    big_act[:, 9, :, :50] = -0.75
     tiled_out, tiled_traj = model.sample(
         big_src, big_act, steps=2, tile_size=64, tile_overlap=16, return_trajectory=True
     )
@@ -413,7 +445,7 @@ def test_model_and_stages_mock():
 
     mask_2d = extract_one_click_semantic_mask(model.semantic_encoder, src[:1], point_xy=(0.5, 0.5))
     assert mask_2d.shape == (64, 64) and 0.0 <= float(mask_2d.min()) and float(mask_2d.max()) <= 1.0
-    print("[PASS] Clean SD-2.1 baseline, DDP gradients, zero-drift CSD & selective controls verified.")
+    print("[PASS] 2-Step SD-2.1, Shared+Specialist LoRA-MoE, DDP gradients & zero-drift CSD verified.")
 
 
 if __name__ == "__main__":

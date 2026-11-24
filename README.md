@@ -2,33 +2,38 @@
 
 An **orthogonal, spatially controllable image restoration framework** built on **Frozen DINOv2-with-Registers** (`facebook/dinov2-with-registers-base`) and **Stable Diffusion 2.1 Base** (`sd2-community/stable-diffusion-2-1-base` default, plus `sd-turbo`, `sd-1.5`, `bk-sdm-small`, and `tiny-sd`).
 
-All control resides in a **6-Channel Spatial Control Overlay** $\mathbf{A}(y, x)$ plus a single **Generative Texture Detail** dial (`detail_scale` $\in [0, 1]$):
+All control resides in a **10-Channel Spatial Control Overlay** $\mathbf{A}(y, x)$ plus a **Generative Texture Detail** dial (`detail_scale` $\in [0, 1]$) and an optional **Full-Frame Lens Distortion** parameter (`--lens-k1`):
 
 ### Control Knobs
 
 | Knob | Range | Role | Meaning |
 | :--- | :---: | :---: | :--- |
-| **`denoise`** | `[0.0, 1.0]` | Structural Fix | `0.0` = keep grain · `1.0` = full sensor luminance & chroma denoise |
-| **`deartifact`** | `[0.0, 1.0]` | Structural Fix | `0.0` = keep · `1.0` = remove JPEG 8×8 blocking, ringing & 8-bit sky banding |
-| **`deblur_motion`** | `[0.0, 1.0]` | Structural Fix | `0.0` = keep panning/motion streaks · `1.0` = deconvolve camera shake |
-| **`sharpen_focus`** | `[0.0, 1.0]` | Structural Fix | `0.0` = keep portrait bokeh · `1.0` = sharpen optical defocus & low-res softness |
+| **`denoise`** | `[0.0, 1.0]` | `clean_smooth` | `0.0` = keep grain · `1.0` = full sensor luminance & chroma denoise |
+| **`deartifact`** | `[0.0, 1.0]` | `clean_smooth` | `0.0` = keep · `1.0` = remove JPEG blocks, ringing, 4:2:0 subsampling & banding |
+| **`deblur_motion`** | `[0.0, 1.0]` | `motion_deconv` | `0.0` = keep panning streaks · `1.0` = deconvolve Bezier/tremor camera shake |
+| **`sharpen_focus`** | `[0.0, 1.0]` | `focus_optical` | `0.0` = keep portrait bokeh · `1.0` = sharpen optical defocus & low-res softness |
+| **`deflare`** | `[0.0, 1.0]` | `optics_atmos` | `0.0` = keep sunlight flare · `1.0` = remove FFT corona, streaks, wash & lens ghosts |
+| **`dereflection`** | `[0.0, 1.0]` | `optics_atmos` | `0.0` = keep glass reflections · `1.0` = remove double-pane window reflections |
+| **`dechromatic`** | `[0.0, 1.0]` | `focus_optical` | `0.0` = keep · `1.0` = remove radial purple/cyan lens chromatic aberration |
+| **`dehaze`** | `[0.0, 1.0]` | `optics_atmos` | `0.0` = keep atmospheric mist · `1.0` = clear haze & restore contrast |
 | **`exposure`** | `[-1.0, +1.0]` | `1×1` Radiometric Head | `-1.0` = darken / recover washout · `0.0` = keep mood lighting · `+1.0` = brighten shadows |
 | **`warmth`** | `[-1.0, +1.0]` | `1×1` Radiometric Head | `-1.0` = cool / remove warm yellow cast · `0.0` = keep · `+1.0` = warm / remove cold blue cast |
-| **`detail_scale`** | `[0.0, 1.0]` | `sem_branch` (`r=16`, Stage 2) | `0.0` = conservative pixel-faithful PSNR · `0.50–1.0` = crisp natural micro-texture |
+| **`detail_scale`** | `[0.0, 1.0]` | `sem_branch` (`r=16`, Stage 2) | `0.0` = conservative pixel-faithful PSNR · `0.65–1.0` = crisp natural micro-texture |
+| **`--lens-k1`** | `[-0.35, +0.35]` | Full-frame Brown-Conrady | Optional standalone radial barrel/pincushion correction before tiled inference |
 
 ---
 
 ## Core Architecture
 
-1. **Clean Fixed-Timestep `SD-2.1-Base` (`t=199`) + Unified Dual-Branch LoRA**:
-   - Uses a single fixed denoising timestep (`RESTORATION_TIMESTEP = 199`) and unified pixel-fidelity LoRA (`r=32`) + semantic-detail LoRA (`r=16`).
-   - Stage 2 (`semantic_stage`) uses zero-extra-VRAM **Zero-Drift Target-Anchored CSD** (`LoRA OFF` on the frozen base UNet) + DISTS local patch texture matching.
+1. **2-Step Latent Refinement on `SD-2.1-Base` (`t = 299 → 99`) + Shared/Specialist LoRA-MoE**:
+   - Encodes once, runs Step 1 (`t=299`) for coarse deblur/denoise and Step 2 (`t=99`) for crisp fine-edge polish, then decodes once.
+   - Uses an always-active Shared Base Pixel LoRA (`r=20`) + additive Slider-Routed Specialist Experts (`clean_smooth`, `motion_deconv`, `focus_optical`, `r=8` each) + Stage-2 `sem_branch` (`r=16`) with zero-drift Target-Anchored CSD and a gentle full-res subpixel anchor.
 2. **2-Path Spatial Conditioning**:
    - `_ActionConditionedConvIn` + strictly `1×1` SPADE `PointwiseSpatialModulator` across UNet blocks, paired with `ActionOverlayEncoder` cross-attention tokens anchored onto OpenCLIP's 77-token prompt manifold.
-3. **Lightweight `SkipConnectedVAE` + `1×1` `PointwiseRadiometricHead`**:
-   - Frozen natural-manifold VAE decoder, lightweight `r=8` VAE encoder LoRA, action-gated `3×3` skip bridges with skip dropout (`0.15`), and exact zero-action bit-for-bit identity lock.
-4. **Hybrid Clean + Real Camera Deblurring Loader (`GoPro` + `HIDE` + `RealBlur` + `DPDD`)**:
-   - Combines Laplacian sharpness-gated clean 2K crops (2D Bezier curved camera shake + optical bokeh disc PSFs) with real paired camera datasets wrapped via a **Compositional Real-Pair Wrapper**.
+3. **`SkipConnectedVAE` + `1×1` `PointwiseRadiometricHead`**:
+   - Frozen natural-manifold VAE decoder, lightweight `r=8` VAE encoder LoRA, action-gated `3×3` skip bridges that fade fine skips smoothly as `detail_scale` increases, and exact zero-action bit-for-bit identity lock.
+4. **Rich Hybrid Clean + Real Camera Deblurring Loader (`GoPro` + `HIDE` + `RealBlur` + `DPDD`)**:
+   - Combines Laplacian sharpness-gated clean 2K crops (Bezier arcs, S-curve tremor, micro-shake motion blur, bokeh discs + chromatic aberration, 4:2:0 chroma/ringing/JPEG/banding, heteroscedastic noise, up to 4 compound degradations) with real paired camera datasets wrapped via a **Compositional Real-Pair Wrapper**.
 
 ---
 

@@ -2,7 +2,8 @@
 
 1. `vae.encoder` receives lightweight pixel-stage LoRA (when `VAE_ENC_LORA_RANK > 0`).
 2. `vae.decoder` stays 100% frozen so every decoded edge lies on SD's natural image manifold.
-3. `_SpatialSkipBridge` passes action-gated multi-scale encoder skips into the frozen decoder.
+3. `_SpatialSkipBridge` passes action-gated multi-scale encoder skips into the frozen decoder,
+   smoothly fading fine high-res skips as `detail_scale` increases so Stage-2 micro-texture is never washed out.
 """
 
 import math
@@ -169,6 +170,7 @@ class SkipConnectedVAE(nn.Module):
                 self.vae.encoder,
                 rank=enc_rank,
                 alpha=enc_alpha,
+                expert_specs=None,
                 sem_rank=0,
                 sem_alpha=0.0,
                 include_conv=True,
@@ -184,9 +186,14 @@ class SkipConnectedVAE(nn.Module):
             z_dummy, enc_skips = self._raw_encode(dummy)
             dec_channels = self._probe_decoder_channels(z_dummy)
 
+        deg_names = list(getattr(config, "DEGRADATION_TYPES", []))
+        signed_set = set(getattr(config, "SIGNED_ACTION_TYPES", ["exposure", "warmth"]))
+        struct_idx = [i for i, n in enumerate(deg_names) if n not in signed_set]
+        self.register_buffer("struct_action_indices", torch.tensor(struct_idx, dtype=torch.long), persistent=False)
+
         num_actions = config.NUM_ACTIONS
         mod_hidden = getattr(config, "SPATIAL_MOD_HIDDEN_DIM", 64)
-        self.skip_dropout_prob = float(getattr(config, "SKIP_DROPOUT_PROB", 0.15))
+        self.skip_dropout_prob = float(getattr(config, "SKIP_DROPOUT_PROB", 0.25))
 
         self.up_skip_bridges = nn.ModuleList(
             [
@@ -272,6 +279,7 @@ class SkipConnectedVAE(nn.Module):
         enc_skips: List[torch.Tensor],
         action_map: torch.Tensor,
         skip_scale: float = 1.0,
+        detail_scale: float = 0.0,
         release_skips: bool = False,
     ) -> torch.Tensor:
         """Decode latents back to [0, 1] RGB through frozen natural-manifold AutoencoderKL decoder."""
@@ -300,6 +308,8 @@ class SkipConnectedVAE(nn.Module):
             h = h.requires_grad_(True)
         h = grad_checkpoint(dec.mid_block, h, use_reentrant=False) if use_ckpt else dec.mid_block(h)
 
+        detail_env = min(1.0, max(0.0, float(detail_scale)))
+        fine_fade = (0.0, 0.50, 0.85)
         skip_indices = [2, 1, 0]
         for idx, up_block in enumerate(dec.up_blocks):
             if idx < 3 and len(enc_skips) > skip_indices[idx]:
@@ -308,12 +318,25 @@ class SkipConnectedVAE(nn.Module):
                 if release_skips and not use_ckpt:
                     enc_skips[s_idx] = None
                 if enc_skip is not None:
+                    if detail_env > 1e-4 and fine_fade[idx] > 0.0 and self.struct_action_indices.numel() > 0:
+                        thw = h.shape[-2:]
+                        a_loc = (
+                            F.interpolate(action_map.float(), size=thw, mode="area")
+                            if action_map.shape[-2:] != thw
+                            else action_map.float()
+                        )
+                        si = self.struct_action_indices.to(a_loc.device)
+                        struct_act = a_loc.index_select(1, si).abs().amax(dim=1, keepdim=True).clamp(0.0, 1.0)
+                        eff_keep = keep_mask * (1.0 - fine_fade[idx] * detail_env * struct_act).clamp(0.0, 1.0)
+                    else:
+                        eff_keep = keep_mask
+
                     h = (
                         grad_checkpoint(
-                            self.up_skip_bridges[idx], h, enc_skip, action_map, keep_mask, use_reentrant=False
+                            self.up_skip_bridges[idx], h, enc_skip, action_map, eff_keep, use_reentrant=False
                         )
                         if use_ckpt
-                        else self.up_skip_bridges[idx](h, enc_skip, action_map, keep_mask)
+                        else self.up_skip_bridges[idx](h, enc_skip, action_map, eff_keep)
                     )
                     del enc_skip
             h = grad_checkpoint(up_block, h, use_reentrant=False) if use_ckpt else up_block(h)

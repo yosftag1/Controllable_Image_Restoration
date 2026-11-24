@@ -23,18 +23,38 @@ class DegradationParams:
 
     height: int
     width: int
-    noise_seed: int                 # Deterministic seed for lazy sensor noise realization
-    motion_angle: float             # Primary trajectory angle in [0, 180)
-    motion_curve_bend: float = 0.0  # Quadratic Bezier camera-shake curvature in [-max_bend, +max_bend]
-    motion_dwell_end: float = 0.0   # Shutter turnaround endpoint dwell in [0, 0.35]
-    use_bokeh_disc: bool = True     # True = optical circle-of-confusion disc PSF, False = Gaussian softness
-    focus_mode: int = 0             # 0 = optical defocus/bokeh, 1 = low-res bicubic, 2 = hybrid lens+resample
-    artifact_mode: int = 0          # 0 = JPEG compression, 1 = 8-bit color banding, 2 = JPEG + banding
-    jpeg_quality: int = 20          # Frozen base JPEG quality in [10, 32] for monotonic severity blending
-    banding_levels: int = 12        # Frozen base quantization levels in [7, 16]
-    exposure_sign: float = 1.0      # -1.0 (dark/underexposed) or +1.0 (bright/washed-out)
-    warmth_sign: float = 1.0        # -1.0 (cold blue cast) or +1.0 (warm amber/yellow cast)
+    noise_seed: int                  # Deterministic seed for lazy sensor noise realization
+    motion_angle: float              # Primary trajectory angle in [0, 180)
+    motion_curve_bend: float = 0.0   # Quadratic Bezier camera-shake curvature in [-max_bend, +max_bend]
+    motion_dwell_end: float = 0.0    # Shutter turnaround endpoint dwell in [0, 0.35]
+    motion_shake_jitter: float = 0.0 # S-curve / handheld tremor amplitude in [-0.35, +0.35]
+    motion_pattern: int = 0          # 0 = Bezier arc, 1 = S-curve tremor, 2 = micro-shake jitter
+    use_bokeh_disc: bool = True      # True = optical circle-of-confusion disc PSF, False = Gaussian softness
+    focus_mode: int = 0              # 0 = optical defocus/bokeh, 1 = low-res bicubic, 2 = hybrid lens+resample
+    use_chromatic_aberration: bool = False  # Subtle lateral R/B lens fringing in optical focus mode
+    chroma_shift_px: float = 0.0     # Lateral R/B chromatic shift amplitude in pixels
+    artifact_mode: int = 0           # 0 = JPEG, 1 = 8-bit banding, 2 = JPEG+banding, 3 = 4:2:0 chroma+ringing+JPEG
+    jpeg_quality: int = 20           # Frozen base JPEG quality in [10, 32] for monotonic severity blending
+    banding_levels: int = 12         # Frozen base quantization levels in [7, 16]
+    heteroscedastic_noise: bool = False  # Signal-dependent CMOS shot+read noise modulation
+    flare_style: int = 0             # 0=Wave-Optics FFT, 1=Anamorphic, 2=Off-frame Wash, 3=Ghost Chain, 4=Rainbow Arc
+    flare_cx: float = 0.80           # Flare light center X in normalized coords (can be off-frame)
+    flare_cy: float = 0.16           # Flare light center Y in normalized coords
+    flare_seed: int = 7              # Deterministic seed for FFT dust/scratches & ghosts
+    flare_tint: Tuple[float, float, float] = (1.0, 0.88, 0.68)
+    refl_sigma: float = 2.6          # Glass reflection optical defocus sigma
+    refl_dx: float = 5.0             # Double-pane horizontal ghost offset (px)
+    refl_dy: float = 3.0             # Double-pane vertical ghost offset (px)
+    refl_angle: float = 0.6          # Planar Fresnel gradient angle
+    ca_max_scale: float = 0.016      # Radial R/B magnification delta at severity=1.0
+    haze_seed: int = 11              # Seed for smooth spatial atmospheric depth map
+    haze_airlight: Tuple[float, float, float] = (215.0, 224.0, 236.0)
+    exposure_sign: float = 1.0       # -1.0 (dark/underexposed) or +1.0 (bright/washed-out)
+    warmth_sign: float = 1.0         # -1.0 (cold blue cast) or +1.0 (warm amber/yellow cast)
     _noise_cache: Optional[np.ndarray] = field(default=None, repr=False)
+    _flare_cache: Optional[Tuple[np.ndarray, np.ndarray]] = field(default=None, repr=False)
+    _refl_cache: Optional[Tuple[np.ndarray, np.ndarray]] = field(default=None, repr=False)
+    _haze_depth_cache: Optional[np.ndarray] = field(default=None, repr=False)
 
     def get_noise_unit(self) -> np.ndarray:
         """Lazily materialize realistic sensor noise (80% RGB independent + 20% correlated luminance grain)."""
@@ -50,8 +70,12 @@ class SelectiveDegradationPipeline:
     """Synthesizes (x_src, A_spatial, x_tgt) pairs from clean GT or Compositional Real Camera Blur Pairs."""
 
     PHYSICAL_ORDER = [
+        "dehaze",
+        "dereflection",
         "sharpen_focus",
+        "dechromatic",
         "deblur_motion",
+        "deflare",
         "exposure",
         "warmth",
         "deartifact",
@@ -107,6 +131,34 @@ class SelectiveDegradationPipeline:
         max_bend = float(getattr(self.config, "MOTION_CURVE_MAX_BEND", 0.38))
         min_q, max_q = self.config.JPEG_QUALITY_RANGE
         min_lvl, max_lvl = self.config.BANDING_LEVELS_RANGE
+        f_style = int(rng.choice([0, 1, 2, 3, 4], p=[0.24, 0.18, 0.22, 0.22, 0.14]))
+        if f_style == 2:
+            # Off-frame light source just outside border
+            side = int(rng.integers(0, 4))
+            if side == 0:
+                fcx, fcy = float(rng.uniform(-0.22, -0.04)), float(rng.uniform(0.05, 0.90))
+            elif side == 1:
+                fcx, fcy = float(rng.uniform(1.04, 1.22)), float(rng.uniform(0.05, 0.90))
+            elif side == 2:
+                fcx, fcy = float(rng.uniform(0.10, 0.90)), float(rng.uniform(-0.22, -0.04))
+            else:
+                fcx, fcy = float(rng.uniform(0.10, 0.90)), float(rng.uniform(1.04, 1.22))
+        else:
+            fcx = float(rng.uniform(0.08, 0.92))
+            fcy = float(rng.uniform(0.08, 0.42) if rng.random() < 0.7 else rng.uniform(0.55, 0.92))
+        tint_presets = [
+            (1.0, 0.88, 0.66),
+            (1.0, 0.94, 0.82),
+            (0.92, 0.96, 1.00),
+            (1.0, 0.82, 0.56),
+        ]
+        f_tint = tint_presets[int(rng.integers(0, len(tint_presets)))]
+        air_base = float(rng.uniform(195.0, 238.0))
+        air_col = (
+            float(np.clip(air_base + rng.uniform(-10.0, 8.0), 175.0, 248.0)),
+            float(np.clip(air_base + rng.uniform(-4.0, 8.0), 180.0, 248.0)),
+            float(np.clip(air_base + rng.uniform(2.0, 18.0), 185.0, 250.0)),
+        )
         return DegradationParams(
             height=height,
             width=width,
@@ -114,11 +166,28 @@ class SelectiveDegradationPipeline:
             motion_angle=float(rng.uniform(min_angle, max_angle)),
             motion_curve_bend=float(rng.uniform(-max_bend, max_bend)),
             motion_dwell_end=float(rng.uniform(0.0, 0.35)),
+            motion_shake_jitter=float(rng.uniform(-0.35, 0.35)),
+            motion_pattern=int(rng.choice([0, 1, 2], p=[0.45, 0.35, 0.20])),
             use_bokeh_disc=bool(rng.random() < 0.70),
             focus_mode=int(rng.choice([0, 1, 2], p=[0.46, 0.32, 0.22])),
-            artifact_mode=int(rng.choice([0, 1, 2], p=[0.50, 0.25, 0.25])),
+            use_chromatic_aberration=bool(rng.random() < 0.20),
+            chroma_shift_px=float(rng.uniform(0.8, 2.0)),
+            artifact_mode=int(rng.choice([0, 1, 2, 3], p=[0.38, 0.20, 0.20, 0.22])),
             jpeg_quality=int(rng.integers(min_q, max(min_q + 1, (min_q + max_q) // 2))),
             banding_levels=int(rng.integers(min_lvl, max(min_lvl + 1, (min_lvl + max_lvl) // 2))),
+            heteroscedastic_noise=bool(rng.random() < 0.40),
+            flare_style=f_style,
+            flare_cx=fcx,
+            flare_cy=fcy,
+            flare_seed=int(rng.integers(0, 2**31 - 1)),
+            flare_tint=f_tint,
+            refl_sigma=float(rng.uniform(1.8, 4.0)),
+            refl_dx=float(rng.uniform(3.0, 7.0)) * (-1.0 if rng.random() < 0.5 else 1.0),
+            refl_dy=float(rng.uniform(2.0, 5.0)) * (-1.0 if rng.random() < 0.5 else 1.0),
+            refl_angle=float(rng.uniform(0.0, 2.0 * np.pi)),
+            ca_max_scale=float(rng.uniform(0.010, 0.022)),
+            haze_seed=int(rng.integers(0, 2**31 - 1)),
+            haze_airlight=air_col,
             exposure_sign=-1.0 if rng.random() < 0.5 else 1.0,
             warmth_sign=-1.0 if rng.random() < 0.5 else 1.0,
         )
@@ -171,8 +240,10 @@ class SelectiveDegradationPipeline:
         angle_deg: float,
         curve_bend: float = 0.0,
         dwell_end: float = 0.0,
+        shake_jitter: float = 0.0,
+        pattern: int = 0,
     ) -> np.ndarray:
-        """Single-pass 2D Bezier PSF kernel convolution (~15x faster on CPU than multi-pass warpAffine!)."""
+        """Single-pass 2D Bezier / S-curve / handheld tremor PSF kernel convolution."""
         if length_px <= 0.05:
             return img_float
         rad = np.deg2rad(angle_deg)
@@ -189,6 +260,18 @@ class SelectiveDegradationPipeline:
         quad_zero_mean = (t_vals * t_vals) - np.float32(1.0 / 3.0)
         dx_arr = t_vals * np.float32(tx) + np.float32(curve_bend) * quad_zero_mean * np.float32(nx)
         dy_arr = t_vals * np.float32(ty) + np.float32(curve_bend) * quad_zero_mean * np.float32(ny)
+
+        if pattern == 1 and abs(shake_jitter) > 1e-4:
+            # S-curve handheld trajectory wobble
+            s_wave = np.sin(np.float32(np.pi) * t_vals) * np.float32(shake_jitter)
+            dx_arr = dx_arr + s_wave * np.float32(nx)
+            dy_arr = dy_arr + s_wave * np.float32(ny)
+        elif pattern == 2 and abs(shake_jitter) > 1e-4:
+            # Multi-frequency handheld micro-shake tremor
+            wobble_n = np.sin(np.float32(2.5 * np.pi) * t_vals) * np.float32(0.75 * shake_jitter)
+            wobble_t = np.cos(np.float32(2.0 * np.pi) * t_vals) * np.float32(0.18 * abs(shake_jitter))
+            dx_arr = dx_arr + wobble_n * np.float32(nx) + wobble_t * np.float32(tx)
+            dy_arr = dy_arr + wobble_n * np.float32(ny) + wobble_t * np.float32(ty)
 
         max_reach = int(np.ceil(max(float(np.max(np.abs(dx_arr))), float(np.max(np.abs(dy_arr)))) + 1.5))
         half_k = max(1, max_reach)
@@ -212,6 +295,34 @@ class SelectiveDegradationPipeline:
         psf /= np.maximum(np.sum(psf), np.float32(1e-6))
 
         return cv2.filter2D(img_float, cv2.CV_32F, psf, borderType=cv2.BORDER_REFLECT_101)
+
+    @classmethod
+    def render_custom_motion_blur(
+        cls,
+        img_rgb_u8: np.ndarray,
+        length_px: float,
+        angle_deg: float,
+        curve_bend: float = 0.0,
+        shake_jitter: float = 0.0,
+        dwell_end: float = 0.0,
+        pattern: int = 0,
+    ) -> np.ndarray:
+        """Synthesize custom linear-light motion blur with explicit length, angle, curvature & shake."""
+        if length_px <= 0.05:
+            return img_rgb_u8.copy()
+        inv255 = np.float32(1.0 / 255.0)
+        lin = np.square(np.clip(img_rgb_u8.astype(np.float32) * inv255, np.float32(0.0), np.float32(1.0))) * np.float32(255.0)
+        blurred = cls._continuous_curved_motion_blur(
+            lin,
+            length_px=float(length_px),
+            angle_deg=float(angle_deg),
+            curve_bend=float(curve_bend),
+            dwell_end=float(dwell_end),
+            shake_jitter=float(shake_jitter),
+            pattern=int(pattern),
+        )
+        out = np.sqrt(np.clip(blurred * inv255, np.float32(0.0), np.float32(1.0))) * np.float32(255.0)
+        return np.clip(np.round(out), np.float32(0.0), np.float32(255.0)).astype(np.uint8)
 
     @staticmethod
     def _build_optical_bokeh_disc_kernel(radius: float) -> np.ndarray:
@@ -267,6 +378,19 @@ class SelectiveDegradationPipeline:
                     np.float32(255.0),
                 )
 
+        if params.focus_mode in (0, 2) and params.use_chromatic_aberration and params.chroma_shift_px > 0.05:
+            shift = float(sev * params.chroma_shift_px)
+            if shift >= 0.05:
+                m_r = np.array([[1.0, 0.0, shift], [0.0, 1.0, 0.0]], dtype=np.float32)
+                m_b = np.array([[1.0, 0.0, -shift], [0.0, 1.0, 0.0]], dtype=np.float32)
+                out = out.copy()
+                out[:, :, 0] = cv2.warpAffine(
+                    out[:, :, 0], m_r, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT_101
+                )
+                out[:, :, 2] = cv2.warpAffine(
+                    out[:, :, 2], m_b, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT_101
+                )
+
         return out
 
     @staticmethod
@@ -297,8 +421,24 @@ class SelectiveDegradationPipeline:
             return img_float
         return cv2.cvtColor(cv2.imdecode(enc, cv2.IMREAD_COLOR), cv2.COLOR_BGR2RGB).astype(np.float32)
 
+    @classmethod
+    def _render_base_chroma_ringing(cls, img_float: np.ndarray, quality: int) -> np.ndarray:
+        """4:2:0 YCrCb chroma subsampling + subtle unsharp ringing + JPEG compression."""
+        h, w = img_float.shape[:2]
+        u8 = np.clip(np.round(img_float), 0.0, 255.0).astype(np.uint8)
+        ycc = cv2.cvtColor(u8, cv2.COLOR_RGB2YCrCb)
+        y_ch, cr, cb = cv2.split(ycc)
+        half_w, half_h = max(8, w // 2), max(8, h // 2)
+        cr_sub = cv2.resize(cv2.resize(cr, (half_w, half_h), interpolation=cv2.INTER_AREA), (w, h), interpolation=cv2.INTER_LINEAR)
+        cb_sub = cv2.resize(cv2.resize(cb, (half_w, half_h), interpolation=cv2.INTER_AREA), (w, h), interpolation=cv2.INTER_LINEAR)
+        sub_rgb = cv2.cvtColor(cv2.merge([y_ch, cr_sub, cb_sub]), cv2.COLOR_YCrCb2RGB).astype(np.float32)
+        # Subtle Gibbs ringing overshoot around high-contrast edges before JPEG
+        blur_l = cv2.GaussianBlur(sub_rgb, (0, 0), sigmaX=1.0, sigmaY=1.0)
+        ringed = np.clip(sub_rgb + np.float32(0.35) * (sub_rgb - blur_l), np.float32(0.0), np.float32(255.0))
+        return cls._render_base_jpeg(ringed, quality)
+
     def _apply_deartifact_forward(self, img_float: np.ndarray, severity: float, params: DegradationParams) -> np.ndarray:
-        """Apply compression/banding artifacts with monotonic linear blending for partial severities."""
+        """Apply compression/banding/chroma-ringing artifacts with monotonic linear blending."""
         if severity <= 1e-4:
             return img_float
         sev = float(np.clip(severity, 0.0, 1.0))
@@ -307,24 +447,267 @@ class SelectiveDegradationPipeline:
             cur = self._render_base_banding(cur, params.banding_levels)
         if params.artifact_mode in (0, 2):
             cur = self._render_base_jpeg(cur, params.jpeg_quality)
+        if params.artifact_mode == 3:
+            cur = self._render_base_chroma_ringing(cur, params.jpeg_quality)
         if sev >= 0.999:
             return cur
         return img_float * np.float32(1.0 - sev) + cur * np.float32(sev)
 
+    @staticmethod
+    def _apply_haze(img_float: np.ndarray, severity: float, params: DegradationParams) -> np.ndarray:
+        """Spatially varying atmospheric scattering veil I = J*t + A*(1 - t)."""
+        if severity <= 1e-4:
+            return img_float
+        sev = float(np.clip(severity, 0.0, 1.0))
+        h, w = img_float.shape[:2]
+        if params._haze_depth_cache is None or params._haze_depth_cache.shape[:2] != (h, w):
+            hrng = np.random.default_rng(params.haze_seed)
+            coarse = hrng.uniform(0.50, 1.0, size=(6, 6)).astype(np.float32)
+            smooth = cv2.resize(coarse, (w, h), interpolation=cv2.INTER_CUBIC)
+            vert = np.linspace(0.95, 0.45, h, dtype=np.float32)[:, None]
+            params._haze_depth_cache = np.clip(0.55 * smooth + 0.45 * vert, 0.25, 1.0)[:, :, None]
+        beta = np.float32(sev * 1.40)
+        trans = np.exp(-beta * params._haze_depth_cache)
+        air = np.array(params.haze_airlight, dtype=np.float32).reshape(1, 1, 3)
+        return np.clip(img_float * trans + air * (np.float32(1.0) - trans), np.float32(0.0), np.float32(255.0))
+
+    @staticmethod
+    def _apply_reflection(
+        lin_rgb: np.ndarray,
+        severity: float,
+        params: DegradationParams,
+        refl_donor_u8: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        """Highlight-dominant double-pane glass reflection with planar Fresnel gradient."""
+        if severity <= 1e-4:
+            return lin_rgb
+        sev = float(np.clip(severity, 0.0, 1.0))
+        h, w = lin_rgb.shape[:2]
+        if params._refl_cache is None or params._refl_cache[0].shape[:2] != (h, w):
+            if refl_donor_u8 is not None:
+                d_rs = cv2.resize(refl_donor_u8, (w, h), interpolation=cv2.INTER_AREA)
+                inv255 = np.float32(1.0 / 255.0)
+                donor_lin = np.square(np.clip(d_rs.astype(np.float32) * inv255, 0.0, 1.0)) * np.float32(255.0)
+            else:
+                donor_lin = np.roll(np.fliplr(lin_rgb), shift=(h // 5, w // 4), axis=(0, 1)).astype(np.float32)
+            refl_blur = cv2.GaussianBlur(donor_lin, (0, 0), sigmaX=params.refl_sigma, sigmaY=params.refl_sigma)
+            refl_hi = np.power(np.clip(refl_blur / np.float32(255.0), 0.0, 1.0), np.float32(1.75)) * np.float32(255.0)
+            m_shift = np.array([[1.0, 0.0, params.refl_dx], [0.0, 1.0, params.refl_dy]], dtype=np.float32)
+            refl_ghost = cv2.warpAffine(
+                refl_hi, m_shift, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT_101
+            )
+            refl_double = (np.float32(0.72) * refl_hi + np.float32(0.28) * refl_ghost) * np.array(
+                [0.94, 1.00, 0.98], dtype=np.float32
+            ).reshape(1, 1, 3)
+
+            yy, xx = np.meshgrid(np.linspace(-1.0, 1.0, h), np.linspace(-1.0, 1.0, w), indexing="ij")
+            proj = np.cos(params.refl_angle) * xx + np.sin(params.refl_angle) * yy
+            fresnel = np.clip(0.58 + 0.38 * proj, 0.18, 1.0).astype(np.float32)[:, :, None]
+            params._refl_cache = (refl_double, fresnel)
+
+        refl_double, fresnel = params._refl_cache
+        w_refl = np.float32(sev * 0.72) * fresnel
+        w_trans = np.float32(1.0) - np.float32(0.18) * w_refl
+        return np.clip(lin_rgb * w_trans + refl_double * w_refl, np.float32(0.0), np.float32(255.0))
+
+    @staticmethod
+    def _apply_radial_chromatic_aberration(
+        lin_rgb: np.ndarray, severity: float, params: DegradationParams
+    ) -> np.ndarray:
+        """Radial R/B magnification scaling: center stays crisp, outer edges fringe purple/cyan."""
+        if severity <= 1e-4:
+            return lin_rgb
+        sev = float(np.clip(severity, 0.0, 1.0))
+        h, w = lin_rgb.shape[:2]
+        cx, cy = (w - 1) * 0.5, (h - 1) * 0.5
+        yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+        k = float(sev * params.ca_max_scale)
+        map_r_x = (cx + (xx - cx) * (1.0 - k)).astype(np.float32)
+        map_r_y = (cy + (yy - cy) * (1.0 - k)).astype(np.float32)
+        map_b_x = (cx + (xx - cx) * (1.0 + k)).astype(np.float32)
+        map_b_y = (cy + (yy - cy) * (1.0 + k)).astype(np.float32)
+        out = lin_rgb.copy()
+        out[:, :, 0] = cv2.remap(
+            lin_rgb[:, :, 0], map_r_x, map_r_y, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT_101
+        )
+        out[:, :, 2] = cv2.remap(
+            lin_rgb[:, :, 2], map_b_x, map_b_y, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT_101
+        )
+        return out
+
+    @staticmethod
+    def _build_flare_fields(h: int, w: int, params: DegradationParams) -> Tuple[np.ndarray, np.ndarray]:
+        """Lazy-compute unit-severity (flare_rgb [0..1+], veil_atten_strength [0..0.35]) for all 5 flare styles."""
+        frng = np.random.default_rng(params.flare_seed)
+        yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+        cx, cy = float(params.flare_cx) * w, float(params.flare_cy) * h
+        dx, dy = (xx - cx) / max(h, w), (yy - cy) / max(h, w)
+        dist = np.sqrt(dx * dx + dy * dy) + np.float32(1e-4)
+        tint_arr = np.array(params.flare_tint, dtype=np.float32).reshape(1, 1, 3)
+
+        style = int(params.flare_style) % 5
+        if style == 0:
+            # 0: Wave-optics FFT Fraunhofer diffraction corona (computed fast at 128x128)
+            n = 128
+            py, px = np.mgrid[0:n, 0:n].astype(np.float32) - n * 0.5
+            rr = np.sqrt(px * px + py * py) / (n * 0.11)
+            th = np.arctan2(py, px)
+            sector = (2.0 * np.pi) / 6.0
+            ang_m = np.abs(((th + 0.18) % sector) - 0.5 * sector)
+            ap = (rr <= (np.cos(0.5 * sector) / np.maximum(np.cos(ang_m), 1e-4))).astype(np.float32)
+            dust = cv2.GaussianBlur(frng.normal(0.0, 1.2, size=(n, n)).astype(np.float32), (0, 0), sigmaX=1.2)
+            pupil = ap * np.exp(1j * (0.45 * dust))
+            pwr = np.power(np.abs(np.fft.fftshift(np.fft.fft2(pupil))) ** 2, 0.38).astype(np.float32)
+            pwr /= max(1e-8, float(pwr.max()))
+            c_n = n * 0.5
+            psf_s = np.zeros((n, n, 3), dtype=np.float32)
+            for ch, wl in enumerate((1.07, 1.00, 0.93)):
+                m = np.array([[wl, 0.0, c_n * (1.0 - wl)], [0.0, wl, c_n * (1.0 - wl)]], dtype=np.float32)
+                psf_s[:, :, ch] = cv2.warpAffine(pwr, m, (n, n), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
+            psf_full = cv2.resize(psf_s, (w * 2, h * 2), interpolation=cv2.INTER_LINEAR)
+            x0 = max(0, min(w, w - int(round(cx))))
+            y0 = max(0, min(h, h - int(round(cy))))
+            crop_psf = psf_full[y0 : y0 + h, x0 : x0 + w]
+            veil = (np.exp(-dist * 2.2) * 0.24)[:, :, None] * tint_arr
+            flare_rgb = crop_psf * np.float32(1.25) + veil
+            veil_atten = np.clip(0.16 * veil, 0.0, 0.30)
+            return flare_rgb, veil_atten
+
+        if style == 1:
+            # 1: Anamorphic / Smartphone smudge streak
+            dx_w, dy_h = (xx - cx) / w, (yy - cy) / h
+            s_main = np.exp(-np.abs(dy_h) * 32.0) * np.exp(-np.abs(dx_w) * 2.2) * 0.80
+            s_wide = np.exp(-np.abs(dy_h) * 9.5) * np.exp(-np.abs(dx_w) * 1.4) * 0.24
+            core = np.exp(-(dx_w * dx_w + dy_h * dy_h) * 52.0) * 0.85
+            ana_t = np.array([0.52, 0.78, 1.00], dtype=np.float32).reshape(1, 1, 3)
+            core_t = np.array([0.92, 0.97, 1.00], dtype=np.float32).reshape(1, 1, 3)
+            smudge = np.exp(-((dx_w * 2.4) ** 2 + (dy_h * 1.2) ** 2)) * 0.14
+            flare_rgb = (s_main + s_wide)[:, :, None] * ana_t + core[:, :, None] * core_t + smudge[:, :, None] * core_t
+            veil_atten = np.clip(0.10 * smudge[:, :, None], 0.0, 0.20)
+            return flare_rgb, veil_atten
+
+        if style == 2:
+            # 2: Off-frame golden backlit wash
+            wash = np.exp(-dist * 1.75) * 0.46 + np.exp(-dist * 4.5) * 0.40
+            flare_rgb = wash[:, :, None] * tint_arr
+            veil_atten = np.clip(0.26 * wash[:, :, None], 0.0, 0.35)
+            return flare_rgb, veil_atten
+
+        if style == 3:
+            # 3: Multi-element DSLR hexagonal/ringed ghost chain
+            ox, oy = w * 0.5, h * 0.5
+            ghost_layer = np.zeros((h, w, 3), dtype=np.float32)
+            specs = [
+                (0.28, 11, (0.95, 0.88, 0.72), 0.13, False),
+                (0.56, 20, (0.55, 0.92, 0.68), 0.11, True),
+                (0.84, 10, (0.98, 0.68, 0.42), 0.14, False),
+                (1.12, 28, (0.48, 0.74, 0.98), 0.09, True),
+                (1.48, 18, (0.85, 0.58, 0.95), 0.10, False),
+                (1.78, 34, (0.45, 0.88, 0.80), 0.08, True),
+            ]
+            for pos, rad, col, alpha, ring_edge in specs:
+                gx = cx + pos * (ox - cx)
+                gy = cy + pos * (oy - cy)
+                angles = np.linspace(0.0, 2.0 * np.pi, 6, endpoint=False) + float(frng.uniform(0.0, 0.5))
+                pts = np.round(np.stack([gx + rad * np.cos(angles), gy + rad * np.sin(angles)], axis=-1)).astype(np.int32)
+                mask = np.zeros((h, w), dtype=np.float32)
+                cv2.fillConvexPoly(mask, pts, 1.0)
+                if ring_edge:
+                    in_pts = np.round(
+                        np.stack([gx + rad * 0.72 * np.cos(angles), gy + rad * 0.72 * np.sin(angles)], axis=-1)
+                    ).astype(np.int32)
+                    inner = np.zeros((h, w), dtype=np.float32)
+                    cv2.fillConvexPoly(inner, in_pts, 1.0)
+                    mask = np.clip(0.42 * mask + 0.58 * (mask - inner), 0.0, 1.0)
+                soft = cv2.GaussianBlur(mask, (0, 0), sigmaX=max(2.0, rad * 0.18))
+                ghost_layer += (soft * np.float32(alpha))[:, :, None] * np.array(col, dtype=np.float32).reshape(1, 1, 3)
+            src_glow = (np.exp(-dist * 4.0) * 0.24)[:, :, None] * tint_arr
+            flare_rgb = ghost_layer + src_glow
+            veil_atten = np.clip(0.08 * src_glow, 0.0, 0.15)
+            return flare_rgb, veil_atten
+
+        # 4: Lens-barrel curved chromatic rainbow crescent arc
+        angle = np.arctan2(dy, dx)
+        to_c = np.arctan2(0.5 * h - cy, 0.5 * w - cx)
+        ang_d = np.arctan2(np.sin(angle - to_c), np.cos(angle - to_c))
+        crescent = np.exp(-np.square(ang_d / 0.85))
+        r_c = 0.62
+        arc = np.stack(
+            [
+                np.exp(-np.square((dist - (r_c + 0.040)) / 0.042)),
+                np.exp(-np.square((dist - r_c) / 0.042)) * 0.90,
+                np.exp(-np.square((dist - (r_c - 0.040)) / 0.042)),
+            ],
+            axis=-1,
+        ) * crescent[:, :, None] * np.float32(0.14)
+        src_veil = (np.exp(-dist * 2.2) * 0.26)[:, :, None] * tint_arr
+        flare_rgb = arc + src_veil
+        veil_atten = np.clip(0.14 * src_veil, 0.0, 0.25)
+        return flare_rgb, veil_atten
+
+    @classmethod
+    def _apply_lens_flare(cls, lin_rgb: np.ndarray, severity: float, params: DegradationParams) -> np.ndarray:
+        """Apply realistic optical lens flare in linear light with strict severity monotonicity."""
+        if severity <= 1e-4:
+            return lin_rgb
+        sev = float(np.clip(severity, 0.0, 1.0))
+        h, w = lin_rgb.shape[:2]
+        if params._flare_cache is None or params._flare_cache[0].shape[:2] != (h, w):
+            params._flare_cache = cls._build_flare_fields(h, w, params)
+        flare_rgb, veil_atten = params._flare_cache
+        atten = np.clip(1.0 - np.float32(sev) * veil_atten, 0.60, 1.0)
+        return np.clip(lin_rgb * atten + np.float32(sev * 255.0) * flare_rgb, np.float32(0.0), np.float32(255.0))
+
+    @staticmethod
+    def render_lens_distortion(rgb_u8: np.ndarray, k1: float = 0.0, k2: float = 0.0) -> np.ndarray:
+        """Full-frame Brown-Conrady radial distortion/correction (k1>0 barrel, k1<0 pincushion)."""
+        if abs(k1) < 1e-5 and abs(k2) < 1e-5:
+            return rgb_u8.copy()
+        h, w = rgb_u8.shape[:2]
+        cx, cy = (w - 1) * 0.5, (h - 1) * 0.5
+        yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+        xn = (xx - cx) / max(1.0, cx)
+        yn = (yy - cy) / max(1.0, cy)
+        r2 = xn * xn + yn * yn
+        factor = 1.0 + np.float32(k1) * r2 + np.float32(k2) * (r2 * r2)
+        xs, ys = xn * factor, yn * factor
+        max_reach = max(1.0, float(np.max(np.abs(xs))), float(np.max(np.abs(ys))))
+        map_x = ((xs / np.float32(max_reach)) * cx + cx).astype(np.float32)
+        map_y = ((ys / np.float32(max_reach)) * cy + cy).astype(np.float32)
+        return cv2.remap(rgb_u8, map_x, map_y, interpolation=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REFLECT_101)
+
     def render_with_params(
-        self, clean_rgb_u8: np.ndarray, state_vec: np.ndarray, params: DegradationParams
+        self,
+        clean_rgb_u8: np.ndarray,
+        state_vec: np.ndarray,
+        params: DegradationParams,
+        refl_donor_u8: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         """Render an RGB uint8 image from `clean_rgb_u8` at signed/unsigned state `state_vec`."""
         cur = clean_rgb_u8.astype(np.float32)
 
-        # 1 & 2. Linear-light (gamma=2.0) optical bokeh disc / focus & 2D curved Bezier camera-shake blur
+        # 1. Atmospheric haze (scene level)
+        if "dehaze" in self.type_to_idx:
+            s_haze = float(state_vec[self.type_to_idx["dehaze"]])
+            if s_haze > 1e-4:
+                cur = self._apply_haze(cur, s_haze, params)
+
+        # 2. Linear-light optical pipeline (reflection -> focus -> radial CA -> motion blur -> lens flare)
+        s_refl = float(state_vec[self.type_to_idx["dereflection"]]) if "dereflection" in self.type_to_idx else 0.0
         s_foc = float(state_vec[self.type_to_idx["sharpen_focus"]]) if "sharpen_focus" in self.type_to_idx else 0.0
+        s_ca = float(state_vec[self.type_to_idx["dechromatic"]]) if "dechromatic" in self.type_to_idx else 0.0
         s_mot = float(state_vec[self.type_to_idx["deblur_motion"]]) if "deblur_motion" in self.type_to_idx else 0.0
-        if s_foc > 1e-4 or s_mot > 1e-4:
+        s_flr = float(state_vec[self.type_to_idx["deflare"]]) if "deflare" in self.type_to_idx else 0.0
+
+        if s_refl > 1e-4 or s_foc > 1e-4 or s_ca > 1e-4 or s_mot > 1e-4 or s_flr > 1e-4:
             inv255 = np.float32(1.0 / 255.0)
             lin = np.square(np.clip(cur * inv255, np.float32(0.0), np.float32(1.0))) * np.float32(255.0)
+            if s_refl > 1e-4:
+                lin = self._apply_reflection(lin, s_refl, params, refl_donor_u8=refl_donor_u8)
             if s_foc > 1e-4:
                 lin = self._apply_focus_softness(lin, s_foc, params)
+            if s_ca > 1e-4:
+                lin = self._apply_radial_chromatic_aberration(lin, s_ca, params)
             if s_mot > 1e-4:
                 _, max_k = self.config.MOTION_BLUR_KERNEL_RANGE
                 length_px = float(np.clip(s_mot, 0.0, 1.0)) * (float(max_k) - 1.0)
@@ -334,7 +717,11 @@ class SelectiveDegradationPipeline:
                     params.motion_angle,
                     curve_bend=params.motion_curve_bend,
                     dwell_end=params.motion_dwell_end,
+                    shake_jitter=params.motion_shake_jitter,
+                    pattern=params.motion_pattern,
                 )
+            if s_flr > 1e-4:
+                lin = self._apply_lens_flare(lin, s_flr, params)
             cur = np.sqrt(np.clip(lin * inv255, np.float32(0.0), np.float32(1.0))) * np.float32(255.0)
 
         # 3 & 4. Exact Commutative Lie-Group Exposure + Warmth in float32 [0, 1]
@@ -360,19 +747,32 @@ class SelectiveDegradationPipeline:
             if s_noi > 1e-4:
                 _, max_std = self.config.GAUSSIAN_NOISE_STD_RANGE
                 noise_std = np.float32(float(np.clip(s_noi, 0.0, 1.0)) * float(max_std))
-                cur = np.clip(cur + params.get_noise_unit() * noise_std, np.float32(0.0), np.float32(255.0))
+                if params.heteroscedastic_noise:
+                    lum_mod = np.float32(0.70) + np.float32(0.60) * np.sqrt(
+                        np.clip(cur * np.float32(1.0 / 255.0), np.float32(0.0), np.float32(1.0))
+                    )
+                    noise_delta = params.get_noise_unit() * (noise_std * lum_mod)
+                else:
+                    noise_delta = params.get_noise_unit() * noise_std
+                cur = np.clip(cur + noise_delta, np.float32(0.0), np.float32(255.0))
 
         return np.clip(np.round(cur), np.float32(0.0), np.float32(255.0)).astype(np.uint8)
 
     def sample_source_severity(
         self, rng: np.random.Generator = None, params: Optional[DegradationParams] = None
     ) -> np.ndarray:
-        """Sample 1 to 3 active degradations (unsigned in [min_sev, 1], signed in +/-[min_sev, 0.92])."""
+        """Sample 1 to 4 active degradations (unsigned in [min_sev, 1], signed in +/-[min_sev, 0.95])."""
         rng = rng or np.random.default_rng()
         eff_compound_prob = max(0.15, self.compound_prob * (1.0 - 0.70 * self.curriculum_single_boost))
 
         if self.max_compound > 1 and rng.random() < eff_compound_prob:
-            k = 2 if (self.max_compound == 2 or rng.random() < 0.68) else min(3, self.max_compound)
+            u_k = float(rng.random())
+            if self.max_compound >= 4 and u_k < 0.22:
+                k = 4
+            elif self.max_compound >= 3 and u_k < 0.54:
+                k = 3
+            else:
+                k = 2
         else:
             k = 1
 
@@ -393,7 +793,7 @@ class SelectiveDegradationPipeline:
             drop_name = "deblur_motion" if rng.random() < 0.4 else "sharpen_focus"
             chosen.remove(self.type_to_idx[drop_name])
 
-        damping = 1.0 if len(chosen) == 1 else (0.90 if len(chosen) == 2 else 0.80)
+        damping = 1.0 if len(chosen) == 1 else (0.90 if len(chosen) == 2 else (0.82 if len(chosen) == 3 else 0.76))
         s_src = np.zeros(self.num_types, dtype=np.float32)
         for idx in chosen:
             mag = float(np.clip(float(rng.uniform(self.min_severity, 0.95)) * damping, self.min_severity, 0.95))
@@ -523,13 +923,14 @@ class SelectiveDegradationPipeline:
         clean_rgb_u8: np.ndarray,
         rng: np.random.Generator = None,
         align_only: bool = False,
+        refl_donor_u8: Optional[np.ndarray] = None,
     ):
         """Fast synthesis returning compact components (x_src, x_tgt, a_fg, a_bg, mask_2d, s_src)."""
         rng = rng or np.random.default_rng()
         h, w = clean_rgb_u8.shape[:2]
         params = self.sample_params(h, w, rng=rng)
         s_src = self.sample_source_severity(rng=rng, params=params)
-        x_src = self.render_with_params(clean_rgb_u8, s_src, params)
+        x_src = self.render_with_params(clean_rgb_u8, s_src, params, refl_donor_u8=refl_donor_u8)
 
         if align_only:
             zeros_a = np.zeros(self.num_types, dtype=np.float32)
@@ -543,7 +944,7 @@ class SelectiveDegradationPipeline:
         elif np.allclose(s_tgt_fg, 0.0, atol=1e-4):
             x_tgt_fg = clean_rgb_u8.copy()
         else:
-            x_tgt_fg = self.render_with_params(clean_rgb_u8, s_tgt_fg, params)
+            x_tgt_fg = self.render_with_params(clean_rgb_u8, s_tgt_fg, params, refl_donor_u8=refl_donor_u8)
 
         eff_mask_prob = self.spatial_mask_prob * (1.0 - 0.65 * self.curriculum_single_boost)
         if rng.random() < eff_mask_prob:
@@ -560,7 +961,7 @@ class SelectiveDegradationPipeline:
             elif np.allclose(s_tgt_bg, s_tgt_fg, atol=1e-4):
                 x_tgt_bg = x_tgt_fg
             else:
-                x_tgt_bg = self.render_with_params(clean_rgb_u8, s_tgt_bg, params)
+                x_tgt_bg = self.render_with_params(clean_rgb_u8, s_tgt_bg, params, refl_donor_u8=refl_donor_u8)
 
             mask = self.sample_spatial_mask(clean_rgb_u8, rng=rng)
             mask_3d = mask[:, :, None]
@@ -965,8 +1366,12 @@ class ControllableRestorationDataset(_TorchDataset):
             )
         else:
             clean_u8 = self._load_crop_with_retry(idx % max(1, len(self.image_paths)))
+            donor_u8 = None
+            if self.is_train and len(self._decoded_ring) >= 2:
+                d_slot = int(rng.integers(0, len(self._decoded_ring)))
+                donor_u8 = self._crop_and_augment(self._decoded_ring[d_slot][0])
             x_src_u8, x_tgt_u8, a_fg, a_bg, mask_2d, s_src = self.pipeline.synthesize_components(
-                clean_u8, rng=rng, align_only=self.align_only
+                clean_u8, rng=rng, align_only=self.align_only, refl_donor_u8=donor_u8
             )
 
         inv_255 = np.float32(1.0 / 255.0)

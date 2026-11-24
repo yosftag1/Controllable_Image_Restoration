@@ -1,11 +1,11 @@
-"""Configuration for Controllable Pretrained Image Restoration (Clean SD-2.1 Baseline)."""
+"""Configuration for Controllable Pretrained Image Restoration (2-Step SD-2.1 + Shared/Specialist LoRA-MoE)."""
 
 
 class Config:
-    """Clean 2-stage baseline: SD-2.1-Base (fixed t=199) + Unified Pixel/Detail LoRA + Frozen DINOv2-Reg."""
+    """Clean 2-stage baseline: 2-Step SD-2.1-Base (t=299->99) + Shared/Specialist LoRA-MoE + Frozen DINOv2-Reg."""
 
     PROJECT_NAME = "controllable_image_restoration"
-    MODEL_VERSION = "v5_clean_sd21"
+    MODEL_VERSION = "v5_2step_moe"
 
     # -------------------------------------------------------------------------
     # 1. Frozen Pretrained Semantic Vision Encoder (Cross-Attn Context & 1-Click Masks)
@@ -15,7 +15,7 @@ class Config:
     DINOV2_FALLBACK_MODEL_ID = "facebook/dinov2-with-registers-small"
 
     # -------------------------------------------------------------------------
-    # 2. Pretrained Generator Backbone & Clean Dual-Branch LoRA
+    # 2. Pretrained Generator Backbone & Shared+Specialist LoRA-MoE
     # -------------------------------------------------------------------------
     GENERATOR_BACKBONE = "sd-2.1-base"
 
@@ -39,9 +39,15 @@ class Config:
         ],
     }
 
-    # Unified Pixel-Stage LoRA + Stage-3 Semantic-Detail LoRA
-    UNET_LORA_RANK = 32
-    UNET_LORA_ALPHA = 32.0
+    # Shared Base Pixel LoRA (always active across 100% of batches) + Lightweight Specialist Experts
+    UNET_LORA_RANK = 20
+    UNET_LORA_ALPHA = 20.0
+    LORA_EXPERT_SPECS = [
+        {"name": "clean_smooth", "sliders": ["denoise", "deartifact"], "rank": 8},
+        {"name": "motion_deconv", "sliders": ["deblur_motion"], "rank": 8},
+        {"name": "focus_optical", "sliders": ["sharpen_focus", "dechromatic"], "rank": 8},
+        {"name": "optics_atmos", "sliders": ["deflare", "dereflection", "dehaze"], "rank": 8},
+    ]
     SEM_DETAIL_LORA_RANK = 16
     SEM_DETAIL_LORA_ALPHA = 16.0
 
@@ -62,25 +68,29 @@ class Config:
 
     # Single user-facing Generative Detail dial (`detail_scale` in [0, 1])
     DEFAULT_FIDELITY_SCALE = 1.0
-    DEFAULT_DETAIL_SCALE = 0.50
+    DEFAULT_DETAIL_SCALE = 0.65
 
-    # Fixed single-step denoising timestep for SD-2.1-base
+    # 2-Step Latent Refinement schedule on SD-2.1-base (Step 1 coarse deblur/denoise -> Step 2 crisp polish)
     DEFAULT_INFERENCE_STEPS = 1
-    RESTORATION_TIMESTEP = 199
+    RESTORATION_TIMESTEPS = (299, 99)
     INFERENCE_TILE_SIZE = 512
     INFERENCE_TILE_OVERLAP = 96
     INITIAL_VELOCITY_SCALE = 1.0
-    # Drop encoder skips on 15% of training steps so UNet `hat_z_0` carries full deblurring on its own
-    SKIP_DROPOUT_PROB = 0.15
+    # Drop encoder skips on 25% of training steps so UNet `hat_z_0` carries full sharp deblurring on its own
+    SKIP_DROPOUT_PROB = 0.25
 
     # -------------------------------------------------------------------------
-    # 3. Orthogonal Control Space (4 Unsigned [0, 1] Fixes + 2 Signed [-1, +1] Grades)
+    # 3. Orthogonal Control Space (8 Unsigned [0, 1] Fixes + 2 Signed [-1, +1] Grades)
     # -------------------------------------------------------------------------
     DEGRADATION_TYPES = [
         "denoise",
         "deartifact",
         "deblur_motion",
         "sharpen_focus",
+        "deflare",
+        "dereflection",
+        "dechromatic",
+        "dehaze",
         "exposure",
         "warmth",
     ]
@@ -89,6 +99,10 @@ class Config:
         "deartifact",
         "deblur_motion",
         "sharpen_focus",
+        "deflare",
+        "dereflection",
+        "dechromatic",
+        "dehaze",
     ]
     SIGNED_ACTION_TYPES = [
         "exposure",
@@ -101,11 +115,11 @@ class Config:
     ZERO_ACTION_LOCK_THRESHOLD = 0.03
 
     # -------------------------------------------------------------------------
-    # 4. Linear-Light Curved Motion, Optical Bokeh Disc & Directional Synthesis
+    # 4. Linear-Light Curved/Tremor Motion, Optical Bokeh/CA & Richer Synthesis
     # -------------------------------------------------------------------------
     MIN_SEVERITY = 0.25
-    MAX_COMPOUND_DEGRADATIONS = 3
-    COMPOUND_PROB = 0.70
+    MAX_COMPOUND_DEGRADATIONS = 4
+    COMPOUND_PROB = 0.75
     CURRICULUM_WARMUP_EPOCHS = 2
 
     SPATIAL_MASK_PROB = 0.25
@@ -172,8 +186,8 @@ class Config:
     SEED = 42
 
     # 2-Stage Training:
-    #   Stage 1 (Epochs 1..12):  Pixel Stage (Spatial Control + Pixel/Latent Fidelity)
-    #   Stage 2 (Epochs 13..15): Semantic Stage (DISTS Texture + Zero-Drift Target-Anchored CSD)
+    #   Stage 1 (Epochs 1..12):  Pixel Stage (Spatial Control + 2-Step Pixel/Latent Fidelity)
+    #   Stage 2 (Epochs 13..15): Semantic Stage (DISTS Texture + Subpixel Anchor + Zero-Drift CSD)
     TRAINING_MODE = "staged"
     EPOCHS = 15
     PIXEL_STAGE_EPOCHS = 12
@@ -183,18 +197,19 @@ class Config:
     GRAD_CLIP_NORM = 1.0
     CHECKPOINT_EVERY_N_EPOCHS = 4
 
-    # Clean 4-Term Loss Objective:
+    # Clean Loss Objective:
     LOSS_L1_WEIGHT = 1.0
     LOSS_LATENT_WEIGHT = 0.50
     LOSS_PIXEL_STAGE_PERCEPTUAL_WEIGHT = 0.10
     LOSS_PRESERVE_WEIGHT = 0.50
 
-    LOSS_SEMANTIC_STAGE_LP_L1_WEIGHT = 0.75
+    LOSS_SEMANTIC_STAGE_LP_L1_WEIGHT = 0.70
+    LOSS_SEMANTIC_STAGE_FULL_L1_WEIGHT = 0.15  # Gentle subpixel anchor preventing 1-2px fine-detail jitter
     LOSS_SEMANTIC_STAGE_LATENT_LP_WEIGHT = 0.25
     LOSS_PERCEPTUAL_WEIGHT = 0.60
-    LOSS_CSD_WEIGHT = 0.20
-    CSD_CFG_SCALE = 4.5
-    CSD_STEP_SCALE = 0.15
+    LOSS_CSD_WEIGHT = 0.40
+    CSD_CFG_SCALE = 5.0
+    CSD_STEP_SCALE = 0.30
     CSD_TIMESTEP_RANGE = (50, 400)
     PERCEPTUAL_LAYERS = ["relu1_2", "relu2_2", "relu3_4", "relu4_4"]
 
@@ -208,10 +223,10 @@ class Config:
 
 
 class PilotConfig(Config):
-    """Balanced ~5-hour 2-stage preset (`--pilot` / `--5h`) for Kaggle 2x T4."""
+    """Balanced ~5-hour 2-stage preset (`--pilot` / `--5h`) for Kaggle 2x T4 (8 pixel + 4 semantic epochs)."""
 
     EPOCHS = 12
-    PIXEL_STAGE_EPOCHS = 9
+    PIXEL_STAGE_EPOCHS = 8
     CURRICULUM_WARMUP_EPOCHS = 2
     LEARNING_RATE = 1.15e-4
     MAX_STEPS_PER_EPOCH = 950

@@ -1,20 +1,22 @@
-"""Thread-safe Switchable Dual-Branch LoRA for Generator UNet and VAE Encoder.
+"""Thread-safe Switchable Shared+Specialist LoRA-MoE for Generator UNet and VAE Encoder.
 
 Provides:
-1. Device-scoped `generator_lora_context(lambda_pix, lambda_sem)` so turning
-   `lambda_pix=0.0, lambda_sem=0.0` exposes the exact frozen base UNet/VAE for
-   target latent encoding and Stage-2 Target-Anchored CSD with zero extra VRAM.
-2. Clean `DualLoRALinear` & `DualLoRAConv2d` wrapping frozen layers with a
-   pixel-fidelity branch (`pix_branch`) and an optional semantic-detail branch
-   (`sem_branch`).
+1. Device-scoped `generator_lora_context(lambda_pix, lambda_sem, spatial_action_map=...)`
+   with O(1) cached spatial routing maps. Turning `lambda_pix=0, lambda_sem=0` exposes
+   the exact frozen base UNet/VAE for target encoding and Stage-2 CSD.
+2. Clean `DualLoRALinear` & `DualLoRAConv2d` combining:
+   - An always-active shared base branch (`shared_branch`, e.g. `r=20`)
+   - Additive slider-routed standard specialist branches (`pix_experts`, e.g. `r=8` each)
+   - An optional semantic-detail branch (`sem_branch`, Stage 2)
 """
 
 from contextlib import contextmanager
 import math
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 def infer_module_dtype(mod: nn.Module, fallback: torch.dtype = torch.float32) -> torch.dtype:
@@ -53,9 +55,10 @@ def infer_module_device(mod: nn.Module) -> torch.device:
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-_LoRAStateTuple = Tuple[float, float]
-_DEFAULT_LORA_STATE: _LoRAStateTuple = (1.0, 0.50)
+_LoRAStateTuple = Tuple[float, float, Optional[torch.Tensor]]
+_DEFAULT_LORA_STATE: _LoRAStateTuple = (1.0, 0.65, None)
 _LORA_STATE_BY_DEVICE: Dict[str, _LoRAStateTuple] = {}
+_ROUTE_PYRAMID_CACHE_BY_DEVICE: Dict[str, Dict[Tuple, torch.Tensor]] = {}
 
 
 def _resolve_device_key(
@@ -84,48 +87,58 @@ def _get_generator_lora_state(device: Optional[torch.device] = None) -> _LoRASta
 
 def set_generator_lora_state(
     lambda_pix: float = 1.0,
-    lambda_sem: float = 0.50,
+    lambda_sem: float = 0.65,
     device: Optional[torch.device] = None,
+    spatial_action_map: Optional[torch.Tensor] = None,
 ) -> None:
-    """Persist device-scoped Dual-LoRA scales across forward + C++ autograd."""
+    """Persist device-scoped Dual-LoRA scales & spatial slider map across forward + C++ autograd."""
     global _DEFAULT_LORA_STATE
-    state: _LoRAStateTuple = (float(lambda_pix), float(lambda_sem))
-    key = _resolve_device_key(device=device)
+    state: _LoRAStateTuple = (float(lambda_pix), float(lambda_sem), spatial_action_map)
+    key = _resolve_device_key(device=device, tensor=spatial_action_map)
     if key is not None:
         _LORA_STATE_BY_DEVICE[key] = state
+        _ROUTE_PYRAMID_CACHE_BY_DEVICE.pop(key, None)
     else:
         _DEFAULT_LORA_STATE = state
+        _ROUTE_PYRAMID_CACHE_BY_DEVICE.clear()
 
 
 def clear_generator_lora_state(device: Optional[torch.device] = None) -> None:
-    """Release device-scoped Dual-LoRA state after backward completes."""
+    """Release device-scoped Dual-LoRA state and route caches after backward completes."""
     global _DEFAULT_LORA_STATE
     if device is not None:
         key = _resolve_device_key(device=device)
         if key is not None:
             _LORA_STATE_BY_DEVICE.pop(key, None)
+            _ROUTE_PYRAMID_CACHE_BY_DEVICE.pop(key, None)
             return
     _LORA_STATE_BY_DEVICE.clear()
-    _DEFAULT_LORA_STATE = (1.0, 0.50)
+    _ROUTE_PYRAMID_CACHE_BY_DEVICE.clear()
+    _DEFAULT_LORA_STATE = (1.0, 0.65, None)
 
 
 @contextmanager
 def generator_lora_context(
     lambda_pix: float = 1.0,
-    lambda_sem: float = 0.50,
+    lambda_sem: float = 0.65,
     device: Optional[torch.device] = None,
+    spatial_action_map: Optional[torch.Tensor] = None,
 ):
-    """Scoped context manager setting device-scoped Dual-LoRA scales."""
+    """Scoped context manager setting device-scoped Dual-LoRA scales and spatial routing map."""
     global _DEFAULT_LORA_STATE
-    state: _LoRAStateTuple = (float(lambda_pix), float(lambda_sem))
-    key = _resolve_device_key(device=device)
+    state: _LoRAStateTuple = (float(lambda_pix), float(lambda_sem), spatial_action_map)
+    key = _resolve_device_key(device=device, tensor=spatial_action_map)
     if key is not None:
         had_key = key in _LORA_STATE_BY_DEVICE
         prev_val = _LORA_STATE_BY_DEVICE.get(key)
+        prev_cache = _ROUTE_PYRAMID_CACHE_BY_DEVICE.pop(key, None)
         _LORA_STATE_BY_DEVICE[key] = state
         try:
             yield
         finally:
+            _ROUTE_PYRAMID_CACHE_BY_DEVICE.pop(key, None)
+            if prev_cache is not None:
+                _ROUTE_PYRAMID_CACHE_BY_DEVICE[key] = prev_cache
             if had_key and prev_val is not None:
                 _LORA_STATE_BY_DEVICE[key] = prev_val
             else:
@@ -133,14 +146,163 @@ def generator_lora_context(
     else:
         prev_default = _DEFAULT_LORA_STATE
         prev_map = dict(_LORA_STATE_BY_DEVICE)
+        prev_all_cache = dict(_ROUTE_PYRAMID_CACHE_BY_DEVICE)
         _LORA_STATE_BY_DEVICE.clear()
+        _ROUTE_PYRAMID_CACHE_BY_DEVICE.clear()
         _DEFAULT_LORA_STATE = state
         try:
             yield
         finally:
             _LORA_STATE_BY_DEVICE.clear()
             _LORA_STATE_BY_DEVICE.update(prev_map)
+            _ROUTE_PYRAMID_CACHE_BY_DEVICE.clear()
+            _ROUTE_PYRAMID_CACHE_BY_DEVICE.update(prev_all_cache)
             _DEFAULT_LORA_STATE = prev_default
+
+
+def resolve_expert_specs(
+    expert_specs: Optional[Sequence[Dict]],
+    degradation_types: Optional[Sequence[str]],
+    signed_types: Optional[Sequence[str]] = ("exposure", "warmth"),
+    default_rank: int = 8,
+) -> List[Dict]:
+    """Resolve `LORA_EXPERT_SPECS` into concrete `[{"name", "indices", "rank"}]` specs."""
+    if not expert_specs or not degradation_types:
+        return []
+    deg_list = list(degradation_types)
+    signed_set = set(signed_types or ())
+    name_to_idx = {n: i for i, n in enumerate(deg_list)}
+
+    resolved: List[Dict] = []
+    covered_indices = set()
+    for raw in expert_specs:
+        exp_name = str(raw.get("name", f"expert_{len(resolved)}"))
+        sliders = list(raw.get("sliders", []))
+        indices = [name_to_idx[s] for s in sliders if s in name_to_idx]
+        if not indices:
+            continue
+        covered_indices.update(indices)
+        erank = max(2, int(raw.get("rank", default_rank)))
+        resolved.append({"name": exp_name, "indices": indices, "rank": erank})
+
+    unassigned = [
+        i for i, n in enumerate(deg_list) if (n not in signed_set) and (i not in covered_indices)
+    ]
+    if unassigned:
+        resolved.append({"name": "extra_specialist", "indices": unassigned, "rank": max(2, int(default_rank))})
+    return resolved
+
+
+def _get_cached_resized_action_map(
+    spatial_action_map: torch.Tensor,
+    target_hw: Tuple[int, int],
+    batch_size: int,
+    device: torch.device,
+) -> Optional[torch.Tensor]:
+    """O(1) cached `(B, K, H_f, W_f)` absolute slider pyramid lookup."""
+    dev_key = _resolve_device_key(device=device) or "default"
+    dev_cache = _ROUTE_PYRAMID_CACHE_BY_DEVICE.setdefault(dev_key, {})
+    cache_key = ("2d", int(spatial_action_map.data_ptr()), batch_size, target_hw[0], target_hw[1])
+    cached = dev_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    a_map = spatial_action_map.detach().float()
+    if a_map.device != device:
+        a_map = a_map.to(device)
+    if a_map.shape[0] != batch_size:
+        if batch_size % max(1, a_map.shape[0]) == 0:
+            a_map = a_map.repeat_interleave(batch_size // a_map.shape[0], dim=0)
+        else:
+            return None
+
+    a_abs = a_map.abs().clamp_(0.0, 1.0)
+    if a_abs.shape[-2:] != target_hw:
+        a_local = F.interpolate(a_abs, size=target_hw, mode="area")
+    else:
+        a_local = a_abs
+    dev_cache[cache_key] = a_local
+    return a_local
+
+
+def _compute_conv_expert_route(
+    spatial_action_map: Optional[torch.Tensor],
+    indices: Tuple[int, ...],
+    target_hw: Tuple[int, int],
+    batch_size: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Compute [B, 1, H_f, W_f] continuous slider routing weight (exact 0.0 when expert sliders == 0)."""
+    if spatial_action_map is None or not indices:
+        return torch.ones((batch_size, 1, 1, 1), device=device, dtype=torch.float32)
+
+    dev_key = _resolve_device_key(device=device) or "default"
+    dev_cache = _ROUTE_PYRAMID_CACHE_BY_DEVICE.setdefault(dev_key, {})
+    exp_key = ("conv_route", int(spatial_action_map.data_ptr()), batch_size, target_hw[0], target_hw[1], indices)
+    cached_r = dev_cache.get(exp_key)
+    if cached_r is not None:
+        return cached_r
+
+    a_local = _get_cached_resized_action_map(spatial_action_map, target_hw, batch_size, device)
+    if a_local is None:
+        return torch.ones((batch_size, 1, 1, 1), device=device, dtype=torch.float32)
+
+    if len(indices) == 1:
+        i0 = indices[0]
+        route = a_local[:, i0 : i0 + 1]
+    else:
+        idx_t = torch.as_tensor(indices, dtype=torch.long, device=device)
+        route = a_local.index_select(1, idx_t).amax(dim=1, keepdim=True)
+    dev_cache[exp_key] = route
+    return route
+
+
+def _compute_linear_expert_route(
+    spatial_action_map: Optional[torch.Tensor],
+    indices: Tuple[int, ...],
+    x_shape: Tuple[int, ...],
+    device: torch.device,
+) -> torch.Tensor:
+    """Compute spatial token [B, N, 1] or batch [B, 1, 1] slider routing weight for Linear layers."""
+    bsz = x_shape[0]
+    ndim = len(x_shape)
+    ones_shape = (bsz, 1) if ndim == 2 else (bsz, 1, 1)
+    if spatial_action_map is None or not indices:
+        return torch.ones(ones_shape, device=device, dtype=torch.float32)
+
+    seq_len = x_shape[1] if ndim == 3 else 0
+    dev_key = _resolve_device_key(device=device) or "default"
+    dev_cache = _ROUTE_PYRAMID_CACHE_BY_DEVICE.setdefault(dev_key, {})
+    lin_key = ("lin_route", int(spatial_action_map.data_ptr()), bsz, ndim, seq_len, indices)
+    cached_l = dev_cache.get(lin_key)
+    if cached_l is not None:
+        return cached_l
+
+    h_img, w_img = spatial_action_map.shape[-2], spatial_action_map.shape[-1]
+    if ndim == 3 and seq_len > 1 and (h_img * w_img) % seq_len == 0:
+        ratio = int(round(math.sqrt((h_img * w_img) / float(seq_len))))
+        if ratio >= 1 and (h_img // ratio) * (w_img // ratio) == seq_len:
+            h_tok, w_tok = h_img // ratio, w_img // ratio
+            r_2d = _compute_conv_expert_route(spatial_action_map, indices, (h_tok, w_tok), bsz, device)
+            tok_w = r_2d.flatten(2).transpose(1, 2).contiguous()
+            dev_cache[lin_key] = tok_w
+            return tok_w
+
+    a_full = _get_cached_resized_action_map(spatial_action_map, (h_img, w_img), bsz, device)
+    if a_full is None:
+        return torch.ones(ones_shape, device=device, dtype=torch.float32)
+    if len(indices) == 1:
+        i0 = indices[0]
+        act_ch = a_full[:, i0 : i0 + 1]
+    else:
+        idx_t = torch.as_tensor(indices, dtype=torch.long, device=device)
+        act_ch = a_full.index_select(1, idx_t).amax(dim=1, keepdim=True)
+    peak = act_ch.amax(dim=(2, 3))
+    mean = act_ch.mean(dim=(2, 3))
+    glob_w = (0.70 * peak + 0.30 * mean).clamp(0.0, 1.0)
+    res = glob_w if ndim == 2 else glob_w.unsqueeze(1)
+    dev_cache[lin_key] = res
+    return res
 
 
 class _LoRABranch(nn.Module):
@@ -197,13 +359,14 @@ class _LoRABranch(nn.Module):
 
 
 class DualLoRALinear(nn.Module):
-    """Frozen nn.Linear wrapped with unified Pixel-Fidelity and optional Semantic-Detail LoRA."""
+    """Frozen nn.Linear wrapped with Shared Base LoRA + Slider-Routed Specialists + Semantic LoRA."""
 
     def __init__(
         self,
         base_linear: nn.Linear,
-        rank: int = 32,
-        alpha: float = 32.0,
+        rank: int = 20,
+        alpha: float = 20.0,
+        expert_specs: Optional[Sequence[Dict]] = None,
         sem_rank: int = 0,
         sem_alpha: float = 0.0,
     ):
@@ -214,7 +377,18 @@ class DualLoRALinear(nn.Module):
 
         device = base_linear.weight.device
         in_f, out_f = base_linear.in_features, base_linear.out_features
-        self.pix_branch = _LoRABranch(in_f, out_f, rank=rank, alpha=alpha, is_conv=False, device=device)
+        self.shared_branch = _LoRABranch(in_f, out_f, rank=rank, alpha=alpha, is_conv=False, device=device)
+
+        self.expert_indices: Dict[str, Tuple[int, ...]] = {}
+        self.pix_experts = nn.ModuleDict()
+        for sp in expert_specs or ():
+            ename = str(sp["name"])
+            erank = max(2, int(sp.get("rank", 8)))
+            self.expert_indices[ename] = tuple(int(i) for i in sp.get("indices", []))
+            self.pix_experts[ename] = _LoRABranch(
+                in_f, out_f, rank=erank, alpha=float(erank), is_conv=False, device=device
+            )
+
         if int(sem_rank) > 0:
             self.sem_branch: Optional[_LoRABranch] = _LoRABranch(
                 in_f, out_f, rank=int(sem_rank), alpha=float(sem_alpha), is_conv=False, device=device
@@ -223,7 +397,7 @@ class DualLoRALinear(nn.Module):
             self.sem_branch = None
 
     def pixel_parameters(self) -> List[nn.Parameter]:
-        return list(self.pix_branch.parameters())
+        return list(self.shared_branch.parameters()) + list(self.pix_experts.parameters())
 
     def semantic_parameters(self) -> List[nn.Parameter]:
         return list(self.sem_branch.parameters()) if self.sem_branch is not None else []
@@ -246,13 +420,20 @@ class DualLoRALinear(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         out = self.base(x)
-        lam_pix, lam_sem = _get_generator_lora_state(x.device)
+        lam_pix, lam_sem, spatial_map = _get_generator_lora_state(x.device)
         if abs(lam_pix) < 1e-6 and abs(lam_sem) < 1e-6:
             return out
 
         delta = None
         if abs(lam_pix) >= 1e-6:
-            delta = float(lam_pix) * self.pix_branch(x)
+            pix_sum = self.shared_branch(x)
+            for ename, expert in self.pix_experts.items():
+                route_w = _compute_linear_expert_route(
+                    spatial_map, self.expert_indices[ename], tuple(x.shape), x.device
+                )
+                pix_sum = pix_sum + expert(x) * route_w.to(pix_sum.dtype)
+            delta = float(lam_pix) * pix_sum
+
         if self.sem_branch is not None and abs(lam_sem) >= 1e-6:
             sem_d = float(lam_sem) * self.sem_branch(x)
             delta = sem_d if delta is None else (delta + sem_d)
@@ -260,13 +441,14 @@ class DualLoRALinear(nn.Module):
 
 
 class DualLoRAConv2d(nn.Module):
-    """Frozen nn.Conv2d wrapped with unified Pixel-Fidelity and optional Semantic-Detail LoRA."""
+    """Frozen nn.Conv2d wrapped with Shared Base LoRA + Slider-Routed Specialists + Semantic LoRA."""
 
     def __init__(
         self,
         base_conv: nn.Conv2d,
-        rank: int = 32,
-        alpha: float = 32.0,
+        rank: int = 20,
+        alpha: float = 20.0,
+        expert_specs: Optional[Sequence[Dict]] = None,
         sem_rank: int = 0,
         sem_alpha: float = 0.0,
     ):
@@ -284,9 +466,24 @@ class DualLoRAConv2d(nn.Module):
             dilation=base_conv.dilation,
             device=device,
         )
-        self.pix_branch = _LoRABranch(
+        self.shared_branch = _LoRABranch(
             base_conv.in_channels, base_conv.out_channels, rank=rank, alpha=alpha, **conv_kwargs
         )
+
+        self.expert_indices: Dict[str, Tuple[int, ...]] = {}
+        self.pix_experts = nn.ModuleDict()
+        for sp in expert_specs or ():
+            ename = str(sp["name"])
+            erank = max(2, int(sp.get("rank", 8)))
+            self.expert_indices[ename] = tuple(int(i) for i in sp.get("indices", []))
+            self.pix_experts[ename] = _LoRABranch(
+                base_conv.in_channels,
+                base_conv.out_channels,
+                rank=erank,
+                alpha=float(erank),
+                **conv_kwargs,
+            )
+
         if int(sem_rank) > 0:
             self.sem_branch: Optional[_LoRABranch] = _LoRABranch(
                 base_conv.in_channels,
@@ -299,7 +496,7 @@ class DualLoRAConv2d(nn.Module):
             self.sem_branch = None
 
     def pixel_parameters(self) -> List[nn.Parameter]:
-        return list(self.pix_branch.parameters())
+        return list(self.shared_branch.parameters()) + list(self.pix_experts.parameters())
 
     def semantic_parameters(self) -> List[nn.Parameter]:
         return list(self.sem_branch.parameters()) if self.sem_branch is not None else []
@@ -322,13 +519,25 @@ class DualLoRAConv2d(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         out = self.base(x)
-        lam_pix, lam_sem = _get_generator_lora_state(x.device)
+        lam_pix, lam_sem, spatial_map = _get_generator_lora_state(x.device)
         if abs(lam_pix) < 1e-6 and abs(lam_sem) < 1e-6:
             return out
 
+        target_hw = (out.shape[-2], out.shape[-1])
+        bsz = out.shape[0]
         delta = None
         if abs(lam_pix) >= 1e-6:
-            delta = float(lam_pix) * self.pix_branch(x)
+            pix_sum = self.shared_branch(x)
+            for ename, expert in self.pix_experts.items():
+                route_2d = _compute_conv_expert_route(
+                    spatial_map, self.expert_indices[ename], target_hw, bsz, out.device
+                )
+                exp_out = expert(x)
+                if exp_out.shape[-2:] != target_hw:
+                    exp_out = F.interpolate(exp_out, size=target_hw, mode="bilinear", align_corners=False)
+                pix_sum = pix_sum + exp_out * route_2d.to(pix_sum.dtype)
+            delta = float(lam_pix) * pix_sum
+
         if self.sem_branch is not None and abs(lam_sem) >= 1e-6:
             sem_d = float(lam_sem) * self.sem_branch(x)
             delta = sem_d if delta is None else (delta + sem_d)
@@ -345,8 +554,9 @@ def _set_submodule(root: nn.Module, dotted_name: str, new_module: nn.Module):
 
 def inject_generator_dual_lora(
     model: nn.Module,
-    rank: int = 32,
-    alpha: float = 32.0,
+    rank: int = 20,
+    alpha: float = 20.0,
+    expert_specs: Optional[Sequence[Dict]] = None,
     sem_rank: int = 0,
     sem_alpha: float = 0.0,
     include_conv: bool = True,
@@ -392,6 +602,7 @@ def inject_generator_dual_lora(
             mod,
             rank=rank,
             alpha=alpha,
+            expert_specs=expert_specs,
             sem_rank=sem_rank,
             sem_alpha=sem_alpha,
         )
@@ -404,6 +615,7 @@ def inject_generator_dual_lora(
             mod,
             rank=rank,
             alpha=alpha,
+            expert_specs=expert_specs,
             sem_rank=sem_rank,
             sem_alpha=sem_alpha,
         )
