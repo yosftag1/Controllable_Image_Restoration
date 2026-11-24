@@ -361,7 +361,7 @@ def build_gradio_app(
                         gr.Markdown("#### C. Texture Synthesis Dial")
                         default_det = (
                             0.0
-                            if inferencer.ckpt_stage in ("align_warmup", "pixel_stage")
+                            if inferencer.ckpt_stage == "pixel_stage"
                             else float(inferencer.config.DEFAULT_DETAIL_SCALE)
                         )
                         detail_slider = gr.Slider(
@@ -543,7 +543,7 @@ def build_gradio_app(
                 info = inferencer.switch_checkpoint(ckpt_path)
             new_det = (
                 0.0
-                if info.get("stage") in ("align_warmup", "pixel_stage")
+                if info.get("stage") == "pixel_stage"
                 else float(inferencer.config.DEFAULT_DETAIL_SCALE)
             )
             return _format_ckpt_banner(inferencer), gr.update(value=new_det)

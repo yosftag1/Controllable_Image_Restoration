@@ -192,9 +192,9 @@ def run_single_image_benchmark(
     click_pt = point_xy if point_xy is not None else (0.5, 0.5)
     signed_types = getattr(config, "SIGNED_ACTION_TYPES", ["exposure", "warmth"])
 
-    if ckpt_stage in ("align_warmup", "pixel_stage"):
+    if ckpt_stage == "pixel_stage":
         print(
-            f"[Benchmark Note] Loaded checkpoint stage is '{ckpt_stage}' (Semantic-LoRA has not run Stage 3 yet); "
+            f"[Benchmark Note] Loaded checkpoint stage is '{ckpt_stage}' (Semantic-LoRA has not run Stage 2 yet); "
             "Pixel-Faithful and Detail columns will match until semantic_stage completes."
         )
 

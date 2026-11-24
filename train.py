@@ -1,4 +1,4 @@
-"""3-Phase Multi-GPU AMP Training Script for Controllable Pretrained Restoration (V4)."""
+"""2-Stage Multi-GPU AMP Training Script for Controllable Pretrained Restoration."""
 
 import argparse
 from datetime import timedelta
@@ -50,15 +50,15 @@ PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-from config import Config, DebugConfig, HYPIRConfig, PilotConfig
+from config import Config, DebugConfig, PilotConfig
 from data.selective_dataset import (
     SelectiveDegradationPipeline,
     create_controllable_dataset,
     dataloader_worker_init_fn,
     unpack_batch_action_map,
 )
-from losses.controllable_losses import ControllableRestorationLoss, VisionAidedDiscriminator
-from models.controllable_restorer import ControllableRestorer, SplitMultiGPURestorer
+from losses.controllable_losses import ControllableRestorationLoss
+from models.controllable_restorer import ControllableRestorer
 from utils.semantic_mask import build_spatial_action_overlay, parse_action_spec
 
 
@@ -71,8 +71,6 @@ def set_seed(seed: int):
 
 
 def unwrap_model(model: torch.nn.Module) -> ControllableRestorer:
-    if isinstance(model, SplitMultiGPURestorer):
-        return model.raw_model
     if isinstance(model, (torch.nn.DataParallel, torch.nn.parallel.DistributedDataParallel)):
         return model.module
     return model
@@ -137,12 +135,10 @@ def print_gpu_usage(header: str = "GPU Status"):
 
 
 def determine_epoch_stage(epoch_1based: int, config: Config) -> str:
-    """Resolve training stage for 1-based epoch index."""
+    """Resolve 2-stage training phase for 1-based epoch index."""
     if config.TRAINING_MODE.lower() == "joint":
         return "joint"
-    if epoch_1based <= config.ALIGN_WARMUP_EPOCHS:
-        return "align_warmup"
-    if epoch_1based <= config.ALIGN_WARMUP_EPOCHS + config.PIXEL_STAGE_EPOCHS:
+    if epoch_1based <= config.PIXEL_STAGE_EPOCHS:
         return "pixel_stage"
     return "semantic_stage"
 
@@ -154,28 +150,23 @@ def compute_curriculum_boost(epoch_1based: int, stage: str, config: Config) -> f
     warmup_ep = int(getattr(config, "CURRICULUM_WARMUP_EPOCHS", 0) or 0)
     if warmup_ep <= 0:
         return 0.0
-    start_ep = (config.ALIGN_WARMUP_EPOCHS + 1) if stage == "pixel_stage" else 1
-    rel_idx = epoch_1based - start_ep
+    rel_idx = epoch_1based - 1
     if rel_idx < 0 or rel_idx >= warmup_ep:
         return 0.0
     return float(max(0.0, 0.80 * (1.0 - float(rel_idx) / float(warmup_ep))))
 
 
 def build_stage_optimizer(raw_model: ControllableRestorer, stage: str, config: Config):
-    """Configure trainable parameters and build AdamW optimizer with distinct Vision-LoRA LR."""
+    """Configure trainable parameters and build AdamW optimizer for the active stage."""
     raw_model.set_training_stage(stage)
     groups = raw_model.get_stage_parameter_groups()
 
     param_groups = []
-    if stage == "align_warmup":
-        param_groups.append({"params": groups["vision_lora"], "lr": config.VISION_LORA_LR})
-    elif stage == "pixel_stage":
-        param_groups.append({"params": groups["vision_lora"], "lr": config.VISION_LORA_LR * 0.25})
+    if stage == "pixel_stage":
         param_groups.append({"params": groups["pixel_stage"], "lr": config.LEARNING_RATE})
     elif stage == "semantic_stage":
         param_groups.append({"params": groups["semantic_stage"], "lr": config.LEARNING_RATE * 1.25})
     elif stage == "joint":
-        param_groups.append({"params": groups["vision_lora"], "lr": config.VISION_LORA_LR * 0.50})
         param_groups.append(
             {"params": groups["pixel_stage"] + groups["semantic_stage"], "lr": config.LEARNING_RATE}
         )
@@ -313,7 +304,6 @@ def evaluate_validation(model, val_loader, device, config, stage: str, loss_fn=N
         total_dists += dists_val * bsz
         count += bsz
 
-        # Signed-safe max |action| so negative darken/cool validation edits are accurately counted!
         act_max = act.float().abs().amax(dim=(1, 2, 3))
         src_tgt_mse = torch.mean((src.float() - tgt.float()) ** 2, dim=(1, 2, 3))
         active_mask = (act_max > 0.20) & (src_tgt_mse > 2.5e-4)
@@ -384,8 +374,8 @@ def save_controllable_validation_grid(
                 ("Denoise+Bright (Keep Blur)", "denoise=1.0,exposure=0.68,motion=0.0", None, None, 1.0, 0.0),
                 ("50% Partial Restore", "denoise=0.5,exposure=0.34,motion=0.5", None, None, 1.0, 0.3),
                 ("Full (Pixel Faithful)", "denoise=1.0,exposure=0.68,motion=1.0", None, None, 1.0, 0.0),
-                ("Full (With Detail)", "all,exposure=0.68", None, None, 1.0, 0.75),
-                ("Split Mask Overlay", "denoise=1.0,exposure=0.68,motion=1.0", "denoise=1.0,motion=0.0", "left_half", 1.0, 0.6),
+                ("Full (With Detail)", "all,exposure=0.68", None, None, 1.0, 0.50),
+                ("Split Mask Overlay", "denoise=1.0,exposure=0.68,motion=1.0", "denoise=1.0,motion=0.0", "left_half", 1.0, 0.5),
             ]
         elif scenario_id == 1:
             row_tag = "Row2[Defocus+Band+WarmCast]"
@@ -400,8 +390,8 @@ def save_controllable_validation_grid(
                 ("Deband+Cool (Keep Bokeh)", "deartifact=1.0,warmth=-0.70,focus=0.0", None, None, 1.0, 0.0),
                 ("50% Partial Focus", "deartifact=1.0,warmth=-0.70,focus=0.5", None, None, 1.0, 0.35),
                 ("Full (Pixel Faithful)", "deartifact=1.0,warmth=-0.70,focus=1.0", None, None, 1.0, 0.0),
-                ("Full (With Detail)", "all,warmth=-0.70", None, None, 1.0, 0.75),
-                ("Split Mask Overlay", "deartifact=1.0,warmth=-0.70,focus=1.0", "deartifact=1.0,focus=0.0", "left_half", 1.0, 0.6),
+                ("Full (With Detail)", "all,warmth=-0.70", None, None, 1.0, 0.50),
+                ("Split Mask Overlay", "deartifact=1.0,warmth=-0.70,focus=1.0", "deartifact=1.0,focus=0.0", "left_half", 1.0, 0.5),
             ]
         else:
             row_tag = "Row3[LowRes+JPEG+Washout]"
@@ -416,8 +406,8 @@ def save_controllable_validation_grid(
                 ("DeJPEG+Darken (Keep LowRes)", "deartifact=1.0,exposure=-0.65,focus=0.0", None, None, 1.0, 0.0),
                 ("50% Partial Sharpen", "deartifact=1.0,exposure=-0.65,focus=0.5", None, None, 1.0, 0.35),
                 ("Full (Pixel Faithful)", "deartifact=1.0,exposure=-0.65,focus=1.0", None, None, 1.0, 0.0),
-                ("Full (With Detail)", "all,exposure=-0.65", None, None, 1.0, 0.75),
-                ("Split Mask Overlay", "deartifact=1.0,exposure=-0.65,focus=1.0", "deartifact=1.0,focus=0.0", "left_half", 1.0, 0.6),
+                ("Full (With Detail)", "all,exposure=-0.65", None, None, 1.0, 0.50),
+                ("Split Mask Overlay", "deartifact=1.0,exposure=-0.65,focus=1.0", "deartifact=1.0,focus=0.0", "left_half", 1.0, 0.5),
             ]
 
         src_u8 = pipeline.render_with_params(clean_u8, s_demo, params)
@@ -528,10 +518,8 @@ def save_checkpoint(
     best_psnr: float,
     config: Config,
     filename: str,
-    raw_disc: torch.nn.Module = None,
-    disc_optimizer=None,
 ):
-    """Save lightweight unwrapped V4 adapter checkpoint (~50 MB) for seamless resuming & inference."""
+    """Save lightweight unwrapped adapter checkpoint for resuming & inference."""
     ckpt_dir = Path(config.CHECKPOINT_DIR)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     path = ckpt_dir / filename
@@ -543,42 +531,25 @@ def save_checkpoint(
         "optimizer_state_dict": optimizer.state_dict() if optimizer is not None else None,
         "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
         "model_config": {
-            "MODEL_VERSION": getattr(config, "MODEL_VERSION", "v5_universal_experts"),
+            "MODEL_VERSION": getattr(config, "MODEL_VERSION", "v5_clean_sd21"),
             "DEGRADATION_TYPES": list(config.DEGRADATION_TYPES),
             "SIGNED_ACTION_TYPES": list(getattr(config, "SIGNED_ACTION_TYPES", ["exposure", "warmth"])),
-            "LORA_EXPERT_SPECS": [dict(sp) for sp in getattr(config, "LORA_EXPERT_SPECS", [])],
             "SEMANTIC_ENCODER_TYPE": config.SEMANTIC_ENCODER_TYPE,
-            "CONVNEXTV2_MODEL_ID": getattr(config, "CONVNEXTV2_MODEL_ID", "facebook/convnextv2-base-22k-224"),
             "DINOV2_REG_MODEL_ID": getattr(config, "DINOV2_REG_MODEL_ID", "facebook/dinov2-with-registers-base"),
-            "RADIO_MODEL_ID": getattr(config, "RADIO_MODEL_ID", "nvidia/C-RADIOv3-B"),
             "GENERATOR_BACKBONE": config.GENERATOR_BACKBONE,
-            "ADAPTIVE_TIMESTEP": bool(getattr(config, "ADAPTIVE_TIMESTEP", True)),
-            "RESTORATION_MIN_TIMESTEP": getattr(config, "RESTORATION_MIN_TIMESTEP", 49),
-            "RESTORATION_MAX_TIMESTEP": getattr(config, "RESTORATION_MAX_TIMESTEP", 279),
-            "HYPIR_MODE": bool(getattr(config, "HYPIR_MODE", False)),
-            "HYPIR_FIXED_TIMESTEP": getattr(config, "HYPIR_FIXED_TIMESTEP", 200),
-            "HYPIR_LORA_RANK_SCALE": getattr(config, "HYPIR_LORA_RANK_SCALE", 2.0),
+            "RESTORATION_TIMESTEP": int(getattr(config, "RESTORATION_TIMESTEP", 199)),
             "PROMPT_SEQ_LEN": getattr(config, "PROMPT_SEQ_LEN", 77),
             "UNET_LORA_RANK": config.UNET_LORA_RANK,
             "UNET_LORA_ALPHA": config.UNET_LORA_ALPHA,
             "SEM_DETAIL_LORA_RANK": getattr(config, "SEM_DETAIL_LORA_RANK", 16),
             "SEM_DETAIL_LORA_ALPHA": getattr(config, "SEM_DETAIL_LORA_ALPHA", 16.0),
-            "USE_DORA": bool(getattr(config, "USE_DORA", True)),
-            "UNFREEZE_UNET_NORMS": bool(getattr(config, "UNFREEZE_UNET_NORMS", False)),
             "VAE_ENC_LORA_RANK": config.VAE_ENC_LORA_RANK,
             "VAE_ENC_LORA_ALPHA": getattr(config, "VAE_ENC_LORA_ALPHA", float(config.VAE_ENC_LORA_RANK)),
-            "VAE_DEC_LORA_RANK": getattr(config, "VAE_DEC_LORA_RANK", 0),
-            "VAE_DEC_LORA_ALPHA": getattr(config, "VAE_DEC_LORA_ALPHA", 0.0),
-            "VISION_LORA_RANK": config.VISION_LORA_RANK,
             "ACTION_HIDDEN_DIM": config.ACTION_HIDDEN_DIM,
             "SPATIAL_MOD_HIDDEN_DIM": config.SPATIAL_MOD_HIDDEN_DIM,
             "TONE_HEAD_HIDDEN_DIM": getattr(config, "TONE_HEAD_HIDDEN_DIM", 32),
         },
     }
-    if filename == "model_latest.pt" and raw_disc is not None:
-        payload["disc_state_dict"] = {k: v.detach().cpu() for k, v in raw_disc.state_dict().items()}
-        if disc_optimizer is not None:
-            payload["disc_optimizer_state_dict"] = disc_optimizer.state_dict()
     torch.save(payload, str(path))
     print(f"Checkpoint saved to {path}")
     return str(path)
@@ -636,7 +607,6 @@ def _launch_ddp_subprocess(num_gpus: int, config: Config = None) -> None:
         env["AGY_PARENT_IPYTHON"] = "1"
     else:
         env.pop("AGY_PARENT_IPYTHON", None)
-    # Keep HF download progress bars visible on Rank 0 (lines 26-27 mute non-zero ranks automatically)
     env.pop("HF_HUB_DISABLE_PROGRESS_BARS", None)
 
     cmd = [
@@ -739,31 +709,24 @@ def _build_train_loader(
     train_dataset,
     config: Config,
     device: torch.device,
-    align_only: bool,
     is_ddp: bool = False,
     rank: int = 0,
     world_size: int = 1,
 ):
-    """Construct high-throughput DataLoader with virtual step floor (prevents DIV2K starvation) & DDP support."""
-    train_dataset.align_only = align_only
+    """Construct high-throughput DataLoader with virtual step floor & DDP support."""
+    train_dataset.align_only = False
     train_dataset.compact_ipc = True
     if world_size > 1:
         train_dataset._cache_capacity = max(4, int(getattr(config, "DECODE_CACHE_SIZE", 16)) // world_size)
 
     is_debug = bool(getattr(config, "_debug_mode", False))
-    global_bsz = min(32, config.BATCH_SIZE * 4) if (align_only and not is_debug) else config.BATCH_SIZE
+    global_bsz = config.BATCH_SIZE
     per_gpu_bsz = max(1, global_bsz // max(1, world_size))
     total_nw = int(config.NUM_WORKERS)
     nw = max(1, total_nw // max(1, world_size)) if total_nw > 0 else 0
 
-    max_align = int(getattr(config, "MAX_ALIGN_STEPS", 0) or 0)
-    raw_max_steps = int(getattr(config, "MAX_STEPS_PER_EPOCH", 0) or 0)
-    if align_only and max_align > 0:
-        max_steps = min(max_align, raw_max_steps) if raw_max_steps > 0 else max_align
-    else:
-        max_steps = raw_max_steps
-    min_steps_cfg = int(getattr(config, "MIN_STEPS_PER_EPOCH", 0) or 0) if not is_debug else 0
-    min_steps = min(max_align if max_align > 0 else 300, min_steps_cfg) if align_only else min_steps_cfg
+    max_steps = int(getattr(config, "MAX_STEPS_PER_EPOCH", 0) or 0)
+    min_steps = int(getattr(config, "MIN_STEPS_PER_EPOCH", 0) or 0) if not is_debug else 0
     full_steps = max(1, len(train_dataset) // max(1, global_bsz))
 
     target_steps = 0
@@ -862,17 +825,13 @@ def train(
         if is_main:
             mode_tag = f"DDP ({world_size} GPUs)" if is_ddp else f"{device} (GPUs: {num_gpus})"
             gckpt_tag = "ON" if getattr(config, "GRADIENT_CHECKPOINTING", True) else "OFF"
-            t_tag = (
-                f"fixed_hypir_t={getattr(config, 'HYPIR_FIXED_TIMESTEP', 200)}"
-                if getattr(config, "HYPIR_MODE", False)
-                else f"t={getattr(config, 'RESTORATION_MIN_TIMESTEP', 49)}..{config.RESTORATION_MAX_TIMESTEP}"
-            )
-            exp_names = [sp.get("name", "?") for sp in getattr(config, "LORA_EXPERT_SPECS", [])]
+            t_tag = f"fixed_t={getattr(config, 'RESTORATION_TIMESTEP', 199)}"
             print(
                 f"Device: {mode_tag} | Global Batch Size: {config.BATCH_SIZE} "
                 f"({max(1, config.BATCH_SIZE // max(1, world_size))}/GPU) | "
                 f"Backbone: {config.GENERATOR_BACKBONE} ({t_tag}) | "
-                f"Experts: {exp_names} | Vision: {config.SEMANTIC_ENCODER_TYPE} | Controls: {config.NUM_ACTIONS} | "
+                f"Vision: {config.SEMANTIC_ENCODER_TYPE} | Controls: {config.NUM_ACTIONS} | "
+                f"CSD_w: {getattr(config, 'LOSS_CSD_WEIGHT', 0.0)} | "
                 f"AMP: {'ENABLED' if use_amp else 'DISABLED'} | GradCkpt: {gckpt_tag}",
                 flush=True,
             )
@@ -909,7 +868,7 @@ def train(
         if is_main:
             groups = raw_model.get_stage_parameter_groups()
             print(
-                f"Trainable Adapter Breakdown -> Vision LoRA: {sum(p.numel() for p in groups['vision_lora']):,} | "
+                f"Trainable Adapter Breakdown -> "
                 f"Pixel Stage (LoRA+SkipVAE+Refiner+Overlay): {sum(p.numel() for p in groups['pixel_stage']):,} | "
                 f"Semantic Detail Stage: {sum(p.numel() for p in groups['semantic_stage']):,}",
                 flush=True,
@@ -921,8 +880,6 @@ def train(
         resumed_stage = None
         resumed_opt_state = None
         resumed_sched_state = None
-        resumed_disc_state = None
-        resumed_disc_opt_state = None
 
         if resume_path:
             if os.path.exists(resume_path):
@@ -939,12 +896,11 @@ def train(
                         raise RuntimeError(
                             f"Checkpoint at {resume_path} uses {len(ckpt_degs)}-slider schema {ckpt_degs}, "
                             f"which differs from current {len(config.DEGRADATION_TYPES)}-control schema "
-                            f"{config.DEGRADATION_TYPES}. Pass --allow-schema-expand to warm-start matching "
-                            f"named LoRA experts when adding new knobs, or start V5 fresh without --resume!"
+                            f"{config.DEGRADATION_TYPES}. Pass --allow-schema-expand or start fresh without --resume!"
                         )
                     if is_main:
                         print(
-                            f"[SchemaExpand] Warm-starting matching named LoRA experts from {ckpt_degs} -> "
+                            f"[SchemaExpand] Warm-starting matching parameters from {ckpt_degs} -> "
                             f"{config.DEGRADATION_TYPES}",
                             flush=True,
                         )
@@ -955,8 +911,7 @@ def train(
                     if is_main and (missing_keys or unexpected_keys):
                         print(
                             f"[Warning] Partial adapter match on resume "
-                            f"(missing={len(missing_keys)}, unexpected={len(unexpected_keys)}). "
-                            f"If resuming from an older V1-V4 single-LoRA checkpoint, start V5 fresh without --resume!",
+                            f"(missing={len(missing_keys)}, unexpected={len(unexpected_keys)}).",
                             flush=True,
                         )
                 start_epoch = int(ckpt.get("epoch", 0)) + 1
@@ -966,8 +921,6 @@ def train(
                 resumed_stage = ckpt.get("stage")
                 resumed_opt_state = ckpt.get("optimizer_state_dict")
                 resumed_sched_state = ckpt.get("scheduler_state_dict")
-                resumed_disc_state = ckpt.get("disc_state_dict")
-                resumed_disc_opt_state = ckpt.get("disc_optimizer_state_dict")
                 del ckpt
 
                 eff_rem_pix = remaining_pixel_epochs
@@ -979,20 +932,17 @@ def train(
                         elif resumed_stage == "semantic_stage":
                             eff_rem_pix = 0
                         else:
-                            eff_rem_pix = 6
+                            eff_rem_pix = 5
                     if eff_extra is None and not epochs_overridden:
                         if resumed_stage == "pixel_stage":
-                            eff_extra = int(eff_rem_pix or 0) + 3
+                            eff_extra = int(eff_rem_pix or 0) + 2
                         elif resumed_stage == "semantic_stage":
-                            eff_extra = 3
+                            eff_extra = 2
                         else:
-                            eff_extra = int(eff_rem_pix or 6) + 3
+                            eff_extra = int(eff_rem_pix or 5) + 2
 
                 if eff_rem_pix is not None:
-                    config.ALIGN_WARMUP_EPOCHS = min(config.ALIGN_WARMUP_EPOCHS, max(0, last_epoch))
-                    config.PIXEL_STAGE_EPOCHS = max(
-                        0, (last_epoch - config.ALIGN_WARMUP_EPOCHS) + int(eff_rem_pix)
-                    )
+                    config.PIXEL_STAGE_EPOCHS = max(0, last_epoch + int(eff_rem_pix))
                 if eff_extra is not None:
                     config.EPOCHS = last_epoch + max(1, int(eff_extra))
                     resumed_sched_state = None
@@ -1000,14 +950,12 @@ def train(
                 if resumed_stage != determine_epoch_stage(start_epoch, config):
                     resumed_opt_state = None
                     resumed_sched_state = None
-                    resumed_disc_state = None
-                    resumed_disc_opt_state = None
                 if is_main:
                     sched_note = ""
                     if speedrun or eff_rem_pix is not None or eff_extra is not None:
                         sched_note = (
                             f" | schedule -> total_epochs={config.EPOCHS}, "
-                            f"pixel_end={config.ALIGN_WARMUP_EPOCHS + config.PIXEL_STAGE_EPOCHS}, "
+                            f"pixel_end={config.PIXEL_STAGE_EPOCHS}, "
                             f"steps_cap={getattr(config, 'MAX_STEPS_PER_EPOCH', 0) or 'full'}"
                         )
                     print(
@@ -1018,10 +966,9 @@ def train(
             else:
                 if speedrun:
                     if not pixel_epochs_overridden:
-                        config.ALIGN_WARMUP_EPOCHS = 1
-                        config.PIXEL_STAGE_EPOCHS = 6
+                        config.PIXEL_STAGE_EPOCHS = 5
                     if not epochs_overridden:
-                        config.EPOCHS = 9
+                        config.EPOCHS = 7
                 if is_main:
                     print(f"No checkpoint found at {resume_path} — starting fresh training from Epoch 1.", flush=True)
 
@@ -1034,15 +981,16 @@ def train(
             print_gpu_usage("Pre-Training GPU & VRAM Check")
 
         current_stage = None
-        current_loader_align_only = None
-        train_loader = None
-        train_sampler = None
+        train_loader, train_sampler = _build_train_loader(
+            train_dataset,
+            config,
+            device,
+            is_ddp=is_ddp,
+            rank=rank,
+            world_size=world_size,
+        )
         optimizer = None
         scheduler = None
-        raw_disc = None
-        disc_model = None
-        disc_optimizer = None
-        disc_scaler = None
         history_file = Path(config.LOG_DIR) / "training_history.json"
         history = []
         if is_main:
@@ -1058,30 +1006,12 @@ def train(
             cur_boost = compute_curriculum_boost(epoch, stage, config)
             train_dataset.set_curriculum_boost(cur_boost)
 
-            need_align_only = stage == "align_warmup"
-            if train_loader is None or need_align_only != current_loader_align_only:
-                if train_loader is not None:
-                    if getattr(train_loader, "_iterator", None) is not None:
-                        train_loader._iterator._shutdown_workers()
-                    del train_loader
-                    gc.collect()
-                current_loader_align_only = need_align_only
-                train_loader, train_sampler = _build_train_loader(
-                    train_dataset,
-                    config,
-                    device,
-                    align_only=need_align_only,
-                    is_ddp=is_ddp,
-                    rank=rank,
-                    world_size=world_size,
-                )
-
             if train_sampler is not None:
                 train_sampler.set_epoch(epoch)
 
             if stage != current_stage:
                 prev_stage = current_stage if current_stage is not None else resumed_stage
-                if prev_stage in ("align_warmup", "pixel_stage") and stage == "semantic_stage":
+                if prev_stage == "pixel_stage" and stage == "semantic_stage":
                     if is_main:
                         best_ckpt_p = Path(config.CHECKPOINT_DIR) / "model_best.pt"
                         pix_backup_p = Path(config.CHECKPOINT_DIR) / "model_best_pixel.pt"
@@ -1097,74 +1027,22 @@ def train(
                 if is_ddp and model is not raw_model:
                     del model
                     gc.collect()
-                if disc_model is not None:
-                    del disc_model, raw_disc, disc_optimizer
-                    disc_model = None
-                    raw_disc = None
-                    disc_optimizer = None
-                    disc_scaler = None
-                    gc.collect()
                 if device.type == "cuda":
                     torch.cuda.empty_cache()
                 current_stage = stage
                 optimizer, active_params = build_stage_optimizer(raw_model, stage, config)
                 if stage == "pixel_stage":
-                    stage_end = config.ALIGN_WARMUP_EPOCHS + config.PIXEL_STAGE_EPOCHS
-                    stage_rem = max(1, stage_end - epoch + 1)
+                    stage_rem = max(1, config.PIXEL_STAGE_EPOCHS - epoch + 1)
                 else:
                     stage_rem = max(1, config.EPOCHS - epoch + 1)
                 scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=stage_rem, eta_min=1e-5)
                 if device.type == "cuda":
                     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
-                gan_w = max(
-                    float(getattr(config, "LOSS_GAN_WEIGHT", 0.0)),
-                    float(getattr(config, "LOSS_RPGAN_WEIGHT", 0.0)),
-                )
-                if stage in ("semantic_stage", "joint") and gan_w > 0.0:
-                    raw_disc = VisionAidedDiscriminator(
-                        sem_dim=raw_model.semantic_encoder.spatial_dim,
-                        num_actions=config.NUM_ACTIONS,
-                    ).to(device)
-                    if epoch == start_epoch and resumed_stage == stage and resumed_disc_state is not None:
-                        try:
-                            raw_disc.load_state_dict(resumed_disc_state)
-                        except Exception:
-                            pass
-                        resumed_disc_state = None
-                    disc_optimizer = optim.AdamW(
-                        raw_disc.parameters(),
-                        lr=float(getattr(config, "DISC_LR", 6e-5)),
-                        betas=(0.5, 0.999),
-                        weight_decay=1e-4,
-                    )
-                    if epoch == start_epoch and resumed_stage == stage and resumed_disc_opt_state is not None:
-                        try:
-                            disc_optimizer.load_state_dict(resumed_disc_opt_state)
-                        except Exception:
-                            pass
-                        resumed_disc_opt_state = None
-                    if device.type == "cuda":
-                        disc_scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
-                    if is_ddp:
-                        disc_model = torch.nn.parallel.DistributedDataParallel(
-                            raw_disc,
-                            device_ids=[local_rank],
-                            output_device=local_rank,
-                            find_unused_parameters=False,
-                        )
-                    else:
-                        disc_model = raw_disc
-
                 if is_main:
-                    disc_note = (
-                        f" + Vision-Aided GAN ({sum(p.numel() for p in raw_disc.parameters()):,} D params)"
-                        if raw_disc is not None
-                        else ""
-                    )
                     print(
                         f"\n=== Entering Stage '{stage}' at Epoch {epoch}/{config.EPOCHS} "
-                        f"({active_params:,} active G params{disc_note}) ===",
+                        f"({active_params:,} active trainable params) ===",
                         flush=True,
                     )
 
@@ -1182,8 +1060,6 @@ def train(
                             if is_main:
                                 print(f"Restored optimizer & scheduler states for stage '{stage}'.", flush=True)
                         else:
-                            # Expanding a completed `--pilot` / `--speedrun` checkpoint into a longer run:
-                            # preserve warm AdamW momentum while starting a fresh cosine LR schedule!
                             for pg, blr in zip(optimizer.param_groups, base_lrs):
                                 pg["lr"] = blr * 0.85
                                 pg["initial_lr"] = blr * 0.85
@@ -1240,57 +1116,33 @@ def train(
             )
 
             for step_idx, batch in enumerate(pbar, start=1):
-                clean = batch["clean"].to(device, non_blocking=True)
                 src = batch["source"].to(device, non_blocking=True)
+                tgt = batch["target"].to(device, non_blocking=True)
+                act_map = unpack_batch_action_map(batch, device)
 
                 optimizer.zero_grad(set_to_none=True)
-                aux = {}
-                out = None
-                tgt = None
-                act_map = None
 
                 try:
-                    if stage == "align_warmup":
-                        with torch.amp.autocast("cuda", enabled=use_amp):
-                            align_out = model(src, clean_01=clean, align_only=True)
-                            loss = align_out.float().mean()
-                        val_f = float(loss.detach().item())
-                        metrics = {"align": val_f, "total": val_f}
-                    else:
-                        tgt = batch["target"].to(device, non_blocking=True)
-                        act_map = unpack_batch_action_map(batch, device)
-                        # Keep d_scale strictly > 0.25 on all DDP ranks in semantic_stage/joint so sem_branch gets grads
-                        d_scale = 0.0 if stage == "pixel_stage" else float(random.uniform(0.35, 1.05))
+                    d_scale = 0.0 if stage == "pixel_stage" else float(random.uniform(0.35, 1.0))
 
-                        if raw_disc is not None:
-                            raw_disc.eval()
-                            raw_disc.requires_grad_(False)
-
-                        with torch.amp.autocast("cuda", enabled=use_amp):
-                            out = model(
-                                src,
-                                act_map,
-                                tgt_01=tgt,
-                                clean_01=clean,
-                                fidelity_scale=1.0,
-                                detail_scale=d_scale,
-                            )
-                            loss, metrics, aux = loss_fn(
-                                pred_01=out["pred"],
-                                target_01=tgt,
-                                action_map=act_map,
-                                align_loss=out["align_loss"],
-                                stage=stage,
-                                t_vec=out["t"],
-                                src_01=src,
-                                hat_z_0=out.get("hat_z_0"),
-                                z_tgt=out.get("z_tgt"),
-                                evae_loss=out.get("evae_loss"),
-                                restorer_model=raw_model,
-                                semantic_encoder=raw_model.semantic_encoder,
-                                discriminator=raw_disc,
-                                return_aux=True,
-                            )
+                    with torch.amp.autocast("cuda", enabled=use_amp):
+                        out = model(
+                            src,
+                            act_map,
+                            tgt_01=tgt,
+                            fidelity_scale=1.0,
+                            detail_scale=d_scale,
+                        )
+                        loss, metrics = loss_fn(
+                            pred_01=out["pred"],
+                            target_01=tgt,
+                            action_map=act_map,
+                            stage=stage,
+                            src_01=src,
+                            hat_z_0=out.get("hat_z_0"),
+                            z_tgt=out.get("z_tgt"),
+                            restorer_model=raw_model,
+                        )
 
                     if scaler is not None and use_amp:
                         scaler.scale(loss).backward()
@@ -1309,51 +1161,15 @@ def train(
                 finally:
                     raw_model.clear_runtime_contexts()
 
-                if (
-                    disc_model is not None
-                    and raw_disc is not None
-                    and disc_optimizer is not None
-                    and out is not None
-                    and "pred_grid" in aux
-                    and "tgt_grid" in aux
-                ):
-                    raw_disc.requires_grad_(True)
-                    disc_model.train()
-                    disc_optimizer.zero_grad(set_to_none=True)
-                    with torch.amp.autocast("cuda", enabled=use_amp):
-                        d_loss = VisionAidedDiscriminator.discriminator_hinge_loss(
-                            disc_module=disc_model,
-                            real_rgb=tgt,
-                            fake_rgb=out["pred"].detach(),
-                            real_grid=aux["tgt_grid"],
-                            fake_grid=aux["pred_grid"],
-                            action_map=act_map,
-                            relativistic=bool(aux.get("use_rpgan", False)),
-                        )
-                    if disc_scaler is not None and use_amp:
-                        disc_scaler.scale(d_loss).backward()
-                        disc_scaler.unscale_(disc_optimizer)
-                        torch.nn.utils.clip_grad_norm_(raw_disc.parameters(), config.GRAD_CLIP_NORM)
-                        disc_scaler.step(disc_optimizer)
-                        disc_scaler.update()
-                    else:
-                        d_loss.backward()
-                        torch.nn.utils.clip_grad_norm_(raw_disc.parameters(), config.GRAD_CLIP_NORM)
-                        disc_optimizer.step()
-                    metrics["d_loss"] = float(d_loss.detach().item())
-                del aux, out
-
+                del out
                 for k, v in metrics.items():
                     running[k] = running.get(k, 0.0) + v
 
                 if is_main and (step_idx == 1 or step_idx % log_interval == 0 or step_idx == num_steps):
                     avg_tot = running["total"] / step_idx
-                    avg_al = running.get("align", 0.0) / step_idx
                     gpu_str = format_gpu_postfix()
                     if use_tqdm:
-                        pbar.set_postfix(
-                            {"loss": f"{avg_tot:.4f}", "align": f"{avg_al:.4f}", "gpu": gpu_str}
-                        )
+                        pbar.set_postfix({"loss": f"{avg_tot:.4f}", "gpu": gpu_str})
                     else:
                         elapsed = max(1e-6, time.perf_counter() - epoch_start_t)
                         sec_per_it = elapsed / step_idx
@@ -1361,26 +1177,20 @@ def train(
                         eta_str = _format_duration(sec_per_it * (num_steps - step_idx))
                         pct = 100.0 * step_idx / max(1, num_steps)
                         cur_lr = optimizer.param_groups[-1]["lr"]
-                        if stage == "align_warmup":
-                            loss_parts = f"loss={avg_tot:.4f} align={avg_al:.4f}"
-                        elif stage == "pixel_stage":
-                            avg_l1 = running.get("l1", 0.0) / step_idx
-                            avg_lat = running.get("lat", 0.0) / step_idx
-                            avg_ev = running.get("evae", 0.0) / step_idx
-                            avg_pyr = running.get("pyr", 0.0) / step_idx
+                        avg_l1 = running.get("l1", 0.0) / step_idx
+                        avg_lat = running.get("lat", 0.0) / step_idx
+                        avg_perc = running.get("perc", 0.0) / step_idx
+                        if stage == "pixel_stage":
+                            avg_pres = running.get("pres", 0.0) / step_idx
                             loss_parts = (
                                 f"loss={avg_tot:.4f} l1={avg_l1:.4f} lat={avg_lat:.4f} "
-                                f"evae={avg_ev:.4f} pyr={avg_pyr:.4f}"
+                                f"perc={avg_perc:.4f} pres={avg_pres:.4f}"
                             )
                         else:
-                            avg_l1 = running.get("l1", 0.0) / step_idx
-                            avg_lat = running.get("lat", 0.0) / step_idx
                             avg_csd = running.get("csd", 0.0) / step_idx
-                            avg_perc = running.get("perc", 0.0) / step_idx
-                            avg_hf = running.get("hf_g", 0.0) / step_idx
                             loss_parts = (
                                 f"loss={avg_tot:.4f} l1={avg_l1:.4f} lat={avg_lat:.4f} "
-                                f"csd={avg_csd:.4f} perc={avg_perc:.4f} hfg={avg_hf:.4f}"
+                                f"perc={avg_perc:.4f} csd={avg_csd:.4f}"
                             )
                         print(
                             f"[Epoch {epoch:03d}/{config.EPOCHS} | {stage}] "
@@ -1391,7 +1201,6 @@ def train(
 
                 should_mid_sample = (
                     sample_every > 0
-                    and stage != "align_warmup"
                     and (step_idx % sample_every == 0)
                     and (num_steps - step_idx) > min(75, sample_every // 5)
                 )
@@ -1427,7 +1236,7 @@ def train(
             epoch_summary["stage"] = stage
 
             if is_main:
-                if stage != "align_warmup" and (epoch % max(1, config.VAL_EPOCH_INTERVAL) == 0 or epoch == config.EPOCHS):
+                if epoch % max(1, config.VAL_EPOCH_INTERVAL) == 0 or epoch == config.EPOCHS:
                     if device.type == "cuda":
                         torch.cuda.empty_cache()
                     val_metrics = evaluate_validation(raw_model, val_loader, device, config, stage, loss_fn=loss_fn)
@@ -1456,9 +1265,6 @@ def train(
                         config=config,
                     )
 
-                    # In `pixel_stage`, select `model_best.pt` by pure PSNR (`model_best_pixel.pt` backs it up).
-                    # In `semantic_stage`, select by Perceptual-Structural Quality (`rest_psnr - 12 * val_dists`)
-                    # so crisp micro-texture isn't discarded due to the perception-distortion PSNR dip!
                     cur_score = (rest_psnr - 12.0 * val_dists) if stage == "semantic_stage" else rest_psnr
                     if cur_score > best_stage_score:
                         best_stage_score = cur_score
@@ -1474,8 +1280,6 @@ def train(
                     best_psnr,
                     config,
                     "model_latest.pt",
-                    raw_disc=raw_disc,
-                    disc_optimizer=disc_optimizer,
                 )
                 if epoch % config.CHECKPOINT_EVERY_N_EPOCHS == 0:
                     save_checkpoint(
@@ -1496,7 +1300,6 @@ def train(
             traceback.print_exc(file=sys.stdout)
             sys.stdout.flush()
             if is_ddp:
-                # Exit immediately so torchrun terminates sibling ranks in <1s instead of hanging dist.barrier()!
                 os._exit(1)
         raise
     else:
@@ -1505,13 +1308,8 @@ def train(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train Controllable Pretrained Image Restoration Model (V5)")
+    parser = argparse.ArgumentParser(description="Train Controllable Pretrained Image Restoration Model")
     parser.add_argument("--debug", action="store_true", help="Use DebugConfig for quick verification")
-    parser.add_argument(
-        "--hypir-mode",
-        action="store_true",
-        help="Run isolated HYPIR experimental mode (deterministic fixed step + 2x LoRA rank + RpGAN, no CSD)",
-    )
     parser.add_argument("--mock", action="store_true", help="Use offline mock_tiny backbones (no HF downloads)")
     parser.add_argument("--no-ddp", action="store_true", help="Disable automatic multi-GPU DDP worker launch")
     parser.add_argument("--data-root", type=str, default=None, help="Dataset root (DIV2K, LSDIR, or image folder)")
@@ -1533,16 +1331,16 @@ def main():
         "--paired-prob",
         type=float,
         default=None,
-        help="Fraction of training batches sampled from real paired camera datasets (default: 0.35)",
+        help="Fraction of training batches sampled from real paired camera datasets (default: 0.42)",
     )
     parser.add_argument("--output-dir", type=str, default=None, help="Output directory for sweep grids")
     parser.add_argument("--checkpoint-dir", type=str, default=None, help="Directory for adapter checkpoints")
     parser.add_argument("--log-dir", type=str, default=None, help="Directory for training logs")
-    parser.add_argument("--resume", type=str, default=None, help="Path to V5 model_latest.pt / model_best.pt checkpoint")
+    parser.add_argument("--resume", type=str, default=None, help="Path to model_latest.pt / model_best.pt checkpoint")
     parser.add_argument(
         "--allow-schema-expand",
         action="store_true",
-        help="Allow warm-starting existing named LoRA experts when adding new control sliders",
+        help="Allow warm-starting matching adapters when changing control sliders",
     )
     parser.add_argument(
         "--backbone",
@@ -1553,17 +1351,16 @@ def main():
     parser.add_argument(
         "--vision-encoder",
         type=str,
-        choices=["convnextv2_dinov2", "dinov3_siglip2", "c_radio", "mock_tiny"],
+        choices=["dinov2_reg", "mock_tiny"],
         default=None,
     )
-    parser.add_argument("--radio-id", type=str, default=None, help="Override HF repo ID for C-RADIO (e.g. nvidia/C-RADIOv3-B)")
     parser.add_argument("--training-mode", type=str, choices=["staged", "joint"], default=None)
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--epochs", type=int, default=None)
-    parser.add_argument("--align-epochs", type=int, help="Override Phase-1 Vision LoRA warmup epochs", default=None)
-    parser.add_argument("--pixel-epochs", type=int, help="Override Phase-2 Pixel-Stage epochs", default=None)
+    parser.add_argument("--pixel-epochs", type=int, help="Override Pixel-Stage epochs", default=None)
     parser.add_argument("--extra-epochs", type=int, default=None, help="When resuming, run N more epochs past checkpoint")
     parser.add_argument("--remaining-pixel-epochs", type=int, default=None, help="When resuming, run K more pixel_stage epochs")
+    parser.add_argument("--csd-weight", type=float, default=None, help="Override Stage-2 Target-Anchored CSD loss weight")
     parser.add_argument("--steps-per-epoch", type=int, default=None, help="Cap optimizer steps per epoch")
     parser.add_argument("--min-steps-per-epoch", type=int, default=None, help="Minimum optimizer steps per epoch on small folders")
     parser.add_argument("--train-images", type=int, default=None, help="Cap number of training reference images")
@@ -1573,12 +1370,12 @@ def main():
         "--5h",
         dest="pilot",
         action="store_true",
-        help="Balanced ~5-hour end-to-end 3-stage run on 2x T4 (1 align + 9 pixel + 3 CSD epochs @ 950 steps/ep)",
+        help="Balanced ~5-hour 2-stage run on 2x T4 (9 pixel + 3 CSD epochs @ 950 steps/ep)",
     )
     parser.add_argument(
         "--speedrun",
         action="store_true",
-        help="Quick ~60-min sanity preset (350 steps/epoch, 1 align + 5 pixel + 2 detail epochs)",
+        help="Quick sanity preset (350 steps/epoch, 5 pixel + 2 detail epochs)",
     )
     parser.add_argument("--num-workers", type=int, default=None)
     parser.add_argument("--log-interval", type=int, default=None, help="Steps between clean log lines (default: 100)")
@@ -1594,11 +1391,6 @@ def main():
     else:
         config = Config()
 
-    if args.hypir_mode:
-        for k, v in HYPIRConfig.__dict__.items():
-            if k.isupper():
-                setattr(config, k, v)
-
     if args.mock:
         config.GENERATOR_BACKBONE = "mock_tiny"
         config.SEMANTIC_ENCODER_TYPE = "mock_tiny"
@@ -1606,8 +1398,6 @@ def main():
         config.GENERATOR_BACKBONE = args.backbone
     if args.vision_encoder:
         config.SEMANTIC_ENCODER_TYPE = args.vision_encoder
-    if args.radio_id:
-        config.RADIO_MODEL_ID = args.radio_id
     if args.training_mode:
         config.TRAINING_MODE = args.training_mode
     if args.data_root:
@@ -1631,7 +1421,6 @@ def main():
     if args.batch_size:
         config.BATCH_SIZE = args.batch_size
     if args.speedrun:
-        config.MAX_ALIGN_STEPS = 200
         config.MAX_STEPS_PER_EPOCH = 350
         config.MIN_STEPS_PER_EPOCH = 350
         config.CURRICULUM_WARMUP_EPOCHS = 1
@@ -1640,15 +1429,14 @@ def main():
         config.LOG_INTERVAL = 40
         config.SAMPLE_EVERY_N_STEPS = 175
         if not args.resume:
-            config.ALIGN_WARMUP_EPOCHS = 1
             config.PIXEL_STAGE_EPOCHS = 5
-            config.EPOCHS = 8
+            config.EPOCHS = 7
     if args.epochs:
         config.EPOCHS = args.epochs
-    if args.align_epochs is not None:
-        config.ALIGN_WARMUP_EPOCHS = args.align_epochs
     if args.pixel_epochs is not None:
         config.PIXEL_STAGE_EPOCHS = args.pixel_epochs
+    if args.csd_weight is not None:
+        config.LOSS_CSD_WEIGHT = float(args.csd_weight)
     if args.steps_per_epoch is not None:
         config.MAX_STEPS_PER_EPOCH = args.steps_per_epoch
         if args.steps_per_epoch > 0:

@@ -5,14 +5,12 @@ Implements:
    with zero spatial receptive field so whole-image, single-object, and multi-region
    overlays behave locally identically at every pixel.
 2. ActionOverlayEncoder: Encodes signed/unsigned spatial action overlays
-   A in [-1, 1]^(B x K x H x W) and Vision Semantic features into:
-   - Cross-Attention tokens [B, 77, cross_attn_dim] preserving English quality tokens
-   - Global Action Conditioning vector [B, action_hidden_dim] (signed mean + peak-magnitude
-     so both positive and negative localized edits activate full LoRA capacity!)
+   A in [-1, 1]^(B x K x H x W) and Vision Semantic features into 77-token
+   cross-attention conditioning preserving the base OpenCLIP prompt prefix.
 """
 
 import math
-from typing import Optional, Tuple
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -44,7 +42,6 @@ class PointwiseSpatialModulator(nn.Module):
             num_groups //= 2
         self.norm = nn.GroupNorm(num_groups=num_groups, num_channels=channels, affine=False)
 
-        # Strictly kernel_size=1 so each spatial coordinate (y, x) only reads its own control vector
         self.mlp_1x1 = nn.Sequential(
             nn.Conv2d(num_actions, hidden_dim, kernel_size=1),
             nn.SiLU(),
@@ -71,7 +68,7 @@ class PointwiseSpatialModulator(nn.Module):
 
 
 class ActionOverlayEncoder(nn.Module):
-    """Anchors signed/unsigned slider & semantic tokens onto SD-Turbo's 77-token OpenCLIP manifold."""
+    """Anchors signed/unsigned slider & semantic tokens onto SD-2.1's 77-token OpenCLIP manifold."""
 
     def __init__(
         self,
@@ -102,20 +99,17 @@ class ActionOverlayEncoder(nn.Module):
             max(1, (self.prompt_seq_len - 4) // max(1, num_actions)),
         )
         self.op_token_count = self.num_actions * self.tokens_per_action
-        # Place semantic + slider tokens in trailing padding slots (preserving English prompt tokens 0..prefix_keep-1!)
         avail_after_ops = max(1, self.prompt_seq_len - self.op_token_count - 1)
-        self.vis_spatial_count = min(16, avail_after_ops)  # 4x4 = 16 high-level scene tokens (dense 2D grid goes into UNet!)
+        self.vis_spatial_count = min(16, avail_after_ops)
         self.prefix_keep = max(0, self.prompt_seq_len - (self.vis_spatial_count + 1 + self.op_token_count))
         self.register_buffer("base_prompt_embeds", embed_buf, persistent=False)
 
-        # Per-operation learned identity basis + preserve/pos/neg anchors for signed controls
         self.op_identity = nn.Parameter(torch.randn(num_actions, action_hidden_dim) * 0.02)
         self.preserve_anchor = nn.Parameter(torch.randn(1, 1, action_hidden_dim) * 0.02)
         self.pos_active_anchor = nn.Parameter(torch.randn(1, 1, action_hidden_dim) * 0.02)
         self.neg_active_anchor = nn.Parameter(torch.randn(1, 1, action_hidden_dim) * 0.02)
 
         self.scalar_fourier = ContinuousScalarFourier(dim=32)
-        # basis (H_act) + f_mean (32) + f_peak (32) + raw_stats [mean, peak, min, max, abs_max] (5)
         in_tok_dim = action_hidden_dim + self.scalar_fourier.out_dim * 2 + 5
 
         self.op_feat_mlp = nn.Sequential(
@@ -151,24 +145,6 @@ class ActionOverlayEncoder(nn.Module):
         nn.init.normal_(self.sem_global_token_out.weight, mean=0.0, std=1e-3)
         nn.init.zeros_(self.sem_global_token_out.bias)
 
-        # Direct slider highway + normalized semantic context for Dual-LoRA & UNet temb FiLM
-        self.action_summary_mlp = nn.Sequential(
-            nn.Linear(num_actions * action_hidden_dim, action_hidden_dim * 2),
-            nn.SiLU(),
-            nn.Linear(action_hidden_dim * 2, action_hidden_dim),
-            nn.LayerNorm(action_hidden_dim),
-        )
-        self.sem_global_proj = nn.Sequential(
-            nn.LayerNorm(sem_global_dim),
-            nn.Linear(sem_global_dim, action_hidden_dim),
-            nn.SiLU(),
-        )
-        self.global_fusion_mlp = nn.Sequential(
-            nn.Linear(action_hidden_dim * 2, action_hidden_dim * 2),
-            nn.SiLU(),
-            nn.Linear(action_hidden_dim * 2, action_hidden_dim),
-        )
-
     @staticmethod
     def ensure_spatial_map(action_input: torch.Tensor, height: int, width: int) -> torch.Tensor:
         """Accept either [B, K] global vector or [B, K, H, W] spatial map and return [B, K, H, W]."""
@@ -185,20 +161,19 @@ class ActionOverlayEncoder(nn.Module):
         action_map: torch.Tensor,
         sem_tokens: torch.Tensor,
         sem_global: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Compute 77-token cross-attention conditioning and global Dual-LoRA action vector."""
+    ) -> torch.Tensor:
+        """Compute 77-token cross-attention conditioning [B, 77, cross_attn_dim]."""
         bsz = action_map.shape[0]
         a_fp32 = action_map.float()
 
-        # Signed-safe spatial summary statistics so negative localized masks (e.g. darken/cool) retain full strength!
-        a_mean = a_fp32.mean(dim=(-2, -1))                      # [B, K]
-        a_max = a_fp32.amax(dim=(-2, -1))                       # [B, K]
-        a_min = a_fp32.amin(dim=(-2, -1))                       # [B, K]
-        a_abs_max = torch.maximum(a_max.abs(), a_min.abs())     # [B, K]
+        a_mean = a_fp32.mean(dim=(-2, -1))
+        a_max = a_fp32.amax(dim=(-2, -1))
+        a_min = a_fp32.amin(dim=(-2, -1))
+        a_abs_max = torch.maximum(a_max.abs(), a_min.abs())
         a_peak = torch.where(a_max.abs() >= a_min.abs(), a_max, a_min)
 
-        active_gate = (a_abs_max / 0.05).clamp(0.0, 1.0).unsqueeze(-1)     # [B, K, 1]
-        sign_blend = (0.5 * (torch.tanh(a_peak * 6.0) + 1.0)).unsqueeze(-1)  # 0 = negative, 1 = positive
+        active_gate = (a_abs_max / 0.05).clamp(0.0, 1.0).unsqueeze(-1)
+        sign_blend = (0.5 * (torch.tanh(a_peak * 6.0) + 1.0)).unsqueeze(-1)
         dir_anchor = sign_blend * self.pos_active_anchor + (1.0 - sign_blend) * self.neg_active_anchor
         status_vec = (1.0 - active_gate) * self.preserve_anchor + active_gate * dir_anchor
         basis = self.op_identity.unsqueeze(0).expand(bsz, -1, -1) + status_vec
@@ -208,7 +183,7 @@ class ActionOverlayEncoder(nn.Module):
         raw_stats = torch.stack([a_mean, a_peak, a_min, a_max, a_abs_max], dim=-1)
 
         op_in = torch.cat([basis, f_mean, f_peak, raw_stats], dim=-1)
-        op_feat = self.op_feat_mlp(op_in)                       # [B, K, action_hidden_dim]
+        op_feat = self.op_feat_mlp(op_in)
 
         op_tokens = self.op_token_proj(op_feat).view(bsz, self.op_token_count, self.cross_attn_dim)
         op_tokens = self.op_token_out(F.silu(self.op_token_norm(op_tokens)))
@@ -237,10 +212,4 @@ class ActionOverlayEncoder(nn.Module):
         base_prompt = self.base_prompt_embeds
         if base_prompt.device != delta_tokens.device or base_prompt.dtype != delta_tokens.dtype:
             base_prompt = base_prompt.to(device=delta_tokens.device, dtype=delta_tokens.dtype)
-        cross_attn_tokens = base_prompt.expand(bsz, -1, -1) + delta_tokens
-
-        action_vec = self.action_summary_mlp(op_feat.reshape(bsz, -1))
-        sem_vec = self.sem_global_proj(sem_global.float())
-        global_action_cond = action_vec + self.global_fusion_mlp(torch.cat([action_vec, sem_vec], dim=-1))
-
-        return cross_attn_tokens, global_action_cond
+        return base_prompt.expand(bsz, -1, -1) + delta_tokens

@@ -202,7 +202,7 @@ class ControllableInferencer:
             )
 
         effective_detail_scale = detail_scale
-        if effective_detail_scale is None and self.ckpt_stage in ("align_warmup", "pixel_stage"):
+        if effective_detail_scale is None and self.ckpt_stage == "pixel_stage":
             effective_detail_scale = 0.0
 
         eff_tile = (
@@ -315,7 +315,7 @@ def main():
     parser.add_argument(
         "--vision-encoder",
         type=str,
-        choices=["convnextv2_dinov2", "dinov3_siglip2", "c_radio", "mock_tiny"],
+        choices=["dinov2_reg", "mock_tiny"],
         default=None,
         help="Optional vision semantic encoder override when running without a checkpoint",
     )

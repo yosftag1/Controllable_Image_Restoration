@@ -1,14 +1,8 @@
-"""DataParallel-safe Universal eVAE Skip-Connected AutoencoderKL with Frozen Natural Decoder.
+"""Skip-Connected AutoencoderKL with Lightweight Encoder LoRA & Frozen Natural Decoder.
 
-Follows OSDD's Dual-Path Feature Alignment (`eVAE`) + Universal Slider Control:
-1. `vae.encoder` receives Expandable Slider-Routed UIR-LoRA Experts to align degraded spatial
-   features toward the selective target `x_tgt` according to the user's sliders (`zero estimator`).
-2. `vae.decoder` stays 100% FROZEN by default (`VAE_DEC_LORA_RANK = 0`), guaranteeing every decoded
-   spatial edge and texture lies on Stable Diffusion's natural photographic manifold.
-3. `_UniversalSpatialSkipBridge` replaces hardcoded `retain_env -> 0` blur suppression with a
-   universal slider-conditioned spatial alignment adapter (`3x3` + `dilated 3x3` + `1x5/5x1` strip
-   depthwise convs modulated via FiLM from `action_map`), preserving sharp high-res geometry across
-   motion blur, defocus, denoising, and future knobs (e.g. lens distortion, lens flare).
+1. `vae.encoder` receives lightweight pixel-stage LoRA (when `VAE_ENC_LORA_RANK > 0`).
+2. `vae.decoder` stays 100% frozen so every decoded edge lies on SD's natural image manifold.
+3. `_SpatialSkipBridge` passes action-gated multi-scale encoder skips into the frozen decoder.
 """
 
 import math
@@ -19,16 +13,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as grad_checkpoint
 
-from .lora_layers import (
-    _get_generator_lora_state,
-    infer_module_dtype,
-    inject_generator_dual_lora,
-    resolve_expert_specs,
-)
+from .lora_layers import infer_module_dtype, inject_generator_dual_lora
 
 
-class _UniversalSpatialSkipBridge(nn.Module):
-    """Decoder-guided universal slider-conditioned spatial skip bridge from Encoder to Frozen Decoder."""
+class _SpatialSkipBridge(nn.Module):
+    """Lean action-gated spatial skip bridge from VAE Encoder to Frozen VAE Decoder."""
 
     def __init__(
         self,
@@ -43,38 +32,21 @@ class _UniversalSpatialSkipBridge(nn.Module):
             enc_groups //= 2
         self.norm = nn.GroupNorm(num_groups=enc_groups, num_channels=enc_channels, affine=False)
 
-        dec_groups = 32
-        while dec_channels % dec_groups != 0 and dec_groups > 1:
-            dec_groups //= 2
-        self.dec_norm = nn.GroupNorm(num_groups=dec_groups, num_channels=dec_channels, affine=False)
-
         mid_ch = min(96, max(32, enc_channels // 4))
         self.in_proj = nn.Conv2d(enc_channels, mid_ch, kernel_size=1, bias=False)
-        self.dec_proj = nn.Conv2d(dec_channels, mid_ch, kernel_size=1, bias=False)
+        self.dw_conv = nn.Conv2d(mid_ch, mid_ch, kernel_size=3, padding=1, groups=mid_ch, bias=False)
+        nn.init.kaiming_uniform_(self.dw_conv.weight, a=math.sqrt(5))
+        self.dw_conv.weight.data.mul_(0.50)
 
-        # Universal 2D spatial realignment bank (local 3x3 + dilated 3x3 + full-2D 5x5 separable strips)
-        self.dw_local = nn.Conv2d(mid_ch, mid_ch, kernel_size=3, padding=1, groups=mid_ch, bias=False)
-        self.dw_dilated = nn.Conv2d(
-            mid_ch, mid_ch, kernel_size=3, padding=2, dilation=2, groups=mid_ch, bias=False
-        )
-        self.dw_strip_h = nn.Conv2d(mid_ch, mid_ch, kernel_size=(1, 5), padding=(0, 2), groups=mid_ch, bias=False)
-        self.dw_strip_v = nn.Conv2d(mid_ch, mid_ch, kernel_size=(5, 1), padding=(2, 0), groups=mid_ch, bias=False)
-
-        for dw in (self.dw_local, self.dw_dilated, self.dw_strip_h, self.dw_strip_v):
-            nn.init.kaiming_uniform_(dw.weight, a=math.sqrt(5))
-            dw.weight.data.mul_(0.30)
-
-        # Reads user sliders + per-pixel Decoder-vs-Encoder edge agreement `(cos_agree, abs_diff)`!
-        # Non-zero init on `act_mlp[-1]` avoids the double-zero saddle point (`zero_proj == 0` keeps step-0 identity!)
         self.act_mlp = nn.Sequential(
-            nn.Conv2d(num_actions + 2, hidden_dim, kernel_size=1),
+            nn.Conv2d(num_actions, hidden_dim, kernel_size=1),
             nn.SiLU(),
-            nn.Conv2d(hidden_dim, mid_ch * 3, kernel_size=1),
+            nn.Conv2d(hidden_dim, mid_ch, kernel_size=1),
         )
         nn.init.normal_(self.act_mlp[-1].weight, mean=0.0, std=0.02)
         nn.init.zeros_(self.act_mlp[-1].bias)
 
-        # bias=False guarantees zero DC color/brightness offset leak into the frozen VAE decoder!
+        # Zero-init without bias guarantees step-0 identity and zero DC color shift
         self.zero_proj = nn.Conv2d(mid_ch, dec_channels, kernel_size=1, bias=False)
         nn.init.zeros_(self.zero_proj.weight)
 
@@ -97,31 +69,10 @@ class _UniversalSpatialSkipBridge(nn.Module):
             a_local = action_map.float()
 
         h = self.in_proj(self.norm(enc_skip_f))
-        h_dec = self.dec_proj(self.dec_norm(dec_feat.float()))
+        h = F.silu(h + self.dw_conv(h))
+        gate = torch.sigmoid(self.act_mlp(a_local))
 
-        # Universal discrepancy cues: where UNet `hat_z_0` shifted/deblurred an edge, `h_dec` disagrees with `h`!
-        cos_agree = (F.normalize(h, dim=1, eps=1e-6) * F.normalize(h_dec, dim=1, eps=1e-6)).sum(
-            dim=1, keepdim=True
-        )
-        abs_diff = (h_dec - h).abs().mean(dim=1, keepdim=True).clamp(0.0, 5.0)
-        ctrl_in = torch.cat([a_local, cos_agree, abs_diff], dim=1)
-
-        raw_gamma, raw_spatial_mix, raw_gate = self.act_mlp(ctrl_in).chunk(3, dim=1)
-        gamma = torch.tanh(raw_gamma)
-        spatial_mix = torch.tanh(raw_spatial_mix)
-        gate = torch.sigmoid(raw_gate)
-
-        # Modulate encoder features, then apply full-2D spatial realignment (including diagonal 5x5 outer-span!)
-        h_mod = h * (1.0 + gamma)
-        h_sep = self.dw_strip_v(self.dw_strip_h(h_mod))
-        h_spatial = (
-            self.dw_local(h_mod)
-            + self.dw_dilated(h_mod)
-            + 0.5 * (h_sep + self.dw_strip_h(h_mod) + self.dw_strip_v(h_mod))
-        )
-        h_aligned = F.silu(h_mod + (0.5 + 0.5 * spatial_mix) * h_spatial)
-
-        bridge = self.zero_proj(gate * h_aligned) * keep_mask.to(dtype=torch.float32, device=dec_feat.device)
+        bridge = self.zero_proj(gate * h) * keep_mask.to(dtype=torch.float32, device=dec_feat.device)
         return dec_feat + bridge.to(dec_feat.dtype)
 
 
@@ -199,7 +150,7 @@ class _MockTinyVAE(nn.Module):
 
 
 class SkipConnectedVAE(nn.Module):
-    """Wraps diffusers AutoencoderKL with Slider-Routed eVAE Encoder LoRA & Universal Skip Alignment."""
+    """Wraps AutoencoderKL with lightweight Encoder LoRA, action-gated skip bridges & frozen Decoder."""
 
     def __init__(self, vae: nn.Module, config):
         super().__init__()
@@ -211,60 +162,21 @@ class SkipConnectedVAE(nn.Module):
         for p in self.vae.parameters():
             p.requires_grad = False
 
-        hypir_scale = (
-            float(getattr(config, "HYPIR_LORA_RANK_SCALE", 2.0))
-            if bool(getattr(config, "HYPIR_MODE", False))
-            else 1.0
-        )
-        unet_base_r = max(1, int(getattr(config, "UNET_LORA_RANK", 28)))
-        enc_rank = int(getattr(config, "VAE_ENC_LORA_RANK", 16) or 0)
+        enc_rank = int(getattr(config, "VAE_ENC_LORA_RANK", 8) or 0)
         enc_alpha = float(getattr(config, "VAE_ENC_LORA_ALPHA", float(enc_rank)))
-        enc_sem_rank = max(6, int(getattr(config, "SEM_DETAIL_LORA_RANK", 16)) * enc_rank // unet_base_r)
-
-        enc_expert_specs = resolve_expert_specs(
-            getattr(config, "LORA_EXPERT_SPECS", None),
-            getattr(config, "DEGRADATION_TYPES", None),
-            signed_types=getattr(config, "SIGNED_ACTION_TYPES", ("exposure", "warmth")),
-            default_rank=enc_rank,
-            rank_scale=(float(enc_rank) / float(unet_base_r)) * hypir_scale,
-        )
-
         if enc_rank > 0:
-            enc_pix_params, enc_sem_params = inject_generator_dual_lora(
+            enc_pix_params, _ = inject_generator_dual_lora(
                 self.vae.encoder,
-                action_dim=config.ACTION_HIDDEN_DIM,
                 rank=enc_rank,
                 alpha=enc_alpha,
+                sem_rank=0,
+                sem_alpha=0.0,
                 include_conv=True,
-                expert_specs=enc_expert_specs,
-                sem_rank=enc_sem_rank,
-                sem_alpha=float(enc_sem_rank),
-                use_dora=bool(getattr(config, "USE_DORA", True)),
-                unfreeze_norms=False,
             )
         else:
-            enc_pix_params, enc_sem_params = [], []
+            enc_pix_params = []
 
-        dec_rank = int(getattr(config, "VAE_DEC_LORA_RANK", 0) or 0)
-        dec_alpha = float(getattr(config, "VAE_DEC_LORA_ALPHA", float(dec_rank)))
-        if dec_rank > 0:
-            dec_pix_params, dec_sem_params = inject_generator_dual_lora(
-                self.vae.decoder,
-                action_dim=config.ACTION_HIDDEN_DIM,
-                rank=dec_rank,
-                alpha=dec_alpha,
-                include_conv=True,
-                expert_specs=enc_expert_specs,
-                sem_rank=max(4, dec_rank // 2),
-                sem_alpha=float(max(4, dec_rank // 2)),
-                use_dora=bool(getattr(config, "USE_DORA", True)),
-                unfreeze_norms=False,
-            )
-        else:
-            dec_pix_params, dec_sem_params = [], []
-
-        self.vae_pix_lora_params = list(enc_pix_params) + list(dec_pix_params)
-        self.vae_sem_lora_params = list(enc_sem_params) + list(dec_sem_params)
+        self.vae_pix_lora_params = list(enc_pix_params)
 
         with torch.no_grad():
             enc_dev = next(self.vae.encoder.parameters()).device
@@ -272,34 +184,25 @@ class SkipConnectedVAE(nn.Module):
             z_dummy, enc_skips = self._raw_encode(dummy)
             dec_channels = self._probe_decoder_channels(z_dummy)
 
-        deg_names = list(getattr(config, "DEGRADATION_TYPES", []))
-        signed_set = set(getattr(config, "SIGNED_ACTION_TYPES", ("exposure", "warmth")))
-        local_clean_set = {"denoise", "deartifact"}
-        struct_idx = [i for i, n in enumerate(deg_names) if n not in signed_set]
-        # Any spatial-displacement / deconvolution slider (motion, focus, or future knobs like lens_distortion):
-        deconv_idx = [i for i, n in enumerate(deg_names) if (n not in signed_set) and (n not in local_clean_set)]
-        self.register_buffer("struct_action_indices", torch.tensor(struct_idx, dtype=torch.long), persistent=False)
-        self.register_buffer("deconv_action_indices", torch.tensor(deconv_idx, dtype=torch.long), persistent=False)
-
         num_actions = config.NUM_ACTIONS
         mod_hidden = getattr(config, "SPATIAL_MOD_HIDDEN_DIM", 64)
-        self.skip_dropout_prob = float(getattr(config, "SKIP_DROPOUT_PROB", 0.0))
+        self.skip_dropout_prob = float(getattr(config, "SKIP_DROPOUT_PROB", 0.15))
 
         self.up_skip_bridges = nn.ModuleList(
             [
-                _UniversalSpatialSkipBridge(
+                _SpatialSkipBridge(
                     enc_skips[2].shape[1],
                     dec_channels[0],
                     num_actions,
                     hidden_dim=mod_hidden,
                 ),
-                _UniversalSpatialSkipBridge(
+                _SpatialSkipBridge(
                     enc_skips[1].shape[1],
                     dec_channels[1],
                     num_actions,
                     hidden_dim=mod_hidden,
                 ),
-                _UniversalSpatialSkipBridge(
+                _SpatialSkipBridge(
                     enc_skips[0].shape[1],
                     dec_channels[2],
                     num_actions,
@@ -357,37 +260,11 @@ class SkipConnectedVAE(nn.Module):
         x_norm = rgb_01 * 2.0 - 1.0
         return self._raw_encode(x_norm, collect_skips=True)
 
-    def encode_target_latents(self, rgb_01: torch.Tensor, return_skips: bool = False):
-        """Encode clean/selective target RGB image in [0, 1] into frozen-VAE target latents (& skips)."""
+    def encode_target_latents(self, rgb_01: torch.Tensor) -> torch.Tensor:
+        """Encode clean/selective target RGB image in [0, 1] into frozen-VAE target latents."""
         x_norm = rgb_01 * 2.0 - 1.0
-        latents, skips = self._raw_encode(x_norm, collect_skips=return_skips)
-        if return_skips:
-            return latents, skips
+        latents, _ = self._raw_encode(x_norm, collect_skips=False)
         return latents
-
-    @staticmethod
-    def compute_evae_alignment_loss(
-        student_skips: List[torch.Tensor],
-        target_skips: List[torch.Tensor],
-    ) -> torch.Tensor:
-        """OSDD-style universal multi-scale feature alignment between student eVAE & clean teacher skips."""
-        if not student_skips or not target_skips:
-            return torch.zeros((), dtype=torch.float32)
-        n = min(len(student_skips), len(target_skips))
-        total = student_skips[0].new_zeros((), dtype=torch.float32)
-        scale_weights = (0.30, 0.35, 0.35)
-        w_sum = 0.0
-        for idx in range(n):
-            sw = scale_weights[idx] if idx < len(scale_weights) else (1.0 / float(n))
-            s_f = student_skips[idx].float()
-            t_f = target_skips[idx].detach().float()
-            s_norm = F.normalize(s_f, dim=1, eps=1e-6)
-            t_norm = F.normalize(t_f, dim=1, eps=1e-6)
-            cos_loss = (1.0 - (s_norm * t_norm).sum(dim=1)).mean()
-            l1_loss = F.smooth_l1_loss(s_f, t_f, beta=0.25)
-            total = total + sw * (0.65 * cos_loss + 0.35 * l1_loss)
-            w_sum += sw
-        return total / max(1e-6, w_sum)
 
     def decode_with_skips(
         self,
@@ -408,7 +285,8 @@ class SkipConnectedVAE(nn.Module):
             keep_mask = (
                 torch.rand((bsz, 1, 1, 1), device=latents.device, dtype=torch.float32) < keep_prob
             ).float() * float(skip_scale)
-            if bsz >= 2 and float(keep_mask.sum().item()) == 0.0 and float(skip_scale) > 0.0:
+            # Ensure at least one sample keeps skips so bridge parameters always receive gradients under DDP
+            if float(keep_mask.sum().item()) == 0.0 and float(skip_scale) > 0.0:
                 keep_mask[0] = float(skip_scale)
         else:
             keep_mask = torch.full((bsz, 1, 1, 1), float(skip_scale), device=latents.device, dtype=torch.float32)
@@ -422,17 +300,6 @@ class SkipConnectedVAE(nn.Module):
             h = h.requires_grad_(True)
         h = grad_checkpoint(dec.mid_block, h, use_reentrant=False) if use_ckpt else dec.mid_block(h)
 
-        # Universal Slider-Driven Fine-Skip Release:
-        # 1. Even in Stage 2 (`detail_scale == 0`), when spatial edge-deconvolving sliders (`deblur_motion`,
-        #    `sharpen_focus`, or future geometric knobs) are active, release blurry 128x128 (`58%`) & 256x256 (`88%`)
-        #    input skips so smeared input edges NEVER overwrite sharp edges restored by the UNet in `hat_z_0`!
-        #    When `deblur_motion=0, sharpen_focus=0` (`Keep Blur` / `Denoise`), `100%` of crisp skips stay active!
-        # 2. When `detail_scale > 0` (Stage 3), also release fine skips on active restoration regions for 1-2px pores/fur!
-        _act_c, _lam_pix, lam_sem, _sp = _get_generator_lora_state(latents.device)
-        detail_env = min(1.0, max(0.0, float(lam_sem)))
-        deconv_release = (0.15, 0.58, 0.88)
-        fine_release = (0.0, 0.52, 0.88)
-
         skip_indices = [2, 1, 0]
         for idx, up_block in enumerate(dec.up_blocks):
             if idx < 3 and len(enc_skips) > skip_indices[idx]:
@@ -441,35 +308,12 @@ class SkipConnectedVAE(nn.Module):
                 if release_skips and not use_ckpt:
                     enc_skips[s_idx] = None
                 if enc_skip is not None:
-                    thw = h.shape[-2:]
-                    a_loc = (
-                        F.interpolate(action_map.float(), size=thw, mode="area")
-                        if action_map.shape[-2:] != thw
-                        else action_map.float()
-                    )
-                    rel_map = None
-                    if self.deconv_action_indices.numel() > 0 and deconv_release[idx] > 0.0:
-                        di = self.deconv_action_indices.to(a_loc.device)
-                        d_act = a_loc.index_select(1, di).abs().amax(dim=1, keepdim=True).clamp(0.0, 1.0)
-                        rel_map = deconv_release[idx] * d_act
-
-                    if detail_env > 1e-4 and fine_release[idx] > 0.0:
-                        if self.struct_action_indices.numel() > 0:
-                            si = self.struct_action_indices.to(a_loc.device)
-                            s_act = a_loc.index_select(1, si).abs().amax(dim=1, keepdim=True).clamp(0.0, 1.0)
-                        else:
-                            s_act = a_loc.abs().amax(dim=1, keepdim=True).clamp(0.0, 1.0)
-                        det_rel = (fine_release[idx] * detail_env) * s_act
-                        rel_map = det_rel if rel_map is None else torch.maximum(rel_map, det_rel)
-
-                    eff_keep = keep_mask if rel_map is None else (keep_mask * (1.0 - rel_map).clamp(0.0, 1.0))
-
                     h = (
                         grad_checkpoint(
-                            self.up_skip_bridges[idx], h, enc_skip, action_map, eff_keep, use_reentrant=False
+                            self.up_skip_bridges[idx], h, enc_skip, action_map, keep_mask, use_reentrant=False
                         )
                         if use_ckpt
-                        else self.up_skip_bridges[idx](h, enc_skip, action_map, eff_keep)
+                        else self.up_skip_bridges[idx](h, enc_skip, action_map, keep_mask)
                     )
                     del enc_skip
             h = grad_checkpoint(up_block, h, use_reentrant=False) if use_ckpt else up_block(h)

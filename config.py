@@ -1,44 +1,24 @@
-"""Configuration for Controllable Pretrained Image Restoration (V5 Universal Slider-Routed Experts)."""
+"""Configuration for Controllable Pretrained Image Restoration (Clean SD-2.1 Baseline)."""
 
 
 class Config:
-    """Main V5 configuration: SD-2.1-Base + Expandable Slider-Routed UIR-LoRA Experts + Universal eVAE."""
+    """Clean 2-stage baseline: SD-2.1-Base (fixed t=199) + Unified Pixel/Detail LoRA + Frozen DINOv2-Reg."""
 
     PROJECT_NAME = "controllable_image_restoration"
-    MODEL_VERSION = "v5_universal_experts"
+    MODEL_VERSION = "v5_clean_sd21"
 
     # -------------------------------------------------------------------------
-    # 1. Pretrained Semantic Vision Encoder ("The Eyes" + Self-Teacher LoRA)
+    # 1. Frozen Pretrained Semantic Vision Encoder (Cross-Attn Context & 1-Click Masks)
     # -------------------------------------------------------------------------
-    # Default switched from `c_radio` (coarse 16x16 single-grid remote code) to `convnextv2_dinov2`:
-    # - `ConvNeXt-V2` (4x/8x/16x 7x7 depthwise conv pyramid) preserves sub-patch blur trajectories & fur edges!
-    # - `DINOv2-with-Registers` (clean register-filtered ViT) supplies artifact-free semantics & 1-click masks!
-    SEMANTIC_ENCODER_TYPE = "convnextv2_dinov2"
-
-    CONVNEXTV2_MODEL_ID = "facebook/convnextv2-base-22k-224"
-    CONVNEXTV2_FALLBACK_ID = "facebook/convnextv2-tiny-22k-224"
+    SEMANTIC_ENCODER_TYPE = "dinov2_reg"
     DINOV2_REG_MODEL_ID = "facebook/dinov2-with-registers-base"
     DINOV2_FALLBACK_MODEL_ID = "facebook/dinov2-with-registers-small"
-    DINOV3_MODEL_ID = "facebook/dinov3-vits16-pretrain-lvd1689m"
-    SIGLIP2_MODEL_ID = "google/siglip2-base-patch16-256"
-    RADIO_MODEL_ID = "nvidia/C-RADIOv3-B"
-    RADIO_ALT_MODEL_ID = "nvidia/C-RADIOv2-B"
-
-    VISION_LORA_RANK = 8
-    VISION_LORA_ALPHA = 16.0
-    VISION_LORA_DROPOUT = 0.0
 
     # -------------------------------------------------------------------------
-    # 2. Pretrained Generator Backbones & Expandable Slider-Routed UIR-LoRA
+    # 2. Pretrained Generator Backbone & Clean Dual-Branch LoRA
     # -------------------------------------------------------------------------
-    # Default switched from `sd-turbo` to `sd-2.1-base`:
-    # - Eliminates SD-Turbo's baked-in ADD high-contrast/oversharpening artifacts.
-    # - Unlocks zero-extra-VRAM Target-Anchored Classifier Score Distillation (CSD/TSD)
-    #   with negative prompts in Stage 3 (`LoRA OFF` on the same frozen base UNet!).
     GENERATOR_BACKBONE = "sd-2.1-base"
 
-    # Note: Stability AI retired `stabilityai/stable-diffusion-2-1-base`; we default to the
-    # verified diffusers mirror `sd2-community/stable-diffusion-2-1-base` with automatic mirror fallback!
     GENERATOR_REPO_MAP = {
         "sd-2.1-base": "sd2-community/stable-diffusion-2-1-base",
         "sd-turbo": "stabilityai/sd-turbo",
@@ -59,47 +39,15 @@ class Config:
         ],
     }
 
-    # Expandable Task-Routed Pixel LoRA Experts (UIR-LoRA + Strip/Multi-Scale Conv-LoRA):
-    # - Each expert is routed deterministically by its assigned user sliders (zero estimator,
-    #   zero cross-task gradient conflict between smoothing noise vs. deconvolving blur!).
-    # - Future-proof: to add new knobs later (e.g. `lens_distortion`, `deflare`), append the
-    #   knob to `DEGRADATION_TYPES` and append a new expert spec dict below. Existing named
-    #   experts load seamlessly from checkpoints without retraining from scratch.
-    LORA_EXPERT_SPECS = [
-        {
-            "name": "clean_smooth",
-            "sliders": ["denoise", "deartifact"],
-            "rank": 24,
-            "conv_mode": "standard_3x3",
-        },
-        {
-            "name": "motion_deconv",
-            "sliders": ["deblur_motion"],
-            "rank": 32,
-            "conv_mode": "strip_1x7_7x1",
-        },
-        {
-            "name": "focus_optical",
-            "sliders": ["sharpen_focus"],
-            "rank": 32,
-            "conv_mode": "multiscale_5x5",
-        },
-    ]
-
-    # Fallback / base rank & decoupled Stage-3 Semantic-Detail LoRA rank
-    UNET_LORA_RANK = 28
-    UNET_LORA_ALPHA = 28.0
+    # Unified Pixel-Stage LoRA + Stage-3 Semantic-Detail LoRA
+    UNET_LORA_RANK = 32
+    UNET_LORA_ALPHA = 32.0
     SEM_DETAIL_LORA_RANK = 16
     SEM_DETAIL_LORA_ALPHA = 16.0
-    USE_DORA = True
-    # Keep base UNet norms frozen in main V5 so LoRA-OFF exposes exact `sd-2.1-base` for Stage-3 CSD!
-    UNFREEZE_UNET_NORMS = False
 
-    # Universal eVAE Encoder LoRA + 100% Frozen Natural-Manifold Decoder (`VAE_DEC_LORA_RANK = 0`)
-    VAE_ENC_LORA_RANK = 16
-    VAE_ENC_LORA_ALPHA = 16.0
-    VAE_DEC_LORA_RANK = 0
-    VAE_DEC_LORA_ALPHA = 0.0
+    # Lightweight VAE Encoder LoRA + 100% Frozen Natural-Manifold Decoder
+    VAE_ENC_LORA_RANK = 8
+    VAE_ENC_LORA_ALPHA = 8.0
     TONE_HEAD_HIDDEN_DIM = 32
 
     DEFAULT_POS_PROMPT = (
@@ -114,30 +62,16 @@ class Config:
 
     # Single user-facing Generative Detail dial (`detail_scale` in [0, 1])
     DEFAULT_FIDELITY_SCALE = 1.0
-    DEFAULT_DETAIL_SCALE = 0.75
+    DEFAULT_DETAIL_SCALE = 0.50
 
-    # Slider-Driven Adaptive Timestep Schedule (`FideDiff` principle without a blind estimator!):
-    # Maps active structural slider strength smoothly into [RESTORATION_MIN_TIMESTEP, RESTORATION_MAX_TIMESTEP].
+    # Fixed single-step denoising timestep for SD-2.1-base
     DEFAULT_INFERENCE_STEPS = 1
-    ADAPTIVE_TIMESTEP = True
-    RESTORATION_MIN_TIMESTEP = 79
-    RESTORATION_MAX_TIMESTEP = 339
+    RESTORATION_TIMESTEP = 199
     INFERENCE_TILE_SIZE = 512
     INFERENCE_TILE_OVERLAP = 96
-    MULTI_STEP_TRAIN_PROB = 0.0
     INITIAL_VELOCITY_SCALE = 1.0
-    # Drop encoder skips on 20% of training steps so UNet `hat_z_0` MUST carry full sharp deblurring on its own!
-    SKIP_DROPOUT_PROB = 0.20
-
-    # -------------------------------------------------------------------------
-    # Separate Experimental HYPIR Mode (Disabled by default; opt-in via --hypir-mode)
-    # -------------------------------------------------------------------------
-    # Kept strictly isolated from the main V5 pipeline so HYPIR (deterministic fixed-step
-    # score-prior + Relativistic Vision RpGAN without CSD) can be benchmarked separately.
-    HYPIR_MODE = False
-    HYPIR_FIXED_TIMESTEP = 200
-    HYPIR_LORA_RANK_SCALE = 2.0
-    LOSS_RPGAN_WEIGHT = 0.0
+    # Drop encoder skips on 15% of training steps so UNet `hat_z_0` carries full deblurring on its own
+    SKIP_DROPOUT_PROB = 0.15
 
     # -------------------------------------------------------------------------
     # 3. Orthogonal Control Space (4 Unsigned [0, 1] Fixes + 2 Signed [-1, +1] Grades)
@@ -176,7 +110,7 @@ class Config:
 
     SPATIAL_MASK_PROB = 0.25
 
-    # Clean-Patch Laplacian Sharpness Gate (purges blurry background bokeh & flat web JPEGs from GT!)
+    # Clean-Patch Laplacian Sharpness Gate
     CLEAN_PATCH_SHARPNESS_CANDIDATES = 3
     CLEAN_PATCH_MIN_LAPLACIAN_VAR = 18.0
     CLEAN_PATCH_SMOOTH_ALLOW_PROB = 0.15
@@ -185,7 +119,7 @@ class Config:
     ACTION_DIST_SELECTIVE = 0.22
     ACTION_DIST_PARTIAL = 0.14
     ACTION_DIST_FULL = 0.50
-    ACTION_DIST_FALSE_POS = 0.08   # Clean-photo safety without drowning out active motion deblurring!
+    ACTION_DIST_FALSE_POS = 0.08
     ACTION_DIST_IDENTITY = 0.06
 
     # Physical camera & compression parameter ranges
@@ -204,26 +138,22 @@ class Config:
     WARMTH_B_KAPPA = 1.30
 
     # -------------------------------------------------------------------------
-    # 5. Hybrid Multi-Dataset Paths, Hardware & Kaggle 2x T4 Training Schedule
+    # 5. Hybrid Multi-Dataset Paths, Hardware & 2-Stage Training Schedule
     # -------------------------------------------------------------------------
     DATASET_NAME = "DIV2K"
     DATASET_PATH = "./data/DIV2K"
     TRAIN_DATASET_PATH = None
     VAL_DATASET_PATH = None
 
-    # Optional real paired camera deblurring roots (e.g. GoPro/HIDE/RealBlur pack + DPDD defocus):
-    # Wrapped via Compositional Real-Pair Wrapper so all 6 selective sliders train on REAL camera blur!
     PAIRED_MOTION_DATASET_PATH = None
     PAIRED_DEFOCUS_DATASET_PATH = None
     PAIRED_REAL_PROB = 0.42
-    # Also reuse verified clean `sharp`/`gt` images from paired datasets inside the main multi-task clean pool!
     REUSE_PAIRED_CLEAN_FOR_SYNTH = True
 
     TRAIN_IMAGES_COUNT = 0
     VAL_IMAGES_COUNT = 0
     MIN_STEPS_PER_EPOCH = 1000
     MAX_STEPS_PER_EPOCH = 0
-    MAX_ALIGN_STEPS = 0
 
     OUTPUT_DIR = "./outputs"
     LOG_DIR = "./logs"
@@ -241,46 +171,31 @@ class Config:
     MULTI_GPU = True
     SEED = 42
 
-    # 3-Phase Staged Training:
-    #   Phase 1 (Epoch 1):       Self-Teacher Vision LoRA warmup
-    #   Phase 2 (Epochs 2..13):  Universal Slider-Routed Experts + Universal eVAE Skip Alignment
-    #   Phase 3 (Epochs 14..16): Target-Anchored CSD (`PiSA-SR` / `TSD-SR`, 0 MB extra VRAM!) + LPIPS
+    # 2-Stage Training:
+    #   Stage 1 (Epochs 1..12):  Pixel Stage (Spatial Control + Pixel/Latent Fidelity)
+    #   Stage 2 (Epochs 13..15): Semantic Stage (DISTS Texture + Zero-Drift Target-Anchored CSD)
     TRAINING_MODE = "staged"
-    EPOCHS = 16
-    ALIGN_WARMUP_EPOCHS = 1
+    EPOCHS = 15
     PIXEL_STAGE_EPOCHS = 12
 
     LEARNING_RATE = 1e-4
-    VISION_LORA_LR = 1e-4
-    DISC_LR = 5e-5
     WEIGHT_DECAY = 1e-4
     GRAD_CLIP_NORM = 1.0
     CHECKPOINT_EVERY_N_EPOCHS = 4
 
-    # V5 Artifact-Free Latent + Universal eVAE + Laplacian Pyramid + Target-Anchored CSD Weights:
-    LOSS_LATENT_WEIGHT = 0.85             # Direct clean-latent target supervision in Stage 2
-    LOSS_SEMANTIC_STAGE_LATENT_LP_WEIGHT = 0.30  # Low-pass 2x latent structural anchor in Stage 3 (frees micro-texture!)
-    LOSS_EVAE_SKIP_WEIGHT = 0.35          # Universal OSDD-style eVAE skip feature alignment vs clean encoder!
-    LOSS_L1_WEIGHT = 1.00
-    LOSS_SEMANTIC_STAGE_LP_L1_WEIGHT = 0.75  # 4x Low-Pass structural L1 in Stage 3 (zero double-penalty blur on 1-3px pores!)
-    LOSS_PYRAMID_WEIGHT = 0.60            # 4-level anti-aliased Laplacian pyramid in Stage 2
-    LOSS_GRADIENT_WEIGHT = 0.35           # Multi-scale edge gradient alignment in Stage 2
-    LOSS_HF_GUARD_WEIGHT = 0.50           # Asymmetric hinge penalizing fake high-freq energy >> ground truth
-    LOSS_FREQUENCY_WEIGHT = 0.10          # Pure complex (real, imag) phase+amp L1 in Stage 2
-    LOSS_COLOR_TONE_WEIGHT = 0.65         # Multi-scale RGB + opponent chroma accuracy
-    LOSS_PRESERVE_WEIGHT = 0.50           # Zero-action & zero-DC tone lock when exposure=warmth=0
-    LOSS_ALIGN_WEIGHT = 0.15              # Self-Teacher vision encoder alignment
-    LOSS_PIXEL_STAGE_PERCEPTUAL_WEIGHT = 0.08
-    LOSS_PERCEPTUAL_WEIGHT = 0.65         # Full-res relu1_2..relu4_4 DISTS local texture + LPIPS in Stage 3!
-    LOSS_CSD_WEIGHT = 0.65                # Stage-3 zero-extra-VRAM Target-Anchored CSD (`sd-2.1-base` teacher!)
-    CSD_CFG_SCALE = 5.5                   # Negative-prompt suppression & sharpness guidance in Stage-3 CSD
-    CSD_STEP_SCALE = 0.35                 # Calibrated score step magnitude so CSD actively synthesizes fine detail!
-    CSD_TIMESTEP_RANGE = (50, 500)        # Full SD-2.1 micro- & meso-texture synthesis band
-    LOSS_CONTRAST_WEIGHT = 0.0
-    # Disabled in Stage 2 (`pixel_stage` already uses latent+eVAE+L1+pyramid+VGG; avoids a 2nd uncheckpointed C-RADIO backward!)
-    LOSS_PIXEL_STAGE_SEM_WEIGHT = 0.0
-    LOSS_SEM_CONSISTENCY_WEIGHT = 0.25
-    LOSS_GAN_WEIGHT = 0.0
+    # Clean 4-Term Loss Objective:
+    LOSS_L1_WEIGHT = 1.0
+    LOSS_LATENT_WEIGHT = 0.50
+    LOSS_PIXEL_STAGE_PERCEPTUAL_WEIGHT = 0.10
+    LOSS_PRESERVE_WEIGHT = 0.50
+
+    LOSS_SEMANTIC_STAGE_LP_L1_WEIGHT = 0.75
+    LOSS_SEMANTIC_STAGE_LATENT_LP_WEIGHT = 0.25
+    LOSS_PERCEPTUAL_WEIGHT = 0.60
+    LOSS_CSD_WEIGHT = 0.20
+    CSD_CFG_SCALE = 4.5
+    CSD_STEP_SCALE = 0.15
+    CSD_TIMESTEP_RANGE = (50, 400)
     PERCEPTUAL_LAYERS = ["relu1_2", "relu2_2", "relu3_4", "relu4_4"]
 
     USE_TQDM = False
@@ -292,40 +207,13 @@ class Config:
     EVAL_IMAGE_COUNT = 3
 
 
-class HYPIRConfig(Config):
-    """Separate experimental HYPIR configuration (opt-in via `--hypir-mode` for isolated testing).
-
-    Implements HYPIR (SIGGRAPH Asia 2025): deterministic fixed-step score-prior restoration
-    with high-rank LoRA (`2x` rank scale) + pretrained C-RADIO Relativistic GAN (`RpGAN`:
-    `D(pred) - D(gt)`), disabling diffusion timestep variation and CSD teacher distillation.
-    """
-
-    MODEL_VERSION = "v5_hypir_experimental"
-    HYPIR_MODE = True
-    UNFREEZE_UNET_NORMS = True
-    ADAPTIVE_TIMESTEP = False
-    RESTORATION_MIN_TIMESTEP = 200
-    RESTORATION_MAX_TIMESTEP = 200
-    HYPIR_FIXED_TIMESTEP = 200
-    HYPIR_LORA_RANK_SCALE = 2.0
-    LOSS_CSD_WEIGHT = 0.0
-    LOSS_RPGAN_WEIGHT = 0.08
-
-
 class PilotConfig(Config):
-    """Balanced ~5-hour end-to-end 3-stage preset (`--pilot` / `--5h`) for Kaggle 2x T4.
+    """Balanced ~5-hour 2-stage preset (`--pilot` / `--5h`) for Kaggle 2x T4."""
 
-    Runs 13 epochs (`1` align @ `350` steps + `9` pixel @ `950` steps/ep + `3` CSD detail @ `950`
-    steps/ep = `11,750` total steps, ~94k patches rotating across your full clean + paired datasets)
-    so all 3 stages converge solidly in ~5 hours, and can still be resumed into a longer uncapped run.
-    """
-
-    EPOCHS = 13
-    ALIGN_WARMUP_EPOCHS = 1
+    EPOCHS = 12
     PIXEL_STAGE_EPOCHS = 9
     CURRICULUM_WARMUP_EPOCHS = 2
     LEARNING_RATE = 1.15e-4
-    MAX_ALIGN_STEPS = 350
     MAX_STEPS_PER_EPOCH = 950
     MIN_STEPS_PER_EPOCH = 950
     VAL_IMAGES_COUNT = 60
@@ -337,8 +225,7 @@ class PilotConfig(Config):
 class DebugConfig(Config):
     """Lightweight debug configuration for rapid end-to-end verification."""
 
-    EPOCHS = 3
-    ALIGN_WARMUP_EPOCHS = 1
+    EPOCHS = 2
     PIXEL_STAGE_EPOCHS = 1
     CURRICULUM_WARMUP_EPOCHS = 0
     MIN_STEPS_PER_EPOCH = 0
