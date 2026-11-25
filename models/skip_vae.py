@@ -190,6 +190,9 @@ class SkipConnectedVAE(nn.Module):
         signed_set = set(getattr(config, "SIGNED_ACTION_TYPES", ["exposure", "warmth"]))
         struct_idx = [i for i, n in enumerate(deg_names) if n not in signed_set]
         self.register_buffer("struct_action_indices", torch.tensor(struct_idx, dtype=torch.long), persistent=False)
+        blur_set = {"deblur_motion", "sharpen_focus"}
+        blur_idx = [i for i, n in enumerate(deg_names) if n in blur_set]
+        self.register_buffer("blur_action_indices", torch.tensor(blur_idx, dtype=torch.long), persistent=False)
 
         num_actions = config.NUM_ACTIONS
         mod_hidden = getattr(config, "SPATIAL_MOD_HIDDEN_DIM", 64)
@@ -309,7 +312,8 @@ class SkipConnectedVAE(nn.Module):
         h = grad_checkpoint(dec.mid_block, h, use_reentrant=False) if use_ckpt else dec.mid_block(h)
 
         detail_env = min(1.0, max(0.0, float(detail_scale)))
-        fine_fade = (0.0, 0.50, 0.85)
+        blur_fine_fade = (0.0, 0.25, 0.55)
+        nonblur_fine_fade = (0.0, 0.05, 0.15)
         skip_indices = [2, 1, 0]
         for idx, up_block in enumerate(dec.up_blocks):
             if idx < 3 and len(enc_skips) > skip_indices[idx]:
@@ -318,7 +322,11 @@ class SkipConnectedVAE(nn.Module):
                 if release_skips and not use_ckpt:
                     enc_skips[s_idx] = None
                 if enc_skip is not None:
-                    if detail_env > 1e-4 and fine_fade[idx] > 0.0 and self.struct_action_indices.numel() > 0:
+                    if (
+                        detail_env > 1e-4
+                        and (blur_fine_fade[idx] > 0.0 or nonblur_fine_fade[idx] > 0.0)
+                        and self.struct_action_indices.numel() > 0
+                    ):
                         thw = h.shape[-2:]
                         a_loc = (
                             F.interpolate(action_map.float(), size=thw, mode="area")
@@ -327,7 +335,16 @@ class SkipConnectedVAE(nn.Module):
                         )
                         si = self.struct_action_indices.to(a_loc.device)
                         struct_act = a_loc.index_select(1, si).abs().amax(dim=1, keepdim=True).clamp(0.0, 1.0)
-                        eff_keep = keep_mask * (1.0 - fine_fade[idx] * detail_env * struct_act).clamp(0.0, 1.0)
+                        if self.blur_action_indices.numel() > 0:
+                            bi = self.blur_action_indices.to(a_loc.device)
+                            blur_act = a_loc.index_select(1, bi).abs().amax(dim=1, keepdim=True).clamp(0.0, 1.0)
+                        else:
+                            blur_act = torch.zeros_like(struct_act)
+                        fade_amt = torch.maximum(
+                            nonblur_fine_fade[idx] * struct_act,
+                            blur_fine_fade[idx] * blur_act,
+                        )
+                        eff_keep = keep_mask * (1.0 - fade_amt * detail_env).clamp(0.0, 1.0)
                     else:
                         eff_keep = keep_mask
 

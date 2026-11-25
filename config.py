@@ -68,7 +68,7 @@ class Config:
 
     # Single user-facing Generative Detail dial (`detail_scale` in [0, 1])
     DEFAULT_FIDELITY_SCALE = 1.0
-    DEFAULT_DETAIL_SCALE = 0.65
+    DEFAULT_DETAIL_SCALE = 0.35
 
     # 2-Step Latent Refinement schedule on SD-2.1-base (Step 1 coarse deblur/denoise -> Step 2 crisp polish)
     DEFAULT_INFERENCE_STEPS = 1
@@ -76,8 +76,8 @@ class Config:
     INFERENCE_TILE_SIZE = 512
     INFERENCE_TILE_OVERLAP = 96
     INITIAL_VELOCITY_SCALE = 1.0
-    # Drop encoder skips on 25% of training steps so UNet `hat_z_0` carries full sharp deblurring on its own
-    SKIP_DROPOUT_PROB = 0.25
+    # Drop encoder skips on 15% of training steps so UNet `hat_z_0` carries full sharp deblurring on its own
+    SKIP_DROPOUT_PROB = 0.15
 
     # -------------------------------------------------------------------------
     # 3. Orthogonal Control Space (8 Unsigned [0, 1] Fixes + 2 Signed [-1, +1] Grades)
@@ -203,13 +203,13 @@ class Config:
     LOSS_PIXEL_STAGE_PERCEPTUAL_WEIGHT = 0.10
     LOSS_PRESERVE_WEIGHT = 0.50
 
-    LOSS_SEMANTIC_STAGE_LP_L1_WEIGHT = 0.70
-    LOSS_SEMANTIC_STAGE_FULL_L1_WEIGHT = 0.15  # Gentle subpixel anchor preventing 1-2px fine-detail jitter
+    LOSS_SEMANTIC_STAGE_LP_L1_WEIGHT = 0.35
+    LOSS_SEMANTIC_STAGE_FULL_L1_WEIGHT = 0.50  # Strong subpixel anchor preventing fine-detail drift
     LOSS_SEMANTIC_STAGE_LATENT_LP_WEIGHT = 0.25
     LOSS_PERCEPTUAL_WEIGHT = 0.60
-    LOSS_CSD_WEIGHT = 0.40
+    LOSS_CSD_WEIGHT = 0.15
     CSD_CFG_SCALE = 5.0
-    CSD_STEP_SCALE = 0.30
+    CSD_STEP_SCALE = 0.20
     CSD_TIMESTEP_RANGE = (50, 400)
     PERCEPTUAL_LAYERS = ["relu1_2", "relu2_2", "relu3_4", "relu4_4"]
 
@@ -223,10 +223,10 @@ class Config:
 
 
 class PilotConfig(Config):
-    """Balanced ~5-hour 2-stage preset (`--pilot` / `--5h`) for Kaggle 2x T4 (8 pixel + 4 semantic epochs)."""
+    """Balanced ~5-hour 2-stage preset (`--pilot` / `--5h`) for Kaggle 2x T4 (9 pixel + 3 semantic epochs)."""
 
     EPOCHS = 12
-    PIXEL_STAGE_EPOCHS = 8
+    PIXEL_STAGE_EPOCHS = 9
     CURRICULUM_WARMUP_EPOCHS = 2
     LEARNING_RATE = 1.15e-4
     MAX_STEPS_PER_EPOCH = 950

@@ -64,7 +64,7 @@ def test_selective_pipeline():
     assert cfg.LOSS_CSD_WEIGHT > 0.0
 
     pil_cfg = PilotConfig()
-    assert pil_cfg.EPOCHS == 12 and pil_cfg.PIXEL_STAGE_EPOCHS == 8
+    assert pil_cfg.EPOCHS == 12 and pil_cfg.PIXEL_STAGE_EPOCHS == 9
     assert pil_cfg.MAX_STEPS_PER_EPOCH == 950 and pil_cfg.MIN_STEPS_PER_EPOCH == 950
 
     dbg_cfg = DebugConfig()

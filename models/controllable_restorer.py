@@ -961,7 +961,7 @@ class ControllableRestorer(nn.Module):
                         timestep_val=t_list[0],
                     )
             hat_z_0 = self._predict_clean_latent(
-                z_t=hat_z_1.detach(),
+                z_t=hat_z_1,
                 cross_tokens=cross_tokens,
                 action_map=action_map,
                 fidelity_scale=fidelity_scale,
