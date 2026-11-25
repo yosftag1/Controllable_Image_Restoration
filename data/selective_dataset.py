@@ -29,6 +29,11 @@ class DegradationParams:
     motion_dwell_end: float = 0.0    # Shutter turnaround endpoint dwell in [0, 0.35]
     motion_shake_jitter: float = 0.0 # S-curve / handheld tremor amplitude in [-0.35, +0.35]
     motion_pattern: int = 0          # 0 = Bezier arc, 1 = S-curve tremor, 2 = micro-shake jitter
+    motion_spatial_mode: int = 0     # 0=uniform, 1=parallax (BG heavy/FG mild), 2=moving FG, 3=smooth 3-basis field
+    motion_hdr_boost: float = 0.0    # Linear-light specular highlight lift before blur for realistic streaks
+    motion_angle_delta: float = 0.0  # Spatial angle shift (deg) across smooth non-uniform blur field
+    motion_bg_ratio: float = 0.10    # Relative blur length on sharp/minor layer in parallax & moving-subject modes
+    motion_field_seed: int = 17      # Deterministic seed for spatial motion blur mask / depth field
     use_bokeh_disc: bool = True      # True = optical circle-of-confusion disc PSF, False = Gaussian softness
     focus_mode: int = 0              # 0 = optical defocus/bokeh, 1 = low-res bicubic, 2 = hybrid lens+resample
     use_chromatic_aberration: bool = False  # Subtle lateral R/B lens fringing in optical focus mode
@@ -55,6 +60,7 @@ class DegradationParams:
     _flare_cache: Optional[Tuple[np.ndarray, np.ndarray]] = field(default=None, repr=False)
     _refl_cache: Optional[Tuple[np.ndarray, np.ndarray]] = field(default=None, repr=False)
     _haze_depth_cache: Optional[np.ndarray] = field(default=None, repr=False)
+    _motion_mask_cache: Optional[np.ndarray] = field(default=None, repr=False)
 
     def get_noise_unit(self) -> np.ndarray:
         """Lazily materialize realistic sensor noise (80% RGB independent + 20% correlated luminance grain)."""
@@ -159,6 +165,16 @@ class SelectiveDegradationPipeline:
             float(np.clip(air_base + rng.uniform(-4.0, 8.0), 180.0, 248.0)),
             float(np.clip(air_base + rng.uniform(2.0, 18.0), 185.0, 250.0)),
         )
+        nonunif_p = float(np.clip(getattr(self.config, "MOTION_NONUNIFORM_PROB", 0.60), 0.0, 0.95))
+        if rng.random() < nonunif_p:
+            # Non-uniform modes: 1=Parallax (BG heavy / FG mild-sharp), 2=Moving FG subject, 3=Smooth 3-basis field
+            m_spatial_mode = int(rng.choice([1, 2, 3], p=[0.38, 0.30, 0.32]))
+        else:
+            m_spatial_mode = 0
+        hdr_p = float(np.clip(getattr(self.config, "MOTION_HDR_STREAK_PROB", 0.65), 0.0, 1.0))
+        m_hdr_boost = float(rng.uniform(0.18, 0.45)) if rng.random() < hdr_p else 0.0
+        m_angle_delta = float(rng.uniform(-32.0, 32.0))
+        m_bg_ratio = 0.0 if rng.random() < 0.35 else float(rng.uniform(0.05, 0.24))
         return DegradationParams(
             height=height,
             width=width,
@@ -167,7 +183,12 @@ class SelectiveDegradationPipeline:
             motion_curve_bend=float(rng.uniform(-max_bend, max_bend)),
             motion_dwell_end=float(rng.uniform(0.0, 0.35)),
             motion_shake_jitter=float(rng.uniform(-0.35, 0.35)),
-            motion_pattern=int(rng.choice([0, 1, 2], p=[0.45, 0.35, 0.20])),
+            motion_pattern=int(rng.choice([0, 1, 2], p=[0.42, 0.36, 0.22])),
+            motion_spatial_mode=m_spatial_mode,
+            motion_hdr_boost=m_hdr_boost,
+            motion_angle_delta=m_angle_delta,
+            motion_bg_ratio=m_bg_ratio,
+            motion_field_seed=int(rng.integers(0, 2**31 - 1)),
             use_bokeh_disc=bool(rng.random() < 0.70),
             focus_mode=int(rng.choice([0, 1, 2], p=[0.46, 0.32, 0.22])),
             use_chromatic_aberration=bool(rng.random() < 0.20),
@@ -252,7 +273,7 @@ class SelectiveDegradationPipeline:
         nx = -ty
         ny = tx
 
-        num_taps = max(7, min(33, int(np.ceil(length_px * 1.4)) | 1))
+        num_taps = max(9, min(75, int(np.ceil(length_px * 1.6)) | 1))
         t_vals = np.linspace(-1.0, 1.0, num_taps, dtype=np.float32)
         weights = np.float32(1.0) + np.float32(dwell_end) * (t_vals * t_vals)
         weights /= np.sum(weights)
@@ -295,6 +316,164 @@ class SelectiveDegradationPipeline:
         psf /= np.maximum(np.sum(psf), np.float32(1e-6))
 
         return cv2.filter2D(img_float, cv2.CV_32F, psf, borderType=cv2.BORDER_REFLECT_101)
+
+    @staticmethod
+    def _build_motion_spatial_field(
+        h: int,
+        w: int,
+        mode: int,
+        seed: int,
+        ref_lin_rgb: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        """Deterministic smooth [H, W, 1] spatial field in [0, 1] for parallax / moving-subject / 3-basis blur."""
+        mrng = np.random.default_rng(seed)
+        gh, gw = max(16, h // 4), max(16, w // 4)
+
+        if mode in (1, 2):
+            # Foreground/background region mask (LAB region, soft ellipse, or depth split)
+            sub = float(mrng.random())
+            if sub < 0.40 and ref_lin_rgb is not None:
+                srgb_small = np.clip(
+                    np.sqrt(np.clip(ref_lin_rgb * np.float32(1.0 / 255.0), 0.0, 1.0)) * np.float32(255.0),
+                    0.0,
+                    255.0,
+                ).astype(np.uint8)
+                small_rgb = cv2.resize(srgb_small, (gw, gh), interpolation=cv2.INTER_AREA)
+                lab = cv2.cvtColor(small_rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
+                cy = int(mrng.integers(gh // 5, 4 * gh // 5))
+                cx = int(mrng.integers(gw // 5, 4 * gw // 5))
+                diff = lab - lab[cy, cx].reshape(1, 1, 3)
+                dist_sq = np.sum(diff * diff, axis=-1)
+                thresh = float(np.percentile(dist_sq, mrng.uniform(28.0, 58.0)))
+                raw_small = (dist_sq <= thresh).astype(np.float32)
+                if float(raw_small.mean()) < 0.15 or float(raw_small.mean()) > 0.85:
+                    sub = 0.55
+                else:
+                    raw_mask = cv2.resize(raw_small, (w, h), interpolation=cv2.INTER_LINEAR)
+                    sigma = float(mrng.uniform(6.0, 14.0))
+                    field = cv2.GaussianBlur(raw_mask, (0, 0), sigmaX=sigma, sigmaY=sigma)
+            if sub >= 0.40 or ref_lin_rgb is None:
+                if sub < 0.78:
+                    mask_small = np.zeros((gh, gw), dtype=np.float32)
+                    cx = int(mrng.integers(gw // 4, 3 * gw // 4))
+                    cy = int(mrng.integers(gh // 4, 3 * gh // 4))
+                    rx = int(mrng.integers(max(4, gw // 5), max(6, int(gw * 0.42))))
+                    ry = int(mrng.integers(max(4, gh // 5), max(6, int(gh * 0.42))))
+                    ang = float(mrng.uniform(0.0, 180.0))
+                    cv2.ellipse(mask_small, (cx, cy), (rx, ry), ang, 0, 360, 1.0, -1)
+                    raw_mask = cv2.resize(mask_small, (w, h), interpolation=cv2.INTER_LINEAR)
+                    sigma = float(mrng.uniform(8.0, 18.0))
+                    field = cv2.GaussianBlur(raw_mask, (0, 0), sigmaX=sigma, sigmaY=sigma)
+                else:
+                    yy, xx = np.meshgrid(
+                        np.linspace(-1.0, 1.0, gh, dtype=np.float32),
+                        np.linspace(-1.0, 1.0, gw, dtype=np.float32),
+                        indexing="ij",
+                    )
+                    theta = float(mrng.uniform(0.0, 2.0 * np.pi))
+                    proj = np.float32(np.cos(theta)) * xx + np.float32(np.sin(theta)) * yy
+                    offset = np.float32(mrng.uniform(-0.25, 0.25))
+                    sharpness = np.float32(mrng.uniform(4.5, 9.0))
+                    field_small = np.float32(1.0) / (np.float32(1.0) + np.exp(-sharpness * (proj - offset)))
+                    field = cv2.resize(field_small, (w, h), interpolation=cv2.INTER_LINEAR)
+        else:
+            # Mode 3: smooth continuous depth/perspective/radial camera-roll blur field in [0, 1]
+            yy, xx = np.meshgrid(
+                np.linspace(0.0, 1.0, gh, dtype=np.float32),
+                np.linspace(0.0, 1.0, gw, dtype=np.float32),
+                indexing="ij",
+            )
+            theta = float(mrng.uniform(0.0, 2.0 * np.pi))
+            lin_ramp = 0.5 + 0.5 * (
+                np.float32(np.cos(theta)) * (xx * 2.0 - 1.0) + np.float32(np.sin(theta)) * (yy * 2.0 - 1.0)
+            )
+            cx = float(mrng.uniform(0.20, 0.80))
+            cy = float(mrng.uniform(0.20, 0.80))
+            rad_ramp = np.sqrt((xx - np.float32(cx)) ** 2 + (yy - np.float32(cy)) ** 2) * np.float32(1.35)
+            mix = float(mrng.uniform(0.30, 0.75))
+            raw_field = np.clip(mix * lin_ramp + (1.0 - mix) * rad_ramp, 0.0, 1.0)
+            if mrng.random() < 0.5:
+                raw_field = 1.0 - raw_field
+            f_min, f_max = float(raw_field.min()), float(raw_field.max())
+            if f_max - f_min > 1e-4:
+                raw_field = (raw_field - f_min) / (f_max - f_min)
+            field = cv2.resize(raw_field.astype(np.float32), (w, h), interpolation=cv2.INTER_LINEAR)
+
+        f_max = float(field.max())
+        if f_max > 1e-5:
+            field = field * np.float32(1.0 / f_max)
+        return np.clip(field, np.float32(0.0), np.float32(1.0))[:, :, None]
+
+    def _apply_motion_blur_field(
+        self, lin_rgb: np.ndarray, severity: float, params: DegradationParams
+    ) -> np.ndarray:
+        """Apply severe curved/tremor & spatially-varying (parallax, moving-object, 3-basis) motion blur."""
+        if severity <= 1e-4:
+            return lin_rgb
+        sev = float(np.clip(severity, 0.0, 1.0))
+        _, max_k = self.config.MOTION_BLUR_KERNEL_RANGE
+        length_px = sev * (float(max_k) - 1.0)
+        if length_px <= 0.05:
+            return lin_rgb
+
+        # Optional linear-light specular HDR boost so highlights streak naturally under heavy motion blur
+        hdr_s = float(params.motion_hdr_boost) * min(1.0, length_px / 14.0)
+        if hdr_s > 1e-4:
+            x_lin = np.clip(lin_rgb * np.float32(1.0 / 255.0), np.float32(0.0), np.float32(1.0))
+            work = lin_rgb * (np.float32(1.0) + np.float32(hdr_s * 2.5) * (x_lin * x_lin * x_lin * x_lin))
+        else:
+            work = lin_rgb
+
+        def _blur_with(l_px: float, ang_deg: float, bend_scale: float = 1.0) -> np.ndarray:
+            if l_px <= 0.15:
+                return work
+            return self._continuous_curved_motion_blur(
+                work,
+                length_px=l_px,
+                angle_deg=ang_deg,
+                curve_bend=params.motion_curve_bend * bend_scale,
+                dwell_end=params.motion_dwell_end,
+                shake_jitter=params.motion_shake_jitter * bend_scale,
+                pattern=params.motion_pattern,
+            )
+
+        mode = int(params.motion_spatial_mode) % 4
+        if mode == 0:
+            blurred = _blur_with(length_px, params.motion_angle, 1.0)
+        else:
+            h, w = lin_rgb.shape[:2]
+            if params._motion_mask_cache is None or params._motion_mask_cache.shape[:2] != (h, w):
+                params._motion_mask_cache = self._build_motion_spatial_field(
+                    h, w, mode=mode, seed=params.motion_field_seed, ref_lin_rgb=lin_rgb
+                )
+            m_field = params._motion_mask_cache
+
+            if mode == 1:
+                # Parallax: background heavily blurred (`length_px`), closer FG subject mild or sharp
+                bg_b = _blur_with(length_px, params.motion_angle, 1.0)
+                fg_b = _blur_with(length_px * float(params.motion_bg_ratio), params.motion_angle, 0.4)
+                blurred = m_field * fg_b + (np.float32(1.0) - m_field) * bg_b
+            elif mode == 2:
+                # Moving foreground subject: FG heavily blurred against near-static background
+                fg_b = _blur_with(length_px, params.motion_angle, 1.0)
+                bg_b = _blur_with(length_px * float(params.motion_bg_ratio), params.motion_angle, 0.3)
+                blurred = m_field * fg_b + (np.float32(1.0) - m_field) * bg_b
+            else:
+                # Mode 3: smooth 3-basis spatially-varying blur field (length & angle ramp smoothly)
+                d_ang = float(params.motion_angle_delta)
+                b0 = _blur_with(length_px * 0.12, params.motion_angle, 0.35)
+                b1 = _blur_with(length_px * 0.55, params.motion_angle + 0.5 * d_ang, 0.70)
+                b2 = _blur_with(length_px, params.motion_angle + d_ang, 1.0)
+                w0 = np.clip(np.float32(1.0) - np.float32(2.0) * m_field, np.float32(0.0), np.float32(1.0))
+                w2 = np.clip(np.float32(2.0) * m_field - np.float32(1.0), np.float32(0.0), np.float32(1.0))
+                w1 = np.float32(1.0) - w0 - w2
+                blurred = w0 * b0 + w1 * b1 + w2 * b2
+
+        if hdr_s > 1e-4:
+            xb = np.maximum(blurred * np.float32(1.0 / 255.0), np.float32(0.0))
+            mapped = xb / (np.float32(1.0) + np.float32(0.14) * np.maximum(xb - np.float32(0.85), np.float32(0.0)))
+            return np.clip(mapped * np.float32(255.0), np.float32(0.0), np.float32(255.0))
+        return np.clip(blurred, np.float32(0.0), np.float32(255.0))
 
     @classmethod
     def render_custom_motion_blur(
@@ -709,17 +888,7 @@ class SelectiveDegradationPipeline:
             if s_ca > 1e-4:
                 lin = self._apply_radial_chromatic_aberration(lin, s_ca, params)
             if s_mot > 1e-4:
-                _, max_k = self.config.MOTION_BLUR_KERNEL_RANGE
-                length_px = float(np.clip(s_mot, 0.0, 1.0)) * (float(max_k) - 1.0)
-                lin = self._continuous_curved_motion_blur(
-                    lin,
-                    length_px,
-                    params.motion_angle,
-                    curve_bend=params.motion_curve_bend,
-                    dwell_end=params.motion_dwell_end,
-                    shake_jitter=params.motion_shake_jitter,
-                    pattern=params.motion_pattern,
-                )
+                lin = self._apply_motion_blur_field(lin, s_mot, params)
             if s_flr > 1e-4:
                 lin = self._apply_lens_flare(lin, s_flr, params)
             cur = np.sqrt(np.clip(lin * inv255, np.float32(0.0), np.float32(1.0))) * np.float32(255.0)
@@ -1261,11 +1430,12 @@ class ControllableRestorationDataset(_TorchDataset):
         h, w = sharp_rgb.shape[:2]
         if h >= ps and w >= ps:
             if self.is_train:
-                # Multi-scale window (`256..470 -> 256`) bridges 1280x720 GoPro blur across all real photo scales,
-                # and 4-candidate Active Blur Gate rejects flat sky/road crops where `blur == sharp`!
+                # Keep real paired crops mostly native 1:1 (`PAIRED_NATIVE_CROP_PROB=0.85`) so severe blur
+                # is NOT shrunk down by aggressive downsampling; 4-candidate Active Blur Gate rejects flat sky crops!
                 min_hw = min(h, w)
-                if min_hw >= int(ps * 1.45) and random.random() < 0.45:
-                    win = random.randint(int(ps * 1.15), min(min_hw, int(ps * 1.85)))
+                native_prob = float(np.clip(getattr(self.config, "PAIRED_NATIVE_CROP_PROB", 0.85), 0.0, 1.0))
+                if min_hw >= int(ps * 1.25) and random.random() >= native_prob:
+                    win = random.randint(int(ps * 1.10), min(min_hw, int(ps * 1.45)))
                 else:
                     win = ps
 

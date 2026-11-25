@@ -312,8 +312,10 @@ class SkipConnectedVAE(nn.Module):
         h = grad_checkpoint(dec.mid_block, h, use_reentrant=False) if use_ckpt else dec.mid_block(h)
 
         detail_env = min(1.0, max(0.0, float(detail_scale)))
-        blur_fine_fade = (0.0, 0.25, 0.55)
-        nonblur_fine_fade = (0.0, 0.05, 0.15)
+        # Keep non-blur encoder skips 100% intact (eliminates generative drift on `denoise`/tone!),
+        # while fading blurry input skips proportionally to active blur sliders (and stronger when `detail_scale > 0`).
+        blur_base_fade = (0.0, 0.20, 0.45)
+        blur_detail_fade = (0.0, 0.25, 0.40)
         skip_indices = [2, 1, 0]
         for idx, up_block in enumerate(dec.up_blocks):
             if idx < 3 and len(enc_skips) > skip_indices[idx]:
@@ -322,29 +324,17 @@ class SkipConnectedVAE(nn.Module):
                 if release_skips and not use_ckpt:
                     enc_skips[s_idx] = None
                 if enc_skip is not None:
-                    if (
-                        detail_env > 1e-4
-                        and (blur_fine_fade[idx] > 0.0 or nonblur_fine_fade[idx] > 0.0)
-                        and self.struct_action_indices.numel() > 0
-                    ):
+                    level_fade = blur_base_fade[idx] + blur_detail_fade[idx] * detail_env
+                    if level_fade > 1e-4 and self.blur_action_indices.numel() > 0:
                         thw = h.shape[-2:]
                         a_loc = (
                             F.interpolate(action_map.float(), size=thw, mode="area")
                             if action_map.shape[-2:] != thw
                             else action_map.float()
                         )
-                        si = self.struct_action_indices.to(a_loc.device)
-                        struct_act = a_loc.index_select(1, si).abs().amax(dim=1, keepdim=True).clamp(0.0, 1.0)
-                        if self.blur_action_indices.numel() > 0:
-                            bi = self.blur_action_indices.to(a_loc.device)
-                            blur_act = a_loc.index_select(1, bi).abs().amax(dim=1, keepdim=True).clamp(0.0, 1.0)
-                        else:
-                            blur_act = torch.zeros_like(struct_act)
-                        fade_amt = torch.maximum(
-                            nonblur_fine_fade[idx] * struct_act,
-                            blur_fine_fade[idx] * blur_act,
-                        )
-                        eff_keep = keep_mask * (1.0 - fade_amt * detail_env).clamp(0.0, 1.0)
+                        bi = self.blur_action_indices.to(a_loc.device)
+                        blur_act = a_loc.index_select(1, bi).abs().amax(dim=1, keepdim=True).clamp(0.0, 1.0)
+                        eff_keep = keep_mask * (1.0 - level_fade * blur_act).clamp(0.0, 1.0)
                     else:
                         eff_keep = keep_mask
 

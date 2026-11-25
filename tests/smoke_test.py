@@ -57,14 +57,17 @@ def test_selective_pipeline():
     assert cfg.SEMANTIC_ENCODER_TYPE == "dinov2_reg", "Default vision encoder must be dinov2_reg!"
     assert cfg.GENERATOR_BACKBONE == "sd-2.1-base", "Default backbone must be sd-2.1-base!"
     assert cfg.GENERATOR_REPO_MAP["sd-2.1-base"] == "sd2-community/stable-diffusion-2-1-base"
-    assert tuple(cfg.RESTORATION_TIMESTEPS) == (299, 99)
-    assert len(cfg.LORA_EXPERT_SPECS) == 4 and cfg.UNET_LORA_RANK == 20
+    assert tuple(cfg.RESTORATION_TIMESTEPS) == (175,)
+    assert cfg.LORA_EXPERT_SPECS == [] and cfg.UNET_LORA_RANK == 16 and cfg.UNET_CONV_LORA_RANK == 8
+    assert cfg.SEM_DETAIL_LORA_RANK == 8 and cfg.SEM_DETAIL_CONV_LORA_RANK == 4
+    assert "denoise" not in cfg.DETAIL_ACTION_TYPES and "deblur_motion" in cfg.DETAIL_ACTION_TYPES
+    assert cfg.MOTION_BLUR_KERNEL_RANGE == (8, 51)
     assert cfg.MAX_COMPOUND_DEGRADATIONS == 4
     assert cfg.SKIP_DROPOUT_PROB > 0.0
-    assert cfg.LOSS_CSD_WEIGHT > 0.0
+    assert cfg.LOSS_CSD_WEIGHT > 0.0 and cfg.LOSS_FREQ_EDGE_WEIGHT > 0.0 and cfg.CSD_EVERY_N_STEPS >= 1
 
     pil_cfg = PilotConfig()
-    assert pil_cfg.EPOCHS == 12 and pil_cfg.PIXEL_STAGE_EPOCHS == 9
+    assert pil_cfg.EPOCHS == 12 and pil_cfg.PIXEL_STAGE_EPOCHS == 8
     assert pil_cfg.MAX_STEPS_PER_EPOCH == 950 and pil_cfg.MIN_STEPS_PER_EPOCH == 950
 
     dbg_cfg = DebugConfig()
@@ -144,6 +147,9 @@ def test_selective_pipeline():
         for mode_id in (0, 1, 2, 3, 4):
             params.focus_mode = mode_id % 3
             params.motion_pattern = mode_id % 3
+            params.motion_spatial_mode = mode_id % 4
+            params.motion_hdr_boost = 0.35 if (mode_id % 2 == 0) else 0.0
+            params._motion_mask_cache = None
             params.artifact_mode = mode_id % 4
             params.flare_style = mode_id
             params._flare_cache = None
@@ -358,13 +364,13 @@ def test_model_and_stages_mock():
 
     groups = model.get_stage_parameter_groups()
 
-    # Stage 1: Pixel Stage (2-Step Refinement + Shared Base + Slider-Routed Specialists)
+    # Stage 1: Pixel Stage (1-Step Lean Shared LoRA)
     act_zero_motion = act_map.clone()
     act_zero_motion[:, 2, :, :] = 0.0
     model.zero_grad(set_to_none=True)
     model.set_training_stage("pixel_stage")
     out_s1 = model(src, act_zero_motion, tgt_01=tgt, fidelity_scale=1.0, detail_scale=0.0)
-    assert "hat_z_1" in out_s1 and out_s1["hat_z_1"] is not out_s1["hat_z_0"]
+    assert "hat_z_1" in out_s1 and out_s1["hat_z_1"] is out_s1["hat_z_0"]
     loss_s1, metrics_s1 = loss_fn(
         out_s1["pred"],
         tgt,
@@ -376,7 +382,7 @@ def test_model_and_stages_mock():
         z_tgt=out_s1["z_tgt"],
         restorer_model=model,
     )
-    assert metrics_s1["l1"] > 0.0 and metrics_s1["lat"] > 0.0 and metrics_s1["csd"] == 0.0
+    assert metrics_s1["l1"] > 0.0 and metrics_s1["lat"] > 0.0 and metrics_s1["csd"] == 0.0 and metrics_s1["freq"] == 0.0
     _backward_on_worker_thread(loss_s1)
     model.clear_runtime_contexts()
     missing_pix_grads = [
@@ -384,16 +390,26 @@ def test_model_and_stages_mock():
         if any(p is gp for gp in groups["pixel_stage"]) and p.grad is None
     ]
     assert not missing_pix_grads, f"Unused pixel_stage params (breaks DDP!): {missing_pix_grads}"
-    # Verify inactive specialist expert receives exact 0.0 gradient while shared_branch stays active!
-    for name, param in model.named_parameters():
-        if "pix_experts.motion_deconv" in name:
-            assert float(param.grad.abs().max().item()) == 0.0, f"Inactive expert {name} leaked gradient!"
     assert all(p.grad is None for p in groups["semantic_stage"])
 
-    # Stage 2: Semantic-Detail Stage with Subpixel Anchor + Zero-Drift Target-Anchored CSD
+    # Stage 2: Semantic-Detail Stage (VGG/DISTS + Multi-Scale Freq/Edge + Sparse Zero-Drift CSD)
     model.zero_grad(set_to_none=True)
     model.set_training_stage("semantic_stage")
     out_s2 = model(src, act_map, tgt_01=tgt, fidelity_scale=1.0, detail_scale=0.8)
+    loss_s2_nocsd, metrics_s2_nocsd = loss_fn(
+        out_s2["pred"],
+        tgt,
+        act_map,
+        stage="semantic_stage",
+        src_01=src,
+        hat_z_0=out_s2["hat_z_0"],
+        hat_z_1=out_s2["hat_z_1"],
+        z_tgt=out_s2["z_tgt"],
+        restorer_model=model,
+        run_csd=False,
+    )
+    assert metrics_s2_nocsd["csd"] == 0.0 and metrics_s2_nocsd["freq"] > 0.0
+
     loss_s2, metrics_s2 = loss_fn(
         out_s2["pred"],
         tgt,
@@ -404,8 +420,9 @@ def test_model_and_stages_mock():
         hat_z_1=out_s2["hat_z_1"],
         z_tgt=out_s2["z_tgt"],
         restorer_model=model,
+        run_csd=True,
     )
-    assert metrics_s2["csd"] >= 0.0
+    assert metrics_s2["csd"] >= 0.0 and metrics_s2["freq"] > 0.0
     _backward_on_worker_thread(loss_s2)
     model.clear_runtime_contexts()
     missing_sem_grads = [
@@ -414,6 +431,42 @@ def test_model_and_stages_mock():
     ]
     assert not missing_sem_grads, f"Unused semantic_stage params (breaks DDP!): {missing_sem_grads}"
     assert all(p.grad is None for p in groups["pixel_stage"])
+
+    # Verify `sem_branch` zero-leakage on pure `denoise` (detail_scale=1.0 must NOT affect pure denoising!)
+    act_denoise_only = torch.zeros_like(act_map)
+    act_denoise_only[:, 0, :, :] = 1.0  # denoise only
+    model.zero_grad(set_to_none=True)
+    model.set_training_stage("semantic_stage")
+    out_dn = model(src, act_denoise_only, tgt_01=tgt, fidelity_scale=1.0, detail_scale=1.0)
+    loss_dn, _ = loss_fn(
+        out_dn["pred"],
+        tgt,
+        act_denoise_only,
+        stage="semantic_stage",
+        src_01=src,
+        hat_z_0=out_dn["hat_z_0"],
+        z_tgt=out_dn["z_tgt"],
+        restorer_model=model,
+        run_csd=True,
+    )
+    _backward_on_worker_thread(loss_dn)
+    model.clear_runtime_contexts()
+    for n, p in model.named_parameters():
+        if any(p is gp for gp in groups["semantic_stage"]):
+            assert p.grad is not None, f"DDP requires zero grad tensor (not None) on {n}!"
+            assert float(p.grad.abs().max().item()) == 0.0, f"sem_branch leaked gradient on pure denoise ({n})!"
+
+    # Inference check: even with non-zero sem_branch weights, pure denoise output is identical at detail=0 vs detail=1
+    model.eval()
+    with torch.no_grad():
+        for p in groups["semantic_stage"]:
+            p.fill_(0.05)
+        dn_d0 = model.sample(src[:1], act_denoise_only[:1], steps=1, fidelity_scale=1.0, detail_scale=0.0)
+        dn_d1 = model.sample(src[:1], act_denoise_only[:1], steps=1, fidelity_scale=1.0, detail_scale=1.0)
+        assert torch.allclose(dn_d0, dn_d1, atol=1e-6), "Pure denoise must be 100% invariant to detail_scale!"
+        for p in groups["semantic_stage"]:
+            p.zero_()
+    model.train()
 
     # Exact Zero-Drift CSD check: when hat_z_0 == z_tgt, CSD loss must be 0.0!
     z_exact = torch.randn(2, 4, 8, 8)

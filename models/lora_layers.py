@@ -359,16 +359,17 @@ class _LoRABranch(nn.Module):
 
 
 class DualLoRALinear(nn.Module):
-    """Frozen nn.Linear wrapped with Shared Base LoRA + Slider-Routed Specialists + Semantic LoRA."""
+    """Frozen nn.Linear wrapped with Shared Base LoRA + optional Specialists + Task-Routed Semantic LoRA."""
 
     def __init__(
         self,
         base_linear: nn.Linear,
-        rank: int = 20,
-        alpha: float = 20.0,
+        rank: int = 16,
+        alpha: float = 16.0,
         expert_specs: Optional[Sequence[Dict]] = None,
         sem_rank: int = 0,
         sem_alpha: float = 0.0,
+        sem_indices: Optional[Sequence[int]] = None,
     ):
         super().__init__()
         self.base = base_linear
@@ -389,6 +390,7 @@ class DualLoRALinear(nn.Module):
                 in_f, out_f, rank=erank, alpha=float(erank), is_conv=False, device=device
             )
 
+        self.sem_indices: Tuple[int, ...] = tuple(int(i) for i in sem_indices) if sem_indices else ()
         if int(sem_rank) > 0:
             self.sem_branch: Optional[_LoRABranch] = _LoRABranch(
                 in_f, out_f, rank=int(sem_rank), alpha=float(sem_alpha), is_conv=False, device=device
@@ -424,6 +426,7 @@ class DualLoRALinear(nn.Module):
         if abs(lam_pix) < 1e-6 and abs(lam_sem) < 1e-6:
             return out
 
+        skip_zero_branches = not (self.training and torch.is_grad_enabled())
         delta = None
         if abs(lam_pix) >= 1e-6:
             pix_sum = self.shared_branch(x)
@@ -431,26 +434,38 @@ class DualLoRALinear(nn.Module):
                 route_w = _compute_linear_expert_route(
                     spatial_map, self.expert_indices[ename], tuple(x.shape), x.device
                 )
+                if skip_zero_branches and float(route_w.max().item()) < 1e-6:
+                    continue
                 pix_sum = pix_sum + expert(x) * route_w.to(pix_sum.dtype)
             delta = float(lam_pix) * pix_sum
 
         if self.sem_branch is not None and abs(lam_sem) >= 1e-6:
-            sem_d = float(lam_sem) * self.sem_branch(x)
-            delta = sem_d if delta is None else (delta + sem_d)
+            if self.sem_indices and spatial_map is not None:
+                sem_route = _compute_linear_expert_route(
+                    spatial_map, self.sem_indices, tuple(x.shape), x.device
+                )
+                if not (skip_zero_branches and float(sem_route.max().item()) < 1e-6):
+                    sem_out = self.sem_branch(x)
+                    sem_d = float(lam_sem) * sem_out * sem_route.to(sem_out.dtype)
+                    delta = sem_d if delta is None else (delta + sem_d)
+            else:
+                sem_d = float(lam_sem) * self.sem_branch(x)
+                delta = sem_d if delta is None else (delta + sem_d)
         return out if delta is None else (out + delta.to(out.dtype))
 
 
 class DualLoRAConv2d(nn.Module):
-    """Frozen nn.Conv2d wrapped with Shared Base LoRA + Slider-Routed Specialists + Semantic LoRA."""
+    """Frozen nn.Conv2d wrapped with Shared Base LoRA + optional Specialists + Task-Routed Semantic LoRA."""
 
     def __init__(
         self,
         base_conv: nn.Conv2d,
-        rank: int = 20,
-        alpha: float = 20.0,
+        rank: int = 8,
+        alpha: float = 8.0,
         expert_specs: Optional[Sequence[Dict]] = None,
         sem_rank: int = 0,
         sem_alpha: float = 0.0,
+        sem_indices: Optional[Sequence[int]] = None,
     ):
         super().__init__()
         self.base = base_conv
@@ -484,6 +499,7 @@ class DualLoRAConv2d(nn.Module):
                 **conv_kwargs,
             )
 
+        self.sem_indices: Tuple[int, ...] = tuple(int(i) for i in sem_indices) if sem_indices else ()
         if int(sem_rank) > 0:
             self.sem_branch: Optional[_LoRABranch] = _LoRABranch(
                 base_conv.in_channels,
@@ -523,6 +539,7 @@ class DualLoRAConv2d(nn.Module):
         if abs(lam_pix) < 1e-6 and abs(lam_sem) < 1e-6:
             return out
 
+        skip_zero_branches = not (self.training and torch.is_grad_enabled())
         target_hw = (out.shape[-2], out.shape[-1])
         bsz = out.shape[0]
         delta = None
@@ -532,6 +549,8 @@ class DualLoRAConv2d(nn.Module):
                 route_2d = _compute_conv_expert_route(
                     spatial_map, self.expert_indices[ename], target_hw, bsz, out.device
                 )
+                if skip_zero_branches and float(route_2d.max().item()) < 1e-6:
+                    continue
                 exp_out = expert(x)
                 if exp_out.shape[-2:] != target_hw:
                     exp_out = F.interpolate(exp_out, size=target_hw, mode="bilinear", align_corners=False)
@@ -539,8 +558,19 @@ class DualLoRAConv2d(nn.Module):
             delta = float(lam_pix) * pix_sum
 
         if self.sem_branch is not None and abs(lam_sem) >= 1e-6:
-            sem_d = float(lam_sem) * self.sem_branch(x)
-            delta = sem_d if delta is None else (delta + sem_d)
+            if self.sem_indices and spatial_map is not None:
+                sem_route = _compute_conv_expert_route(
+                    spatial_map, self.sem_indices, target_hw, bsz, out.device
+                )
+                if not (skip_zero_branches and float(sem_route.max().item()) < 1e-6):
+                    sem_out = self.sem_branch(x)
+                    if sem_out.shape[-2:] != target_hw:
+                        sem_out = F.interpolate(sem_out, size=target_hw, mode="bilinear", align_corners=False)
+                    sem_d = float(lam_sem) * sem_out * sem_route.to(sem_out.dtype)
+                    delta = sem_d if delta is None else (delta + sem_d)
+            else:
+                sem_d = float(lam_sem) * self.sem_branch(x)
+                delta = sem_d if delta is None else (delta + sem_d)
         return out if delta is None else (out + delta.to(out.dtype))
 
 
@@ -554,11 +584,16 @@ def _set_submodule(root: nn.Module, dotted_name: str, new_module: nn.Module):
 
 def inject_generator_dual_lora(
     model: nn.Module,
-    rank: int = 20,
-    alpha: float = 20.0,
+    rank: int = 16,
+    alpha: float = 16.0,
+    conv_rank: Optional[int] = None,
+    conv_alpha: Optional[float] = None,
     expert_specs: Optional[Sequence[Dict]] = None,
     sem_rank: int = 0,
     sem_alpha: float = 0.0,
+    sem_conv_rank: Optional[int] = None,
+    sem_conv_alpha: Optional[float] = None,
+    sem_indices: Optional[Sequence[int]] = None,
     include_conv: bool = True,
     linear_keywords: Iterable[str] = ("to_q", "to_k", "to_v", "to_out", "proj_in", "proj_out", "ff.net"),
     conv_keywords: Iterable[str] = (
@@ -575,11 +610,18 @@ def inject_generator_dual_lora(
 ) -> Tuple[List[nn.Parameter], List[nn.Parameter]]:
     """Freeze `model` and inject DualLoRALinear / DualLoRAConv2d layers.
 
+    Supports decoupled linear vs. conv ranks and task-routed `sem_branch` gating.
+
     Returns:
         (pix_lora_params, sem_lora_params) for decoupled 2-stage optimization.
     """
     for p in model.parameters():
         p.requires_grad = False
+
+    c_rank = int(rank) if conv_rank is None else int(conv_rank)
+    c_alpha = float(alpha) if conv_alpha is None else float(conv_alpha)
+    sc_rank = int(sem_rank) if sem_conv_rank is None else int(sem_conv_rank)
+    sc_alpha = float(sem_alpha) if sem_conv_alpha is None else float(sem_conv_alpha)
 
     linear_targets = []
     conv_targets = []
@@ -605,6 +647,7 @@ def inject_generator_dual_lora(
             expert_specs=expert_specs,
             sem_rank=sem_rank,
             sem_alpha=sem_alpha,
+            sem_indices=sem_indices,
         )
         _set_submodule(model, name, wrapped)
         pix_params.extend(wrapped.pixel_parameters())
@@ -613,11 +656,12 @@ def inject_generator_dual_lora(
     for name, mod in conv_targets:
         wrapped = DualLoRAConv2d(
             mod,
-            rank=rank,
-            alpha=alpha,
+            rank=c_rank,
+            alpha=c_alpha,
             expert_specs=expert_specs,
-            sem_rank=sem_rank,
-            sem_alpha=sem_alpha,
+            sem_rank=sc_rank,
+            sem_alpha=sc_alpha,
+            sem_indices=sem_indices,
         )
         _set_submodule(model, name, wrapped)
         pix_params.extend(wrapped.pixel_parameters())

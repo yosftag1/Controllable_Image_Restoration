@@ -531,19 +531,34 @@ def save_checkpoint(
         "optimizer_state_dict": optimizer.state_dict() if optimizer is not None else None,
         "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
         "model_config": {
-            "MODEL_VERSION": getattr(config, "MODEL_VERSION", "v5_2step_moe"),
+            "MODEL_VERSION": getattr(config, "MODEL_VERSION", "v6_1step_lean"),
             "DEGRADATION_TYPES": list(config.DEGRADATION_TYPES),
             "SIGNED_ACTION_TYPES": list(getattr(config, "SIGNED_ACTION_TYPES", ["exposure", "warmth"])),
+            "DETAIL_ACTION_TYPES": list(
+                getattr(
+                    config,
+                    "DETAIL_ACTION_TYPES",
+                    ["deblur_motion", "sharpen_focus", "deartifact", "deflare", "dereflection"],
+                )
+            ),
             "LORA_EXPERT_SPECS": [dict(sp) for sp in getattr(config, "LORA_EXPERT_SPECS", [])],
             "SEMANTIC_ENCODER_TYPE": config.SEMANTIC_ENCODER_TYPE,
             "DINOV2_REG_MODEL_ID": getattr(config, "DINOV2_REG_MODEL_ID", "facebook/dinov2-with-registers-base"),
             "GENERATOR_BACKBONE": config.GENERATOR_BACKBONE,
-            "RESTORATION_TIMESTEPS": list(getattr(config, "RESTORATION_TIMESTEPS", (299, 99))),
+            "RESTORATION_TIMESTEPS": list(getattr(config, "RESTORATION_TIMESTEPS", (175,))),
             "PROMPT_SEQ_LEN": getattr(config, "PROMPT_SEQ_LEN", 77),
             "UNET_LORA_RANK": config.UNET_LORA_RANK,
             "UNET_LORA_ALPHA": config.UNET_LORA_ALPHA,
-            "SEM_DETAIL_LORA_RANK": getattr(config, "SEM_DETAIL_LORA_RANK", 16),
-            "SEM_DETAIL_LORA_ALPHA": getattr(config, "SEM_DETAIL_LORA_ALPHA", 16.0),
+            "UNET_CONV_LORA_RANK": getattr(config, "UNET_CONV_LORA_RANK", config.UNET_LORA_RANK),
+            "UNET_CONV_LORA_ALPHA": getattr(config, "UNET_CONV_LORA_ALPHA", config.UNET_LORA_ALPHA),
+            "SEM_DETAIL_LORA_RANK": getattr(config, "SEM_DETAIL_LORA_RANK", 8),
+            "SEM_DETAIL_LORA_ALPHA": getattr(config, "SEM_DETAIL_LORA_ALPHA", 8.0),
+            "SEM_DETAIL_CONV_LORA_RANK": getattr(
+                config, "SEM_DETAIL_CONV_LORA_RANK", getattr(config, "SEM_DETAIL_LORA_RANK", 8)
+            ),
+            "SEM_DETAIL_CONV_LORA_ALPHA": getattr(
+                config, "SEM_DETAIL_CONV_LORA_ALPHA", getattr(config, "SEM_DETAIL_LORA_ALPHA", 8.0)
+            ),
             "VAE_ENC_LORA_RANK": config.VAE_ENC_LORA_RANK,
             "VAE_ENC_LORA_ALPHA": getattr(config, "VAE_ENC_LORA_ALPHA", float(config.VAE_ENC_LORA_RANK)),
             "ACTION_HIDDEN_DIM": config.ACTION_HIDDEN_DIM,
@@ -826,14 +841,17 @@ def train(
         if is_main:
             mode_tag = f"DDP ({world_size} GPUs)" if is_ddp else f"{device} (GPUs: {num_gpus})"
             gckpt_tag = "ON" if getattr(config, "GRADIENT_CHECKPOINTING", True) else "OFF"
-            t_tag = f"2step_t={list(getattr(config, 'RESTORATION_TIMESTEPS', (299, 99)))}"
+            t_steps = list(getattr(config, "RESTORATION_TIMESTEPS", (175,)))
+            t_tag = f"{len(t_steps)}step_t={t_steps}"
             exp_names = [sp.get("name", "?") for sp in getattr(config, "LORA_EXPERT_SPECS", [])]
+            exp_tag = str(exp_names) if exp_names else f"SharedLean(lin={config.UNET_LORA_RANK},conv={getattr(config, 'UNET_CONV_LORA_RANK', config.UNET_LORA_RANK)})"
+            csd_every = max(1, int(getattr(config, "CSD_EVERY_N_STEPS", 4)))
             print(
                 f"Device: {mode_tag} | Global Batch Size: {config.BATCH_SIZE} "
                 f"({max(1, config.BATCH_SIZE // max(1, world_size))}/GPU) | "
-                f"Backbone: {config.GENERATOR_BACKBONE} ({t_tag}) | Experts: {exp_names} | "
+                f"Backbone: {config.GENERATOR_BACKBONE} ({t_tag}) | LoRA: {exp_tag} | "
                 f"Vision: {config.SEMANTIC_ENCODER_TYPE} | Controls: {config.NUM_ACTIONS} | "
-                f"CSD_w: {getattr(config, 'LOSS_CSD_WEIGHT', 0.0)} | "
+                f"CSD_w: {getattr(config, 'LOSS_CSD_WEIGHT', 0.0)} (1/{csd_every}) | "
                 f"AMP: {'ENABLED' if use_amp else 'DISABLED'} | GradCkpt: {gckpt_tag}",
                 flush=True,
             )
@@ -1117,6 +1135,7 @@ def train(
                 else train_loader
             )
 
+            csd_every = max(1, int(getattr(config, "CSD_EVERY_N_STEPS", 4)))
             for step_idx, batch in enumerate(pbar, start=1):
                 src = batch["source"].to(device, non_blocking=True)
                 tgt = batch["target"].to(device, non_blocking=True)
@@ -1126,6 +1145,7 @@ def train(
 
                 try:
                     d_scale = 0.0 if stage == "pixel_stage" else float(random.uniform(0.35, 1.0))
+                    do_csd = (stage in ("semantic_stage", "joint")) and (step_idx == 1 or (step_idx % csd_every == 0))
 
                     with torch.amp.autocast("cuda", enabled=use_amp):
                         out = model(
@@ -1145,6 +1165,7 @@ def train(
                             hat_z_1=out.get("hat_z_1"),
                             z_tgt=out.get("z_tgt"),
                             restorer_model=raw_model,
+                            run_csd=do_csd,
                         )
 
                     if scaler is not None and use_amp:
@@ -1190,10 +1211,11 @@ def train(
                                 f"perc={avg_perc:.4f} pres={avg_pres:.4f}"
                             )
                         else:
+                            avg_freq = running.get("freq", 0.0) / step_idx
                             avg_csd = running.get("csd", 0.0) / step_idx
                             loss_parts = (
                                 f"loss={avg_tot:.4f} l1={avg_l1:.4f} lat={avg_lat:.4f} "
-                                f"perc={avg_perc:.4f} csd={avg_csd:.4f}"
+                                f"perc={avg_perc:.4f} freq={avg_freq:.4f} csd={avg_csd:.4f}"
                             )
                         print(
                             f"[Epoch {epoch:03d}/{config.EPOCHS} | {stage}] "

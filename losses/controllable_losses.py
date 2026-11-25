@@ -1,17 +1,18 @@
-"""Clean 4-Term Loss Objective for 2-Stage Controllable Restoration.
+"""Clean 5-Term Loss Objective for 2-Stage Controllable Restoration.
 
 Stage 1 (`pixel_stage`):
   - Charbonnier L1 (`LOSS_L1_WEIGHT`)
-  - 2-Step Latent Charbonnier (`0.35 * hat_z_1 + 0.65 * hat_z_0`) (`LOSS_LATENT_WEIGHT`)
+  - Latent Charbonnier (`LOSS_LATENT_WEIGHT`, supports 1-step & 2-step)
   - Light VGG LPIPS (`LOSS_PIXEL_STAGE_PERCEPTUAL_WEIGHT`)
   - Idle-only preservation (`LOSS_PRESERVE_WEIGHT`)
 
 Stage 2 (`semantic_stage`):
-  - 4x Low-Pass Charbonnier L1 (`LOSS_SEMANTIC_STAGE_LP_L1_WEIGHT`) + gentle Full-Res Subpixel Anchor
-    (`LOSS_SEMANTIC_STAGE_FULL_L1_WEIGHT`) to prevent 1-2px fine-detail jitter
+  - 4x Low-Pass Charbonnier L1 (`LOSS_SEMANTIC_STAGE_LP_L1_WEIGHT`) + light Full-Res Subpixel Anchor
+    (`LOSS_SEMANTIC_STAGE_FULL_L1_WEIGHT`) to prevent geometric jitter without suppressing micro-texture
   - 2x Low-Pass Latent Charbonnier (`LOSS_SEMANTIC_STAGE_LATENT_LP_WEIGHT`)
   - Full-res VGG LPIPS + DISTS Local Patch Texture (`LOSS_PERCEPTUAL_WEIGHT`)
-  - Zero-Drift Target-Anchored CSD (`LOSS_CSD_WEIGHT`)
+  - Multi-Scale Sobel Edge + High-Frequency FFT Magnitude (`LOSS_FREQ_EDGE_WEIGHT`)
+  - Sparse Zero-Drift Target-Anchored CSD (`LOSS_CSD_WEIGHT`, every `CSD_EVERY_N_STEPS` steps)
   - Idle-only preservation (`LOSS_PRESERVE_WEIGHT`)
 """
 
@@ -149,8 +150,82 @@ class MultiLayerVGGPerceptual(nn.Module):
         return total_pos
 
 
+class MultiScaleFreqEdgeLoss(nn.Module):
+    """Multi-scale Sobel edge sharpness + phase-invariant high-frequency FFT log-magnitude loss."""
+
+    def __init__(self):
+        super().__init__()
+        kx = torch.tensor([[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]], dtype=torch.float32) / 4.0
+        ky = kx.t().contiguous()
+        self.register_buffer("sobel_x", kx.view(1, 1, 3, 3), persistent=False)
+        self.register_buffer("sobel_y", ky.view(1, 1, 3, 3), persistent=False)
+        self.register_buffer("luma_w", torch.tensor([0.299, 0.587, 0.114], dtype=torch.float32).view(1, 3, 1, 1), persistent=False)
+
+    def _to_luma(self, rgb_01: torch.Tensor) -> torch.Tensor:
+        return (rgb_01.float() * self.luma_w).sum(dim=1, keepdim=True)
+
+    def _sobel_xy(self, luma: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        pad = F.pad(luma, (1, 1, 1, 1), mode="reflect")
+        return F.conv2d(pad, self.sobel_x), F.conv2d(pad, self.sobel_y)
+
+    def forward(
+        self,
+        pred_01: torch.Tensor,
+        target_01: torch.Tensor,
+        spatial_weight: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        with torch.amp.autocast(device_type=pred_01.device.type, enabled=False):
+            p_y = self._to_luma(pred_01)
+            t_y = self._to_luma(target_01.detach())
+
+            # 1. Multi-scale Sobel gradient matching (1x + 2x) for crisp, ringing-free edges
+            edge_loss = pred_01.new_zeros((), dtype=torch.float32)
+            scales = [(p_y, t_y, 0.65)]
+            if p_y.shape[-2] >= 16 and p_y.shape[-1] >= 16:
+                scales.append(
+                    (
+                        F.avg_pool2d(p_y, kernel_size=2, stride=2),
+                        F.avg_pool2d(t_y, kernel_size=2, stride=2),
+                        0.35,
+                    )
+                )
+            for py_s, ty_s, sw_s in scales:
+                pgx, pgy = self._sobel_xy(py_s)
+                tgx, tgy = self._sobel_xy(ty_s)
+                err = (pgx - tgx).abs() + (pgy - tgy).abs()
+                if spatial_weight is not None:
+                    w_s = F.adaptive_avg_pool2d(spatial_weight.float(), output_size=err.shape[-2:])
+                    w_s = w_s / w_s.mean(dim=(2, 3), keepdim=True).clamp(min=1e-4)
+                    edge_loss = edge_loss + sw_s * (err * w_s).mean()
+                else:
+                    edge_loss = edge_loss + sw_s * err.mean()
+
+            # 2. High-frequency weighted FFT log-amplitude loss (phase-invariant micro-texture energy)
+            if spatial_weight is not None:
+                w_fft = F.adaptive_avg_pool2d(spatial_weight.float(), output_size=p_y.shape[-2:])
+                w_fft = w_fft / w_fft.mean(dim=(2, 3), keepdim=True).clamp(min=1e-4)
+                p_in = p_y * w_fft
+                t_in = t_y * w_fft
+            else:
+                p_in, t_in = p_y, t_y
+
+            fp = torch.fft.rfft2(p_in, norm="ortho")
+            ft = torch.fft.rfft2(t_in, norm="ortho")
+            mag_p = torch.log1p(torch.sqrt(fp.real * fp.real + fp.imag * fp.imag + 1e-8))
+            mag_t = torch.log1p(torch.sqrt(ft.real * ft.real + ft.imag * ft.imag + 1e-8))
+
+            fh, fw = mag_p.shape[-2], mag_p.shape[-1]
+            fy = torch.fft.fftfreq(p_y.shape[-2], device=pred_01.device, dtype=torch.float32).abs() * 2.0
+            fx = torch.fft.rfftfreq(p_y.shape[-1], device=pred_01.device, dtype=torch.float32).abs() * 2.0
+            rad = torch.sqrt(fy[:, None] ** 2 + fx[None, :] ** 2).clamp(0.0, 1.0)
+            freq_w = (0.25 + 0.75 * rad).view(1, 1, fh, fw)
+            fft_loss = ((mag_p - mag_t).abs() * freq_w).mean()
+
+            return 0.55 * edge_loss + 0.45 * fft_loss
+
+
 class ControllableRestorationLoss(nn.Module):
-    """Clean 4-term controllable restoration objective (Charbonnier, 2-Step Latent, VGG/DISTS, Idle + CSD)."""
+    """Clean 5-term controllable restoration objective (Charbonnier, Latent, VGG/DISTS, Freq/Edge, Idle + Sparse CSD)."""
 
     def __init__(self, config, use_pretrained_vgg: bool = True):
         super().__init__()
@@ -161,6 +236,7 @@ class ControllableRestorationLoss(nn.Module):
             layers=getattr(config, "PERCEPTUAL_LAYERS", ["relu1_2", "relu2_2", "relu3_4", "relu4_4"]),
             use_pretrained=use_vgg,
         )
+        self.freq_edge = MultiScaleFreqEdgeLoss()
 
         b1d = torch.tensor([1.0, 4.0, 6.0, 4.0, 1.0], dtype=torch.float32) / 16.0
         b2d = (b1d[:, None] * b1d[None, :]).view(1, 1, 5, 5).repeat(3, 1, 1, 1)
@@ -230,6 +306,7 @@ class ControllableRestorationLoss(nn.Module):
         hat_z_1: Optional[torch.Tensor] = None,
         z_tgt: Optional[torch.Tensor] = None,
         restorer_model: Optional[nn.Module] = None,
+        run_csd: bool = True,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         stage = stage.lower()
         is_detail_stage = stage == "semantic_stage"
@@ -304,10 +381,17 @@ class ControllableRestorationLoss(nn.Module):
             )
             total = total + perc_w * loss_perc
 
+        loss_freq = pred_01.new_zeros((), dtype=torch.float32)
+        freq_w = float(getattr(self.config, "LOSS_FREQ_EDGE_WEIGHT", 0.35))
+        if stage in ("semantic_stage", "joint") and freq_w > 0.0:
+            loss_freq = self.freq_edge(pred_01, target_01, spatial_weight=spatial_w)
+            total = total + freq_w * loss_freq
+
         loss_csd = pred_01.new_zeros((), dtype=torch.float32)
         csd_w = float(getattr(self.config, "LOSS_CSD_WEIGHT", 0.0))
         if (
-            stage in ("semantic_stage", "joint")
+            run_csd
+            and stage in ("semantic_stage", "joint")
             and csd_w > 0.0
             and restorer_model is not None
             and hat_z_0 is not None
@@ -320,6 +404,7 @@ class ControllableRestorationLoss(nn.Module):
             "l1": float(loss_l1.detach().item()),
             "lat": float(loss_latent.detach().item()),
             "perc": float(loss_perc.detach().item()),
+            "freq": float(loss_freq.detach().item()),
             "pres": float(loss_preserve.detach().item()),
             "csd": float(loss_csd.detach().item()),
             "total": float(total.detach().item()),

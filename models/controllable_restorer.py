@@ -523,6 +523,16 @@ class ControllableRestorer(nn.Module):
         struct_idx = [i for i, n in enumerate(deg_names) if n not in signed_set]
         self.register_buffer("struct_action_indices", torch.tensor(struct_idx, dtype=torch.long), persistent=False)
 
+        raw_detail_types = getattr(config, "DETAIL_ACTION_TYPES", None)
+        if raw_detail_types:
+            detail_set = set(raw_detail_types)
+            detail_idx = [i for i, n in enumerate(deg_names) if n in detail_set]
+        else:
+            detail_idx = list(struct_idx)
+        if not detail_idx:
+            detail_idx = list(struct_idx)
+        self.register_buffer("detail_action_indices", torch.tensor(detail_idx, dtype=torch.long), persistent=False)
+
         self.skip_vae = SkipConnectedVAE(raw_vae, config)
 
         unet_expert_specs = resolve_expert_specs(
@@ -531,17 +541,28 @@ class ControllableRestorer(nn.Module):
             signed_types=signed_set,
             default_rank=8,
         )
-        sem_rank = max(4, int(getattr(config, "SEM_DETAIL_LORA_RANK", 16)))
+        pix_rank = int(getattr(config, "UNET_LORA_RANK", 16))
+        pix_alpha = float(getattr(config, "UNET_LORA_ALPHA", float(pix_rank)))
+        pix_conv_rank = int(getattr(config, "UNET_CONV_LORA_RANK", pix_rank))
+        pix_conv_alpha = float(getattr(config, "UNET_CONV_LORA_ALPHA", float(pix_conv_rank)))
+        sem_rank = max(4, int(getattr(config, "SEM_DETAIL_LORA_RANK", 8)))
         sem_alpha = float(getattr(config, "SEM_DETAIL_LORA_ALPHA", float(sem_rank)))
+        sem_conv_rank = max(2, int(getattr(config, "SEM_DETAIL_CONV_LORA_RANK", sem_rank)))
+        sem_conv_alpha = float(getattr(config, "SEM_DETAIL_CONV_LORA_ALPHA", float(sem_conv_rank)))
 
         self.unet = raw_unet
         self.unet_pix_lora_params, self.unet_sem_lora_params = inject_generator_dual_lora(
             self.unet,
-            rank=int(getattr(config, "UNET_LORA_RANK", 20)),
-            alpha=float(getattr(config, "UNET_LORA_ALPHA", 20.0)),
+            rank=pix_rank,
+            alpha=pix_alpha,
+            conv_rank=pix_conv_rank,
+            conv_alpha=pix_conv_alpha,
             expert_specs=unet_expert_specs,
             sem_rank=sem_rank,
             sem_alpha=sem_alpha,
+            sem_conv_rank=sem_conv_rank,
+            sem_conv_alpha=sem_conv_alpha,
+            sem_indices=detail_idx,
             include_conv=True,
         )
 
@@ -757,11 +778,11 @@ class ControllableRestorer(nn.Module):
         clear_spatial_action_map()
 
     def _compute_inference_detail_scale(self, action_map: torch.Tensor, detail_scale: float) -> float:
-        if abs(detail_scale) < 1e-6 or self.struct_action_indices.numel() == 0:
+        if abs(detail_scale) < 1e-6 or self.detail_action_indices.numel() == 0:
             return float(detail_scale)
-        idx = self.struct_action_indices.to(action_map.device)
-        struct_max = float(action_map.float().index_select(1, idx).abs().max().item())
-        gate = min(1.0, max(0.0, struct_max / 0.25))
+        idx = self.detail_action_indices.to(action_map.device)
+        detail_max = float(action_map.float().index_select(1, idx).abs().max().item())
+        gate = min(1.0, max(0.0, detail_max / 0.25))
         return float(detail_scale) * gate
 
     def _get_restoration_timesteps(self) -> Tuple[int, ...]:
@@ -889,9 +910,9 @@ class ControllableRestorer(nn.Module):
             step_delta = w_t * step_mag * score_dir
             target_csd = (z_stu_det - step_delta).detach()
 
-            if self.struct_action_indices.numel() > 0:
-                s_idx = self.struct_action_indices.to(dev)
-                act_gate = action_map.float().index_select(1, s_idx).abs().amax(dim=(1, 2, 3)).clamp(0.0, 1.0)
+            if self.detail_action_indices.numel() > 0:
+                d_idx = self.detail_action_indices.to(dev)
+                act_gate = action_map.float().index_select(1, d_idx).abs().amax(dim=(1, 2, 3)).clamp(0.0, 1.0)
             else:
                 act_gate = action_map.float().abs().amax(dim=(1, 2, 3)).clamp(0.0, 1.0)
             act_gate = act_gate.view(-1, 1, 1, 1)
