@@ -57,7 +57,7 @@ from data.selective_dataset import (
     dataloader_worker_init_fn,
     unpack_batch_action_map,
 )
-from losses.controllable_losses import ControllableRestorationLoss
+from losses.controllable_losses import ControllableRestorationLoss, SpectralPatchDiscriminator
 from models.controllable_restorer import ControllableRestorer
 from utils.semantic_mask import build_spatial_action_overlay, parse_action_spec
 
@@ -222,7 +222,7 @@ def _display_sweep_in_ipython(image_path: str, caption: str = "", max_width: int
             scale = float(max_width) / float(w)
             bgr = cv2.resize(bgr, (max_width, max(64, int(round(h * scale)))), interpolation=cv2.INTER_AREA)
 
-        ok, enc = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+        ok, enc = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
         if not ok:
             return False
         if caption:
@@ -256,6 +256,46 @@ def _psnr_u8_tile(pred_u8: np.ndarray, ref_u8: np.ndarray) -> float:
     if mse <= 1e-8:
         return 99.99
     return float(10.0 * np.log10((255.0 * 255.0) / mse))
+
+
+def _sharpness_ratio_u8(pred_u8: np.ndarray, ref_u8: np.ndarray) -> float:
+    """Ratio of Laplacian edge std (`pred / ref`) — 1.0x matches GT crispness, <0.6x means blurry."""
+    p_gray = cv2.cvtColor(pred_u8, cv2.COLOR_RGB2GRAY)
+    r_gray = cv2.cvtColor(ref_u8, cv2.COLOR_RGB2GRAY)
+    p_std = float(cv2.Laplacian(p_gray, cv2.CV_32F).std())
+    r_std = float(cv2.Laplacian(r_gray, cv2.CV_32F).std())
+    return p_std / max(1e-4, r_std)
+
+
+def _select_sharp_eval_crop(val_dataset, idx: int, crop_size: int = 320) -> np.ndarray:
+    """Deterministically pick the sharpest textured `crop_size` window from a validation image."""
+    crop_size = max(64, (int(crop_size) // 8) * 8)
+    img_paths = getattr(val_dataset, "image_paths", None) or []
+    if img_paths:
+        try:
+            rgb_full = val_dataset._decode_rgb(img_paths[idx % len(img_paths)])
+            h, w = rgb_full.shape[:2]
+            if h >= crop_size and w >= crop_size:
+                ys = sorted({0, max(0, (h - crop_size) // 2), max(0, h - crop_size)})
+                xs = sorted({0, max(0, (w - crop_size) // 2), max(0, w - crop_size)})
+                best_crop = None
+                best_var = -1.0
+                for y in ys:
+                    for x in xs:
+                        cand = rgb_full[y : y + crop_size, x : x + crop_size]
+                        v = val_dataset._estimate_patch_laplacian_var(cand)
+                        if v > best_var:
+                            best_var = v
+                            best_crop = cand
+                if best_crop is not None:
+                    return best_crop.copy()
+            return cv2.resize(rgb_full, (crop_size, crop_size), interpolation=cv2.INTER_CUBIC)
+        except Exception:
+            pass
+    fallback = val_dataset._load_crop_with_retry(idx)
+    if fallback.shape[0] != crop_size or fallback.shape[1] != crop_size:
+        return cv2.resize(fallback, (crop_size, crop_size), interpolation=cv2.INTER_CUBIC)
+    return fallback
 
 
 @torch.no_grad()
@@ -341,7 +381,7 @@ def save_controllable_validation_grid(
     step: int = None,
     return_summary: bool = False,
 ):
-    """Render visual sweep covering all 6 orthogonal controls (incl. signed exposure & warmth) with dB gains."""
+    """Render high-res 6-col diagnostic sweep isolating Motion Deblur, Bokeh Defocus, Compound & Optics + Detail dial."""
     out_dir = Path(config.OUTPUT_DIR) / "controllable_sweeps"
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -349,70 +389,81 @@ def save_controllable_validation_grid(
     raw_model.eval()
     use_amp = config.USE_AMP and (device.type == "cuda")
     signed_types = getattr(config, "SIGNED_ACTION_TYPES", ["exposure", "warmth"])
+    crop_size = int(getattr(config, "EVAL_SWEEP_CROP_SIZE", 320))
+    if getattr(config, "_debug_mode", False):
+        crop_size = min(crop_size, int(config.PATCH_SIZE))
 
     pipeline = SelectiveDegradationPipeline(config)
-    num_imgs = min(len(val_dataset), max(1, config.EVAL_IMAGE_COUNT))
+    num_imgs = min(max(1, len(val_dataset)), max(1, config.EVAL_IMAGE_COUNT))
     rows_canvas = []
     row_log_parts = []
 
     for idx in range(num_imgs):
-        clean_u8 = val_dataset._load_crop_with_retry(idx)
+        clean_u8 = _select_sharp_eval_crop(val_dataset, idx, crop_size=crop_size)
         h, w = clean_u8.shape[:2]
         rng = np.random.default_rng(config.SEED + 1000 + idx)
         params = pipeline.sample_params(h, w, rng=rng)
 
         s_demo = np.zeros(config.NUM_ACTIONS, dtype=np.float32)
-        scenario_id = idx % 3
+        scenario_id = idx % 4
         if scenario_id == 0:
-            row_tag = "Row1[Motion+Noise+DarkExp]"
-            s_demo[pipeline.type_to_idx["deblur_motion"]] = 0.78
-            s_demo[pipeline.type_to_idx["denoise"]] = 0.72
-            s_demo[pipeline.type_to_idx["exposure"]] = -0.68
+            # Row 1: Pure severe curved motion blur — apples-to-apples detail_scale (0.0 vs 0.5 vs 1.0)
+            row_tag = "Row1[PureMotion]"
+            params.motion_spatial_mode = 0
+            params.motion_pattern = 1
+            params.motion_hdr_boost = 0.25
+            s_demo[pipeline.type_to_idx["deblur_motion"]] = 0.68
             runs = [
-                ("Identity (a=0)", "none", None, None, 1.0, 0.0),
-                ("Denoise (Keep Blur/Dark)", "denoise=1.0", None, None, 1.0, 0.0),
-                ("Denoise+Bright (Keep Blur)", "denoise=1.0,exposure=0.68,motion=0.0", None, None, 1.0, 0.0),
-                ("50% Partial Restore", "denoise=0.5,exposure=0.34,motion=0.5", None, None, 1.0, 0.3),
-                ("Full (Pixel Faithful)", "denoise=1.0,exposure=0.68,motion=1.0", None, None, 1.0, 0.0),
-                ("Full (With Detail)", "all,exposure=0.68", None, None, 1.0, 0.50),
-                ("Split Mask Overlay", "denoise=1.0,exposure=0.68,motion=1.0", "denoise=1.0,motion=0.0", "left_half", 1.0, 0.5),
+                ("Denoise Only (Keep Blur)", "denoise=1.0", None, None, 1.0, 0.0),
+                ("Deblur Pixel (d=0.0)", "deblur_motion=1.0", None, None, 1.0, 0.0),
+                ("Deblur Detail (d=0.5)", "deblur_motion=1.0", None, None, 1.0, 0.50),
+                ("Deblur Detail (d=1.0)", "deblur_motion=1.0", None, None, 1.0, 1.00),
             ]
         elif scenario_id == 1:
-            row_tag = "Row2[Defocus+Band+WarmCast]"
+            # Row 2: Pure optical bokeh defocus — apples-to-apples detail_scale (0.0 vs 0.5 vs 1.0)
+            row_tag = "Row2[PureBokeh]"
             params.focus_mode = 0
-            params.artifact_mode = 1
-            s_demo[pipeline.type_to_idx["sharpen_focus"]] = 0.78
-            s_demo[pipeline.type_to_idx["deartifact"]] = 0.78
-            s_demo[pipeline.type_to_idx["warmth"]] = 0.70
+            params.use_bokeh_disc = True
+            s_demo[pipeline.type_to_idx["sharpen_focus"]] = 0.72
             runs = [
-                ("Identity (a=0)", "none", None, None, 1.0, 0.0),
-                ("Deband (Keep Warm/Bokeh)", "deartifact=1.0", None, None, 1.0, 0.0),
-                ("Deband+Cool (Keep Bokeh)", "deartifact=1.0,warmth=-0.70,focus=0.0", None, None, 1.0, 0.0),
-                ("50% Partial Focus", "deartifact=1.0,warmth=-0.70,focus=0.5", None, None, 1.0, 0.35),
-                ("Full (Pixel Faithful)", "deartifact=1.0,warmth=-0.70,focus=1.0", None, None, 1.0, 0.0),
-                ("Full (With Detail)", "all,warmth=-0.70", None, None, 1.0, 0.50),
-                ("Split Mask Overlay", "deartifact=1.0,warmth=-0.70,focus=1.0", "deartifact=1.0,focus=0.0", "left_half", 1.0, 0.5),
+                ("Denoise Only (Keep Bokeh)", "denoise=1.0", None, None, 1.0, 0.0),
+                ("Defocus Pixel (d=0.0)", "sharpen_focus=1.0", None, None, 1.0, 0.0),
+                ("Defocus Detail (d=0.5)", "sharpen_focus=1.0", None, None, 1.0, 0.50),
+                ("Defocus Detail (d=1.0)", "sharpen_focus=1.0", None, None, 1.0, 1.00),
+            ]
+        elif scenario_id == 2:
+            # Row 3: Compound Selective + Spatial Mask (Motion + Noise + Dark Exposure)
+            row_tag = "Row3[Noise+Motion+Dark]"
+            params.motion_spatial_mode = 0
+            s_demo[pipeline.type_to_idx["deblur_motion"]] = 0.60
+            s_demo[pipeline.type_to_idx["denoise"]] = 0.72
+            s_demo[pipeline.type_to_idx["exposure"]] = -0.65
+            runs = [
+                ("Denoise Only (Keep Blur)", "denoise=1.0", None, None, 1.0, 0.0),
+                ("Denoise+Bright (Keep Blur)", "denoise=1.0,exposure=0.65", None, None, 1.0, 0.0),
+                ("Full Exact (d=0.5)", "denoise=1.0,exposure=0.65,motion=1.0", None, None, 1.0, 0.50),
+                ("Split Mask (L=Full R=Dn)", "denoise=1.0,exposure=0.65,motion=1.0", "denoise=1.0,exposure=0.65", "left_half", 1.0, 0.50),
             ]
         else:
-            row_tag = "Row3[LowRes+JPEG+Washout]"
-            params.focus_mode = 1
-            params.artifact_mode = 0
-            s_demo[pipeline.type_to_idx["sharpen_focus"]] = 0.80
+            # Row 4: Banding/JPEG + Warm Cast + Haze (remaining controls, apples-to-apples exact sliders)
+            row_tag = "Row4[Band+Warm+Haze]"
+            params.artifact_mode = 2
             s_demo[pipeline.type_to_idx["deartifact"]] = 0.78
-            s_demo[pipeline.type_to_idx["exposure"]] = 0.65
+            s_demo[pipeline.type_to_idx["warmth"]] = 0.65
+            if "dehaze" in pipeline.type_to_idx:
+                s_demo[pipeline.type_to_idx["dehaze"]] = 0.55
+            full_spec = "deartifact=1.0,warmth=-0.65,dehaze=1.0" if "dehaze" in pipeline.type_to_idx else "deartifact=1.0,warmth=-0.65"
             runs = [
-                ("Identity (a=0)", "none", None, None, 1.0, 0.0),
-                ("DeJPEG (Keep LowRes/Wash)", "deartifact=1.0", None, None, 1.0, 0.0),
-                ("DeJPEG+Darken (Keep LowRes)", "deartifact=1.0,exposure=-0.65,focus=0.0", None, None, 1.0, 0.0),
-                ("50% Partial Sharpen", "deartifact=1.0,exposure=-0.65,focus=0.5", None, None, 1.0, 0.35),
-                ("Full (Pixel Faithful)", "deartifact=1.0,exposure=-0.65,focus=1.0", None, None, 1.0, 0.0),
-                ("Full (With Detail)", "all,exposure=-0.65", None, None, 1.0, 0.50),
-                ("Split Mask Overlay", "deartifact=1.0,exposure=-0.65,focus=1.0", "deartifact=1.0,focus=0.0", "left_half", 1.0, 0.5),
+                ("Deartifact Only", "deartifact=1.0", None, None, 1.0, 0.0),
+                ("+Cool WB (Keep Haze)", "deartifact=1.0,warmth=-0.65", None, None, 1.0, 0.0),
+                ("Full Exact (d=0.5)", full_spec, None, None, 1.0, 0.50),
+                ("Split Mask (L=Full R=Deart)", full_spec, "deartifact=1.0", "left_half", 1.0, 0.50),
             ]
 
         src_u8 = pipeline.render_with_params(clean_u8, s_demo, params)
         src_t = torch.from_numpy(src_u8.astype(np.float32) / 255.0).permute(2, 0, 1).unsqueeze(0).to(device)
         in_db = _psnr_u8_tile(src_u8, clean_u8)
+        in_shp = _sharpness_ratio_u8(src_u8, clean_u8)
 
         left_mask = np.zeros((h, w), dtype=np.float32)
         left_mask[:, : w // 2] = 1.0
@@ -420,66 +471,66 @@ def save_controllable_validation_grid(
         left_3d = left_mask[:, :, None]
 
         specs = [
-            ("Clean GT", clean_u8, "Ground Truth", (185, 200, 215)),
-            ("Degraded Input", src_u8, f"{in_db:.2f} dB (Input)", (215, 205, 175)),
+            (f"{row_tag} GT", clean_u8, "Ground Truth | Shp 1.00x", (185, 200, 215)),
+            ("Degraded Input", src_u8, f"{in_db:.1f}dB | Shp {in_shp:.2f}x", (225, 210, 170)),
         ]
         pix_full_db = in_db
         dual_full_db = in_db
+        dual_full_shp = in_shp
 
         for label, fg_str, bg_str, mask_tag, f_scale, d_scale in runs:
             mask_2d = left_mask if mask_tag == "left_half" else None
             fg_vec = parse_action_spec(fg_str, config.DEGRADATION_TYPES, signed_types=signed_types)
             bg_vec = parse_action_spec(bg_str, config.DEGRADATION_TYPES, signed_types=signed_types) if bg_str else None
             overlay = build_spatial_action_overlay(h, w, fg_vec, bg_vec, mask_2d, device=device)
+            eff_d = d_scale if stage in ("semantic_stage", "joint") else 0.0
             with torch.amp.autocast("cuda", enabled=use_amp):
                 pred_t = raw_model.sample(
                     src_01=src_t,
                     action_input=overlay,
                     steps=1,
                     fidelity_scale=f_scale,
-                    detail_scale=d_scale if stage in ("semantic_stage", "joint") else 0.0,
+                    detail_scale=eff_d,
                 )
             pred_u8 = np.clip(
                 np.round(pred_t[0].permute(1, 2, 0).detach().cpu().numpy() * 255.0), 0.0, 255.0
             ).astype(np.uint8)
 
-            if fg_str == "none":
-                max_px = float(np.max(np.abs(pred_u8.astype(np.float32) - src_u8.astype(np.float32))))
-                foot_txt = f"Max|d|={max_px:.1f}px (Lock)"
-                foot_col = (150, 235, 220)
+            s_fg = pipeline.compute_target_state(s_demo, fg_vec)
+            tgt_fg = clean_u8 if np.allclose(s_fg, 0.0, atol=1e-4) else pipeline.render_with_params(clean_u8, s_fg, params)
+            if mask_tag == "left_half" and bg_vec is not None:
+                s_bg = pipeline.compute_target_state(s_demo, bg_vec)
+                tgt_bg = pipeline.render_with_params(clean_u8, s_bg, params)
+                tgt_col = np.clip(np.round(left_3d * tgt_fg + (1.0 - left_3d) * tgt_bg), 0.0, 255.0).astype(np.uint8)
             else:
-                s_fg = pipeline.compute_target_state(s_demo, fg_vec)
-                tgt_fg = clean_u8 if np.allclose(s_fg, 0.0, atol=1e-4) else pipeline.render_with_params(clean_u8, s_fg, params)
-                if mask_tag == "left_half" and bg_vec is not None:
-                    s_bg = pipeline.compute_target_state(s_demo, bg_vec)
-                    tgt_bg = pipeline.render_with_params(clean_u8, s_bg, params)
-                    tgt_col = np.clip(np.round(left_3d * tgt_fg + (1.0 - left_3d) * tgt_bg), 0.0, 255.0).astype(np.uint8)
-                else:
-                    tgt_col = tgt_fg
-                p_db = _psnr_u8_tile(pred_u8, tgt_col)
-                base_db = _psnr_u8_tile(src_u8, tgt_col)
-                gain_db = p_db - base_db
-                foot_txt = f"{p_db:.2f} dB ({gain_db:+.2f})"
-                if gain_db >= 0.25:
-                    foot_col = (120, 245, 150)
-                elif gain_db <= -0.15:
-                    foot_col = (255, 145, 120)
-                else:
-                    foot_col = (200, 210, 220)
+                tgt_col = tgt_fg
 
-                if label == "Full (Pixel Faithful)":
-                    pix_full_db = p_db
-                elif label == "Full (With Detail)":
-                    dual_full_db = p_db
+            p_db = _psnr_u8_tile(pred_u8, tgt_col)
+            base_db = _psnr_u8_tile(src_u8, tgt_col)
+            gain_db = p_db - base_db
+            shp_r = _sharpness_ratio_u8(pred_u8, tgt_col)
+            foot_txt = f"{p_db:.1f}dB ({gain_db:+.1f}) | Shp {shp_r:.2f}x"
+            if gain_db >= 0.25:
+                foot_col = (120, 245, 150)
+            elif gain_db <= -0.15:
+                foot_col = (255, 145, 120)
+            else:
+                foot_col = (200, 210, 220)
+
+            if "(d=0.0)" in label:
+                pix_full_db = p_db
+            elif "(d=0.5)" in label:
+                dual_full_db = p_db
+                dual_full_shp = shp_r
 
             specs.append((label, pred_u8, foot_txt, foot_col))
 
-        best_row_db = dual_full_db if stage in ("semantic_stage", "joint") else pix_full_db
-        row_log_parts.append(f"{row_tag}: {in_db:.1f}->{best_row_db:.1f}dB ({best_row_db - in_db:+.2f})")
+        best_row_db = dual_full_db if (stage in ("semantic_stage", "joint") or pix_full_db == in_db) else pix_full_db
+        row_log_parts.append(f"{row_tag}: {in_db:.1f}->{best_row_db:.1f}dB ({best_row_db - in_db:+.1f}, Shp {dual_full_shp:.2f}x)")
 
-        pad = 6
-        header_h = 34
-        footer_h = 24
+        pad = 8
+        header_h = 38
+        footer_h = 28
         row_w = len(specs) * (w + pad) + pad
         row_h = header_h + h + footer_h + pad
         panel = np.full((row_h, row_w, 3), 24, dtype=np.uint8)
@@ -487,10 +538,10 @@ def save_controllable_validation_grid(
 
         for c_idx, (col_title, tile_u8, foot_txt, foot_col) in enumerate(specs):
             x0 = pad + c_idx * (w + pad)
-            cv2.putText(panel, col_title, (x0 + 4, header_h - 9), font, 0.38, (220, 240, 180), 1, cv2.LINE_AA)
+            cv2.putText(panel, col_title, (x0 + 5, header_h - 11), font, 0.48, (225, 242, 185), 1, cv2.LINE_AA)
             panel[header_h : header_h + h, x0 : x0 + w] = tile_u8
             cv2.rectangle(panel, (x0, header_h + h), (x0 + w, header_h + h + footer_h - 2), (16, 18, 22), -1)
-            cv2.putText(panel, foot_txt, (x0 + 5, header_h + h + 16), font, 0.37, foot_col, 1, cv2.LINE_AA)
+            cv2.putText(panel, foot_txt, (x0 + 5, header_h + h + 19), font, 0.45, foot_col, 1, cv2.LINE_AA)
 
         rows_canvas.append(panel)
 
@@ -518,6 +569,8 @@ def save_checkpoint(
     best_psnr: float,
     config: Config,
     filename: str,
+    disc_state_dict: dict = None,
+    disc_opt_state_dict: dict = None,
 ):
     """Save lightweight unwrapped adapter checkpoint for resuming & inference."""
     ckpt_dir = Path(config.CHECKPOINT_DIR)
@@ -530,6 +583,8 @@ def save_checkpoint(
         "trainable_state_dict": raw_model.trainable_state_dict(),
         "optimizer_state_dict": optimizer.state_dict() if optimizer is not None else None,
         "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
+        "disc_state_dict": disc_state_dict,
+        "disc_optimizer_state_dict": disc_opt_state_dict,
         "model_config": {
             "MODEL_VERSION": getattr(config, "MODEL_VERSION", "v6_1step_lean"),
             "DEGRADATION_TYPES": list(config.DEGRADATION_TYPES),
@@ -851,7 +906,7 @@ def train(
                 f"({max(1, config.BATCH_SIZE // max(1, world_size))}/GPU) | "
                 f"Backbone: {config.GENERATOR_BACKBONE} ({t_tag}) | LoRA: {exp_tag} | "
                 f"Vision: {config.SEMANTIC_ENCODER_TYPE} | Controls: {config.NUM_ACTIONS} | "
-                f"CSD_w: {getattr(config, 'LOSS_CSD_WEIGHT', 0.0)} (1/{csd_every}) | "
+                f"GAN_w: {getattr(config, 'LOSS_GAN_WEIGHT', 0.0)} | CSD_w: {getattr(config, 'LOSS_CSD_WEIGHT', 0.0)} | "
                 f"AMP: {'ENABLED' if use_amp else 'DISABLED'} | GradCkpt: {gckpt_tag}",
                 flush=True,
             )
@@ -900,6 +955,8 @@ def train(
         resumed_stage = None
         resumed_opt_state = None
         resumed_sched_state = None
+        resumed_disc_state = None
+        resumed_disc_opt_state = None
 
         if resume_path:
             if os.path.exists(resume_path):
@@ -941,6 +998,8 @@ def train(
                 resumed_stage = ckpt.get("stage")
                 resumed_opt_state = ckpt.get("optimizer_state_dict")
                 resumed_sched_state = ckpt.get("scheduler_state_dict")
+                resumed_disc_state = ckpt.get("disc_state_dict")
+                resumed_disc_opt_state = ckpt.get("disc_optimizer_state_dict")
                 del ckpt
 
                 eff_rem_pix = remaining_pixel_epochs
@@ -1011,6 +1070,10 @@ def train(
         )
         optimizer = None
         scheduler = None
+        raw_disc = None
+        disc_model = None
+        disc_opt = None
+        sem_step_counter = 0
         history_file = Path(config.LOG_DIR) / "training_history.json"
         history = []
         if is_main:
@@ -1025,6 +1088,7 @@ def train(
             stage = determine_epoch_stage(epoch, config)
             cur_boost = compute_curriculum_boost(epoch, stage, config)
             train_dataset.set_curriculum_boost(cur_boost)
+            train_dataset.set_detail_stage_focus(stage == "semantic_stage")
 
             if train_sampler is not None:
                 train_sampler.set_epoch(epoch)
@@ -1108,6 +1172,50 @@ def train(
                 else:
                     model = raw_model
 
+                # Setup or tear down lightweight Spectral-Norm Hinge PatchGAN Discriminator for Stage 2
+                gan_weight = float(getattr(config, "LOSS_GAN_WEIGHT", 0.08))
+                if stage in ("semantic_stage", "joint") and gan_weight > 0.0:
+                    if raw_disc is None:
+                        raw_disc = SpectralPatchDiscriminator().to(device)
+                        disc_lr = float(getattr(config, "GAN_DISC_LR", 1.5e-4))
+                        disc_opt = optim.AdamW(
+                            raw_disc.parameters(), lr=disc_lr, betas=(0.0, 0.99), weight_decay=config.WEIGHT_DECAY
+                        )
+                        if epoch == start_epoch and resumed_stage == stage and resumed_disc_state is not None:
+                            try:
+                                raw_disc.load_state_dict(resumed_disc_state)
+                                if resumed_disc_opt_state is not None:
+                                    disc_opt.load_state_dict(resumed_disc_opt_state)
+                                sem_step_counter = int(getattr(config, "GAN_WARMUP_STEPS", 100)) + 150
+                                if is_main:
+                                    print("Restored PatchGAN discriminator state for resumed semantic stage.", flush=True)
+                            except Exception as dexc:
+                                if is_main:
+                                    print(f"[Note] Re-initialized PatchGAN discriminator cleanly ({dexc}).", flush=True)
+                            resumed_disc_state = None
+                            resumed_disc_opt_state = None
+                        if is_ddp:
+                            disc_model = torch.nn.parallel.DistributedDataParallel(
+                                raw_disc,
+                                device_ids=[local_rank],
+                                output_device=local_rank,
+                                broadcast_buffers=False,
+                            )
+                        else:
+                            disc_model = raw_disc
+                        if is_main:
+                            d_params = sum(p.numel() for p in raw_disc.parameters())
+                            print(
+                                f"  [PatchGAN] Active Spectral-Norm Discriminator ({d_params:,} params, "
+                                f"gan_w={gan_weight}, warmup={getattr(config, 'GAN_WARMUP_STEPS', 100)} steps)",
+                                flush=True,
+                            )
+                else:
+                    if disc_model is not None or raw_disc is not None:
+                        disc_model = None
+                        raw_disc = None
+                        disc_opt = None
+
             if is_main and cur_boost > 0.0:
                 print(
                     f"  [Curriculum] Epoch {epoch} single-degradation grounding boost = {cur_boost:.2f}",
@@ -1136,16 +1244,35 @@ def train(
             )
 
             csd_every = max(1, int(getattr(config, "CSD_EVERY_N_STEPS", 4)))
+            gan_target_w = float(getattr(config, "LOSS_GAN_WEIGHT", 0.08))
+            gan_warmup = max(0, int(getattr(config, "GAN_WARMUP_STEPS", 100)))
+            det_idx_dev = raw_model.detail_action_indices.to(device)
+
             for step_idx, batch in enumerate(pbar, start=1):
                 src = batch["source"].to(device, non_blocking=True)
                 tgt = batch["target"].to(device, non_blocking=True)
                 act_map = unpack_batch_action_map(batch, device)
 
                 optimizer.zero_grad(set_to_none=True)
+                pred_detached = None
+                det_mask = None
 
                 try:
                     d_scale = 0.0 if stage == "pixel_stage" else float(random.uniform(0.35, 1.0))
                     do_csd = (stage in ("semantic_stage", "joint")) and (step_idx == 1 or (step_idx % csd_every == 0))
+                    use_gan = (raw_disc is not None) and (stage in ("semantic_stage", "joint")) and (gan_target_w > 0.0)
+                    if use_gan:
+                        sem_step_counter += 1
+                        if sem_step_counter <= gan_warmup:
+                            eff_gan_w = 0.0
+                        else:
+                            eff_gan_w = gan_target_w * min(1.0, float(sem_step_counter - gan_warmup) / 150.0)
+                        if det_idx_dev.numel() > 0:
+                            det_mask = act_map.float().index_select(1, det_idx_dev).abs().amax(dim=1, keepdim=True).clamp(0.0, 1.0)
+                        else:
+                            det_mask = act_map.float().abs().amax(dim=1, keepdim=True).clamp(0.0, 1.0)
+                    else:
+                        eff_gan_w = 0.0
 
                     with torch.amp.autocast("cuda", enabled=use_amp):
                         out = model(
@@ -1168,6 +1295,19 @@ def train(
                             run_csd=do_csd,
                         )
 
+                    if use_gan:
+                        pred_detached = out["pred"].detach()
+                        if eff_gan_w > 0.0:
+                            for dp in raw_disc.parameters():
+                                dp.requires_grad = False
+                            raw_disc.eval()
+                            loss_g_gan = raw_disc.compute_g_loss(out["pred"], det_mask)
+                            loss = loss + eff_gan_w * loss_g_gan
+                            metrics["g_gan"] = float(loss_g_gan.detach().item())
+                            metrics["total"] = float(loss.detach().item())
+                        else:
+                            metrics["g_gan"] = 0.0
+
                     if scaler is not None and use_amp:
                         scaler.scale(loss).backward()
                         scaler.unscale_(optimizer)
@@ -1185,7 +1325,21 @@ def train(
                 finally:
                     raw_model.clear_runtime_contexts()
 
-                del out
+                # Discriminator update (FP32 single concatenated pass — 100% DDP & SpectralNorm safe!)
+                if raw_disc is not None and disc_opt is not None and pred_detached is not None:
+                    for dp in raw_disc.parameters():
+                        dp.requires_grad = True
+                    disc_model.train()
+                    disc_opt.zero_grad(set_to_none=True)
+                    loss_d, _, _ = SpectralPatchDiscriminator.compute_d_loss_with_module(
+                        disc_model, tgt, pred_detached, det_mask
+                    )
+                    loss_d.backward()
+                    torch.nn.utils.clip_grad_norm_(raw_disc.parameters(), 1.0)
+                    disc_opt.step()
+                    metrics["d_loss"] = float(loss_d.detach().item())
+
+                del out, pred_detached
                 for k, v in metrics.items():
                     running[k] = running.get(k, 0.0) + v
 
@@ -1212,10 +1366,14 @@ def train(
                             )
                         else:
                             avg_freq = running.get("freq", 0.0) / step_idx
+                            avg_ggan = running.get("g_gan", 0.0) / step_idx
+                            avg_dloss = running.get("d_loss", 0.0) / step_idx
                             avg_csd = running.get("csd", 0.0) / step_idx
+                            gan_part = f" g_gan={avg_ggan:.3f} d={avg_dloss:.3f}" if raw_disc is not None else ""
+                            csd_part = f" csd={avg_csd:.4f}" if getattr(config, "LOSS_CSD_WEIGHT", 0.0) > 0.0 else ""
                             loss_parts = (
                                 f"loss={avg_tot:.4f} l1={avg_l1:.4f} lat={avg_lat:.4f} "
-                                f"perc={avg_perc:.4f} freq={avg_freq:.4f} csd={avg_csd:.4f}"
+                                f"perc={avg_perc:.4f} freq={avg_freq:.4f}{gan_part}{csd_part}"
                             )
                         print(
                             f"[Epoch {epoch:03d}/{config.EPOCHS} | {stage}] "
@@ -1296,6 +1454,8 @@ def train(
                         best_psnr = rest_psnr
                         save_checkpoint(raw_model, optimizer, scheduler, epoch, stage, best_psnr, config, "model_best.pt")
 
+                disc_sd = {k: v.detach().cpu() for k, v in raw_disc.state_dict().items()} if raw_disc is not None else None
+                disc_osd = disc_opt.state_dict() if disc_opt is not None else None
                 save_checkpoint(
                     raw_model,
                     optimizer,
@@ -1305,6 +1465,8 @@ def train(
                     best_psnr,
                     config,
                     "model_latest.pt",
+                    disc_state_dict=disc_sd,
+                    disc_opt_state_dict=disc_osd,
                 )
                 if epoch % config.CHECKPOINT_EVERY_N_EPOCHS == 0:
                     save_checkpoint(

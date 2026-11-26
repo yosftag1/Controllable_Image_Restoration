@@ -106,6 +106,19 @@ class SelectiveDegradationPipeline:
         self._curriculum_shared = (
             torch.zeros(1, dtype=torch.float32).share_memory_() if torch is not None else None
         )
+        self._detail_focus_val: bool = False
+        self._detail_focus_shared = (
+            torch.zeros(1, dtype=torch.uint8).share_memory_() if torch is not None else None
+        )
+        raw_detail_types = getattr(
+            config,
+            "DETAIL_ACTION_TYPES",
+            ["deblur_motion", "sharpen_focus", "deartifact", "deflare", "dereflection"],
+        )
+        self.detail_indices = [self.type_to_idx[n] for n in raw_detail_types if n in self.type_to_idx]
+        self.blur_indices = [
+            self.type_to_idx[n] for n in ("deblur_motion", "sharpen_focus") if n in self.type_to_idx
+        ]
 
         self.exp_kappa = float(getattr(config, "EXPOSURE_STRENGTH_KAPPA", 2.15))
         self.warm_r_kappa = float(getattr(config, "WARMTH_R_KAPPA", 1.15))
@@ -124,6 +137,19 @@ class SelectiveDegradationPipeline:
         self._curriculum_boost_val = clamped
         if self._curriculum_shared is not None:
             self._curriculum_shared[0] = clamped
+
+    @property
+    def detail_stage_focus(self) -> bool:
+        if self._detail_focus_shared is not None:
+            return bool(int(self._detail_focus_shared[0].item()) != 0)
+        return self._detail_focus_val
+
+    @detail_stage_focus.setter
+    def detail_stage_focus(self, val: bool) -> None:
+        flag = bool(val)
+        self._detail_focus_val = flag
+        if self._detail_focus_shared is not None:
+            self._detail_focus_shared[0] = 1 if flag else 0
 
     def is_signed(self, deg_name_or_idx) -> bool:
         if isinstance(deg_name_or_idx, int):
@@ -189,8 +215,8 @@ class SelectiveDegradationPipeline:
             motion_angle_delta=m_angle_delta,
             motion_bg_ratio=m_bg_ratio,
             motion_field_seed=int(rng.integers(0, 2**31 - 1)),
-            use_bokeh_disc=bool(rng.random() < 0.70),
-            focus_mode=int(rng.choice([0, 1, 2], p=[0.46, 0.32, 0.22])),
+            use_bokeh_disc=bool(rng.random() < 0.78),
+            focus_mode=int(rng.choice([0, 1, 2], p=[0.56, 0.24, 0.20])),
             use_chromatic_aberration=bool(rng.random() < 0.20),
             chroma_shift_px=float(rng.uniform(0.8, 2.0)),
             artifact_mode=int(rng.choice([0, 1, 2, 3], p=[0.38, 0.20, 0.20, 0.22])),
@@ -945,10 +971,11 @@ class SelectiveDegradationPipeline:
         else:
             k = 1
 
-        # Up-weight structural deconvolution (`deblur_motion`, `sharpen_focus`) so motion/focus experts never starve!
+        # Strongly up-weight structural deconvolution (`sharpen_focus`, `deblur_motion`) so bokeh & motion blur
+        # get ample exposure even alongside 8 other controls; in Stage 2 guarantee >=1 detail task every sample!
         type_weights = np.array(
             [
-                1.55 if name == "deblur_motion" else (1.40 if name == "sharpen_focus" else 1.0)
+                2.00 if name == "deblur_motion" else (2.25 if name == "sharpen_focus" else 1.0)
                 for name in self.degradation_types
             ],
             dtype=np.float64,
@@ -956,6 +983,13 @@ class SelectiveDegradationPipeline:
         type_probs = type_weights / np.maximum(type_weights.sum(), 1e-8)
 
         chosen = list(rng.choice(self.num_types, size=min(k, self.num_types), replace=False, p=type_probs))
+        if self.detail_stage_focus and self.detail_indices:
+            if not any(idx in self.detail_indices for idx in chosen):
+                if self.blur_indices and rng.random() < 0.78:
+                    forced = int(rng.choice(self.blur_indices))
+                else:
+                    forced = int(rng.choice(self.detail_indices))
+                chosen[0] = forced
         chosen_names = [self.degradation_types[i] for i in chosen]
 
         if "deblur_motion" in chosen_names and "sharpen_focus" in chosen_names and len(chosen) > 1 and rng.random() < 0.35:
@@ -1034,6 +1068,14 @@ class SelectiveDegradationPipeline:
 
         else:
             action[:] = 0.0
+
+        # In Stage 2 (`detail_stage_focus`), keep >=1 active detail slider ON (except 5% identity/preserve safety)
+        # so ~95% of semantic_stage batches directly train `sem_branch` & PatchGAN instead of wasting steps!
+        if self.detail_stage_focus and self.detail_indices and rng.random() < 0.95:
+            active_detail = [i for i in active_indices if i in self.detail_indices]
+            if active_detail and all(abs(float(action[i])) < 0.25 for i in active_detail):
+                pick = int(rng.choice(active_detail))
+                action[pick] = float(full_act[pick])
 
         return action
 
@@ -1196,16 +1238,18 @@ class SelectiveDegradationPipeline:
             ones_mask = np.ones((h, w), dtype=np.float32)
             return x_src, sharp_rgb_u8, zeros_a, zeros_a, ones_mask, s_src
 
-        if u_mode < 0.06:
-            # 6%: False-Positive Safety on Real Clean Sharp Photo (prevents oversharpening clean photos!)
+        fp_cutoff = 0.04 if self.detail_stage_focus else 0.06
+        pres_cutoff = 0.08 if self.detail_stage_focus else 0.22
+        if u_mode < fp_cutoff:
+            # False-Positive Safety on Real Clean Sharp Photo (prevents oversharpening clean photos!)
             base_src = sharp_rgb_u8
             base_tgt_fg = sharp_rgb_u8
             s_src = s_down.copy()
             a_fg = self.compute_full_restore_action(s_down)
             a_fg[blur_idx] = float(rng.uniform(0.55, 1.0))
             s_tgt_down = self.compute_target_state(s_down, a_fg)
-        elif u_mode < 0.22:
-            # 16%: Selective Real-Blur Preservation (`a_blur = 0.0`: clean noise/tone, KEEP real camera blur!)
+        elif u_mode < pres_cutoff:
+            # Selective Real-Blur Preservation (`a_blur = 0.0`: clean noise/tone, KEEP real camera blur!)
             base_src = blur_rgb_u8
             base_tgt_fg = blur_rgb_u8
             s_src = s_down.copy()
@@ -1214,7 +1258,7 @@ class SelectiveDegradationPipeline:
             a_fg[blur_idx] = 0.0
             s_tgt_down = self.compute_target_state(s_down, a_fg)
         else:
-            # 78%: Active Real Camera Deblurring (`a_blur = 1.0`) + full or selective downstream fixes!
+            # Active Real Camera Deblurring (`a_blur = 1.0`, 78% Stage 1 / 92% Stage 2) + downstream fixes!
             base_src = blur_rgb_u8
             base_tgt_fg = sharp_rgb_u8
             s_src = s_down.copy()
@@ -1314,6 +1358,9 @@ class ControllableRestorationDataset(_TorchDataset):
 
     def set_curriculum_boost(self, boost: float) -> None:
         self.pipeline.curriculum_single_boost = float(np.clip(boost, 0.0, 1.0))
+
+    def set_detail_stage_focus(self, enabled: bool) -> None:
+        self.pipeline.detail_stage_focus = bool(enabled)
 
     @staticmethod
     def _estimate_patch_laplacian_var(crop_rgb: np.ndarray) -> float:

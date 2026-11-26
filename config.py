@@ -46,10 +46,10 @@ class Config:
     UNET_CONV_LORA_ALPHA = 8.0
     LORA_EXPERT_SPECS = []
     # Stage-2 Semantic-Detail LoRA (spatially routed strictly to DETAIL_ACTION_TYPES — never fires on denoise/tone)
-    SEM_DETAIL_LORA_RANK = 8
-    SEM_DETAIL_LORA_ALPHA = 8.0
-    SEM_DETAIL_CONV_LORA_RANK = 4
-    SEM_DETAIL_CONV_LORA_ALPHA = 4.0
+    SEM_DETAIL_LORA_RANK = 16
+    SEM_DETAIL_LORA_ALPHA = 16.0
+    SEM_DETAIL_CONV_LORA_RANK = 8
+    SEM_DETAIL_CONV_LORA_ALPHA = 8.0
 
     # Lightweight VAE Encoder LoRA + 100% Frozen Natural-Manifold Decoder
     VAE_ENC_LORA_RANK = 8
@@ -211,16 +211,19 @@ class Config:
     # Clean Loss Objective:
     LOSS_L1_WEIGHT = 1.0
     LOSS_LATENT_WEIGHT = 0.50
-    LOSS_PIXEL_STAGE_PERCEPTUAL_WEIGHT = 0.10
+    LOSS_PIXEL_STAGE_PERCEPTUAL_WEIGHT = 0.20
     LOSS_PRESERVE_WEIGHT = 0.50
 
-    LOSS_SEMANTIC_STAGE_LP_L1_WEIGHT = 0.50
-    LOSS_SEMANTIC_STAGE_FULL_L1_WEIGHT = 0.12  # Light subpixel anchor — frees high-freq detail synthesis
-    LOSS_SEMANTIC_STAGE_LATENT_LP_WEIGHT = 0.20
-    LOSS_PERCEPTUAL_WEIGHT = 0.75
-    LOSS_FREQ_EDGE_WEIGHT = 0.35  # Multi-scale Sobel edge + high-freq FFT magnitude matching
-    LOSS_CSD_WEIGHT = 0.25
-    CSD_EVERY_N_STEPS = 4  # Run 4x-batch CSD every Nth step in Stage 2 (~3x faster semantic epochs)
+    LOSS_SEMANTIC_STAGE_LP_L1_WEIGHT = 0.45
+    LOSS_SEMANTIC_STAGE_FULL_L1_WEIGHT = 0.05  # Tiny subpixel anchor — lets micro-texture sharpen freely
+    LOSS_SEMANTIC_STAGE_LATENT_LP_WEIGHT = 0.15
+    LOSS_PERCEPTUAL_WEIGHT = 0.85
+    LOSS_FREQ_EDGE_WEIGHT = 0.40  # Pure phase-invariant multi-scale FFT high-frequency magnitude matching
+    LOSS_GAN_WEIGHT = 0.08        # Lightweight Spectral-Norm Hinge PatchGAN on active detail regions
+    GAN_DISC_LR = 1.5e-4
+    GAN_WARMUP_STEPS = 100
+    LOSS_CSD_WEIGHT = 0.0         # Replaced by fast PatchGAN (can still be enabled via --csd-weight)
+    CSD_EVERY_N_STEPS = 4
     CSD_CFG_SCALE = 5.0
     CSD_STEP_SCALE = 0.30
     CSD_TIMESTEP_RANGE = (150, 400)
@@ -230,9 +233,10 @@ class Config:
     LOG_INTERVAL = 100
     SAMPLE_EVERY_N_STEPS = 500
     DISPLAY_INLINE_IMAGES = True
-    INLINE_IMAGE_MAX_WIDTH = 1800
+    INLINE_IMAGE_MAX_WIDTH = 2000
     VAL_EPOCH_INTERVAL = 1
-    EVAL_IMAGE_COUNT = 3
+    EVAL_IMAGE_COUNT = 4
+    EVAL_SWEEP_CROP_SIZE = 320
 
 
 class PilotConfig(Config):

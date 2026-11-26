@@ -1,5 +1,5 @@
 """Losses for 2-stage controllable restoration training."""
 
-from .controllable_losses import ControllableRestorationLoss
+from .controllable_losses import ControllableRestorationLoss, SpectralPatchDiscriminator
 
-__all__ = ["ControllableRestorationLoss"]
+__all__ = ["ControllableRestorationLoss", "SpectralPatchDiscriminator"]

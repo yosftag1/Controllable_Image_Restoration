@@ -312,10 +312,11 @@ class SkipConnectedVAE(nn.Module):
         h = grad_checkpoint(dec.mid_block, h, use_reentrant=False) if use_ckpt else dec.mid_block(h)
 
         detail_env = min(1.0, max(0.0, float(detail_scale)))
-        # Keep non-blur encoder skips 100% intact (eliminates generative drift on `denoise`/tone!),
-        # while fading blurry input skips proportionally to active blur sliders (and stronger when `detail_scale > 0`).
-        blur_base_fade = (0.0, 0.20, 0.45)
-        blur_detail_fade = (0.0, 0.25, 0.40)
+        # Keep non-blur encoder skips 100% intact (zero generative drift on `denoise`/tone!),
+        # while strongly fading blurry input skips across ALL 3 scales (32x32, 64x64, 128x128) on blur tasks
+        # (`0.50/0.70/0.85` in Stage 1 -> `0.75/0.90/0.95` at `detail_scale=1.0`, leaving >=5% for DDP grads).
+        blur_base_fade = (0.50, 0.70, 0.85)
+        blur_detail_fade = (0.25, 0.20, 0.10)
         skip_indices = [2, 1, 0]
         for idx, up_block in enumerate(dec.up_blocks):
             if idx < 3 and len(enc_skips) > skip_indices[idx]:

@@ -59,12 +59,13 @@ def test_selective_pipeline():
     assert cfg.GENERATOR_REPO_MAP["sd-2.1-base"] == "sd2-community/stable-diffusion-2-1-base"
     assert tuple(cfg.RESTORATION_TIMESTEPS) == (175,)
     assert cfg.LORA_EXPERT_SPECS == [] and cfg.UNET_LORA_RANK == 16 and cfg.UNET_CONV_LORA_RANK == 8
-    assert cfg.SEM_DETAIL_LORA_RANK == 8 and cfg.SEM_DETAIL_CONV_LORA_RANK == 4
+    assert cfg.SEM_DETAIL_LORA_RANK == 16 and cfg.SEM_DETAIL_CONV_LORA_RANK == 8
     assert "denoise" not in cfg.DETAIL_ACTION_TYPES and "deblur_motion" in cfg.DETAIL_ACTION_TYPES
     assert cfg.MOTION_BLUR_KERNEL_RANGE == (8, 51)
     assert cfg.MAX_COMPOUND_DEGRADATIONS == 4
     assert cfg.SKIP_DROPOUT_PROB > 0.0
-    assert cfg.LOSS_CSD_WEIGHT > 0.0 and cfg.LOSS_FREQ_EDGE_WEIGHT > 0.0 and cfg.CSD_EVERY_N_STEPS >= 1
+    assert cfg.LOSS_PIXEL_STAGE_PERCEPTUAL_WEIGHT >= 0.15
+    assert cfg.LOSS_FREQ_EDGE_WEIGHT > 0.0 and cfg.LOSS_GAN_WEIGHT > 0.0
 
     pil_cfg = PilotConfig()
     assert pil_cfg.EPOCHS == 12 and pil_cfg.PIXEL_STAGE_EPOCHS == 8
@@ -172,7 +173,18 @@ def test_selective_pipeline():
     assert not np.array_equal(clean, pipe.render_lens_distortion(clean, k1=0.30))
     assert not np.array_equal(clean, pipe.render_lens_distortion(clean, k1=-0.13))
 
-    # 5. Compositional Real-Pair Wrapper + GoPro / RealBlur / DPDD Auto-Discovery Verification
+    # 5. Stage-2 Detail-Focused Sampling + Compositional Real-Pair Wrapper
+    pipe.detail_stage_focus = True
+    det_hits = 0
+    for _ in range(30):
+        s_det = pipe.sample_source_severity(rng=rng, params=params)
+        assert any(float(s_det[i]) > 1e-4 for i in pipe.detail_indices), "Stage-2 detail_stage_focus must include >=1 detail degradation!"
+        a_det = pipe.sample_action_vector(s_det, rng=rng)
+        if any(float(a_det[i]) >= 0.25 for i in pipe.detail_indices):
+            det_hits += 1
+    assert det_hits >= 24, f"Expected >=80% active detail actions in Stage 2, got {det_hits}/30"
+    pipe.detail_stage_focus = False
+
     real_blur_sim = cv2.GaussianBlur(clean, (9, 9), 2.4)
     for _ in range(25):
         rx_src, rx_tgt, ra_fg, ra_bg, rmask, rs_src = pipe.synthesize_real_pair_components(
@@ -319,7 +331,7 @@ def test_model_and_stages_mock():
     import threading
     import torch
     from config import DebugConfig
-    from losses.controllable_losses import ControllableRestorationLoss
+    from losses.controllable_losses import ControllableRestorationLoss, SpectralPatchDiscriminator
     from models.controllable_restorer import ControllableRestorer
     from utils.semantic_mask import extract_one_click_semantic_mask
 
@@ -467,6 +479,25 @@ def test_model_and_stages_mock():
         for p in groups["semantic_stage"]:
             p.zero_()
     model.train()
+
+    # Verify SpectralPatchDiscriminator hinge G & D losses (and zero G grad when detail_mask == 0!)
+    disc = SpectralPatchDiscriminator(base_ch=16)
+    fake_req = torch.rand(2, 3, 64, 64, requires_grad=True)
+    zero_det_mask = torch.zeros(2, 1, 64, 64)
+    g_zero = disc.compute_g_loss(fake_req, zero_det_mask)
+    g_zero.backward()
+    assert float(fake_req.grad.abs().max().item()) == 0.0, "Zero detail mask must produce zero PatchGAN G gradient!"
+
+    fake_req2 = torch.rand(2, 3, 64, 64, requires_grad=True)
+    one_det_mask = torch.ones(2, 1, 64, 64)
+    g_act = disc.compute_g_loss(fake_req2, one_det_mask)
+    g_act.backward()
+    assert float(fake_req2.grad.abs().max().item()) > 0.0, "Active detail mask must produce non-zero PatchGAN G gradient!"
+
+    disc.zero_grad(set_to_none=True)
+    d_loss, _, _ = SpectralPatchDiscriminator.compute_d_loss_with_module(disc, tgt, fake_req2.detach(), one_det_mask)
+    d_loss.backward()
+    assert all(p.grad is not None for p in disc.parameters()), "All PatchGAN discriminator params must receive grads!"
 
     # Exact Zero-Drift CSD check: when hat_z_0 == z_tgt, CSD loss must be 0.0!
     z_exact = torch.randn(2, 4, 8, 8)

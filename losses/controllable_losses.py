@@ -151,22 +151,28 @@ class MultiLayerVGGPerceptual(nn.Module):
 
 
 class MultiScaleFreqEdgeLoss(nn.Module):
-    """Multi-scale Sobel edge sharpness + phase-invariant high-frequency FFT log-magnitude loss."""
+    """Phase-invariant multi-scale high-frequency FFT log-magnitude loss (sharpens texture without 1px phase lock)."""
 
     def __init__(self):
         super().__init__()
-        kx = torch.tensor([[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]], dtype=torch.float32) / 4.0
-        ky = kx.t().contiguous()
-        self.register_buffer("sobel_x", kx.view(1, 1, 3, 3), persistent=False)
-        self.register_buffer("sobel_y", ky.view(1, 1, 3, 3), persistent=False)
         self.register_buffer("luma_w", torch.tensor([0.299, 0.587, 0.114], dtype=torch.float32).view(1, 3, 1, 1), persistent=False)
 
     def _to_luma(self, rgb_01: torch.Tensor) -> torch.Tensor:
         return (rgb_01.float() * self.luma_w).sum(dim=1, keepdim=True)
 
-    def _sobel_xy(self, luma: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        pad = F.pad(luma, (1, 1, 1, 1), mode="reflect")
-        return F.conv2d(pad, self.sobel_x), F.conv2d(pad, self.sobel_y)
+    @staticmethod
+    def _fft_hf_l1(p_y: torch.Tensor, t_y: torch.Tensor) -> torch.Tensor:
+        fp = torch.fft.rfft2(p_y, norm="ortho")
+        ft = torch.fft.rfft2(t_y, norm="ortho")
+        mag_p = torch.log1p(torch.sqrt(fp.real * fp.real + fp.imag * fp.imag + 1e-8))
+        mag_t = torch.log1p(torch.sqrt(ft.real * ft.real + ft.imag * ft.imag + 1e-8))
+
+        fh, fw = mag_p.shape[-2], mag_p.shape[-1]
+        fy = torch.fft.fftfreq(p_y.shape[-2], device=p_y.device, dtype=torch.float32).abs() * 2.0
+        fx = torch.fft.rfftfreq(p_y.shape[-1], device=p_y.device, dtype=torch.float32).abs() * 2.0
+        rad = torch.sqrt(fy[:, None] ** 2 + fx[None, :] ** 2).clamp(0.0, 1.0)
+        freq_w = (0.15 + 0.85 * rad).view(1, 1, fh, fw)
+        return ((mag_p - mag_t).abs() * freq_w).mean()
 
     def forward(
         self,
@@ -178,29 +184,6 @@ class MultiScaleFreqEdgeLoss(nn.Module):
             p_y = self._to_luma(pred_01)
             t_y = self._to_luma(target_01.detach())
 
-            # 1. Multi-scale Sobel gradient matching (1x + 2x) for crisp, ringing-free edges
-            edge_loss = pred_01.new_zeros((), dtype=torch.float32)
-            scales = [(p_y, t_y, 0.65)]
-            if p_y.shape[-2] >= 16 and p_y.shape[-1] >= 16:
-                scales.append(
-                    (
-                        F.avg_pool2d(p_y, kernel_size=2, stride=2),
-                        F.avg_pool2d(t_y, kernel_size=2, stride=2),
-                        0.35,
-                    )
-                )
-            for py_s, ty_s, sw_s in scales:
-                pgx, pgy = self._sobel_xy(py_s)
-                tgx, tgy = self._sobel_xy(ty_s)
-                err = (pgx - tgx).abs() + (pgy - tgy).abs()
-                if spatial_weight is not None:
-                    w_s = F.adaptive_avg_pool2d(spatial_weight.float(), output_size=err.shape[-2:])
-                    w_s = w_s / w_s.mean(dim=(2, 3), keepdim=True).clamp(min=1e-4)
-                    edge_loss = edge_loss + sw_s * (err * w_s).mean()
-                else:
-                    edge_loss = edge_loss + sw_s * err.mean()
-
-            # 2. High-frequency weighted FFT log-amplitude loss (phase-invariant micro-texture energy)
             if spatial_weight is not None:
                 w_fft = F.adaptive_avg_pool2d(spatial_weight.float(), output_size=p_y.shape[-2:])
                 w_fft = w_fft / w_fft.mean(dim=(2, 3), keepdim=True).clamp(min=1e-4)
@@ -209,19 +192,85 @@ class MultiScaleFreqEdgeLoss(nn.Module):
             else:
                 p_in, t_in = p_y, t_y
 
-            fp = torch.fft.rfft2(p_in, norm="ortho")
-            ft = torch.fft.rfft2(t_in, norm="ortho")
-            mag_p = torch.log1p(torch.sqrt(fp.real * fp.real + fp.imag * fp.imag + 1e-8))
-            mag_t = torch.log1p(torch.sqrt(ft.real * ft.real + ft.imag * ft.imag + 1e-8))
+            loss = self._fft_hf_l1(p_in, t_in)
+            if p_in.shape[-2] >= 32 and p_in.shape[-1] >= 32:
+                p_half = F.avg_pool2d(p_in, kernel_size=2, stride=2)
+                t_half = F.avg_pool2d(t_in, kernel_size=2, stride=2)
+                loss = 0.65 * loss + 0.35 * self._fft_hf_l1(p_half, t_half)
+            return loss
 
-            fh, fw = mag_p.shape[-2], mag_p.shape[-1]
-            fy = torch.fft.fftfreq(p_y.shape[-2], device=pred_01.device, dtype=torch.float32).abs() * 2.0
-            fx = torch.fft.rfftfreq(p_y.shape[-1], device=pred_01.device, dtype=torch.float32).abs() * 2.0
-            rad = torch.sqrt(fy[:, None] ** 2 + fx[None, :] ** 2).clamp(0.0, 1.0)
-            freq_w = (0.25 + 0.75 * rad).view(1, 1, fh, fw)
-            fft_loss = ((mag_p - mag_t).abs() * freq_w).mean()
 
-            return 0.55 * edge_loss + 0.45 * fft_loss
+class SpectralPatchDiscriminator(nn.Module):
+    """Lightweight Spectral-Norm Hinge PatchGAN (~2.7M params) for Stage-2 photographic sharpness.
+
+    Runs in FP32 (~4ms/step on T4) and masks generator gradients strictly to active `DETAIL_ACTION_TYPES`
+    regions so pure `denoise`/tone pixels never receive adversarial texture push.
+    """
+
+    def __init__(self, in_channels: int = 3, base_ch: int = 64):
+        super().__init__()
+        sn = nn.utils.spectral_norm
+        self.net = nn.Sequential(
+            sn(nn.Conv2d(in_channels, base_ch, kernel_size=4, stride=2, padding=1)),
+            nn.LeakyReLU(0.2, inplace=True),
+            sn(nn.Conv2d(base_ch, base_ch * 2, kernel_size=4, stride=2, padding=1)),
+            nn.LeakyReLU(0.2, inplace=True),
+            sn(nn.Conv2d(base_ch * 2, base_ch * 4, kernel_size=4, stride=2, padding=1)),
+            nn.LeakyReLU(0.2, inplace=True),
+            sn(nn.Conv2d(base_ch * 4, base_ch * 8, kernel_size=4, stride=1, padding=1)),
+            nn.LeakyReLU(0.2, inplace=True),
+            sn(nn.Conv2d(base_ch * 8, 1, kernel_size=4, stride=1, padding=1)),
+        )
+
+    def forward(self, rgb_01: torch.Tensor) -> torch.Tensor:
+        with torch.amp.autocast(device_type=rgb_01.device.type, enabled=False):
+            x = rgb_01.float() * 2.0 - 1.0
+            return self.net(x)
+
+    @staticmethod
+    def _resize_mask(mask: Optional[torch.Tensor], target_hw: Tuple[int, int]) -> Optional[torch.Tensor]:
+        if mask is None:
+            return None
+        m = mask.float().clamp(0.0, 1.0)
+        if m.shape[-2:] != target_hw:
+            m = F.adaptive_avg_pool2d(m, output_size=target_hw)
+        return m
+
+    def compute_g_loss(
+        self,
+        fake_01: torch.Tensor,
+        detail_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Generator hinge loss (-E[D(fake)]) gated strictly to active detail regions."""
+        logits = self.forward(fake_01)
+        m = self._resize_mask(detail_mask, logits.shape[-2:])
+        if m is not None:
+            return -(logits * m).mean()
+        return -logits.mean()
+
+    @classmethod
+    def compute_d_loss_with_module(
+        cls,
+        disc_module: nn.Module,
+        real_01: torch.Tensor,
+        fake_01_detached: torch.Tensor,
+        detail_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, float, float]:
+        """Single-pass DDP-safe hinge discriminator loss (concatenates real+fake to avoid double SN buffer update)."""
+        cat_x = torch.cat([real_01.detach(), fake_01_detached.detach()], dim=0)
+        cat_logits = disc_module(cat_x)
+        d_real, d_fake = cat_logits.chunk(2, dim=0)
+
+        m = cls._resize_mask(detail_mask, d_real.shape[-2:])
+        if m is not None:
+            w = 0.15 + 0.85 * m
+            loss_real = (F.relu(1.0 - d_real) * w).mean()
+            loss_fake = (F.relu(1.0 + d_fake) * w).mean()
+        else:
+            loss_real = F.relu(1.0 - d_real).mean()
+            loss_fake = F.relu(1.0 + d_fake).mean()
+        loss_d = 0.5 * (loss_real + loss_fake)
+        return loss_d, float(d_real.detach().mean().item()), float(d_fake.detach().mean().item())
 
 
 class ControllableRestorationLoss(nn.Module):
