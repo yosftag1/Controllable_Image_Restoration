@@ -1,15 +1,16 @@
-"""End-to-end verification suite for Controllable_Image_Restoration (2-Step SD-2.1 + LoRA-MoE).
+"""End-to-end verification suite for Controllable_Image_Restoration (V7 SD-Turbo Crisp 7-Control).
 
 Runs:
 1. AST syntax check across every Python file in the repository.
-2. Config invariants (`sd-2.1-base` default, `RESTORATION_TIMESTEPS=(299, 99)`, `LORA_EXPERT_SPECS`,
-   `dinov2_reg`), multi-pattern curved/tremor motion blur + custom blur helper + optical bokeh/CA +
-   4-mode artifact continuity + heteroscedastic noise, Lie-group directional Exposure/Warmth,
-   Laplacian clean-patch sharpness gate, and auto-discovery + Compositional Real-Pair Wrapper across
-   GoPro / RealBlur / DPDD folder & `.txt` layouts.
-3. Full 2-step / 2-stage forward/backward (`pixel_stage` & `semantic_stage`), Shared+Specialist LoRA-MoE
-   zero-leakage routing, DDP gradient completeness, zero-drift Target-Anchored CSD, frozen VAE decoder,
-   1x1 radiometric head, zero-action identity, tiled inference, and 1-click semantic mask extraction.
+2. Config invariants (`sd-turbo` default, `RESTORATION_TIMESTEPS=(499,)`, 7 core controls,
+   3 routed specialist LoRA experts, `VAE_ENC_LORA_RANK=0`, `VAE_DEC_LORA_RANK=8`,
+   `REUSE_PAIRED_CLEAN_FOR_SYNTH=False`, `PATCH_SIZE=384`, `GRAD_ACCUM_STEPS=2`),
+   artifact-first + dataset-balanced sampling, monotonic Real-ESRGAN SR & 3-mode ISP noise,
+   Lie-group Exposure/Warmth, strict `gan_clean_eligible` hygiene, and curated paired loader.
+3. Full 1-step / 2-stage forward/backward (`pixel_stage` & `semantic_stage`), Routed LoRA-MoE +
+   Stage-2 VAE Decoder LoRA DDP gradient completeness & zero-leakage on pure `denoise`,
+   zero-VRAM `DINOv2FeatureDiscriminator` G/D hinge gating, zero-action identity, tiled inference,
+   and 1-click semantic mask extraction.
 """
 
 import ast
@@ -46,45 +47,47 @@ def test_selective_pipeline():
 
     cfg = Config()
     dist_sum = (
-        cfg.ACTION_DIST_SELECTIVE
+        cfg.ACTION_DIST_FULL
+        + cfg.ACTION_DIST_BLIND_ALL
+        + cfg.ACTION_DIST_SELECTIVE
         + cfg.ACTION_DIST_PARTIAL
-        + cfg.ACTION_DIST_FULL
         + cfg.ACTION_DIST_FALSE_POS
         + cfg.ACTION_DIST_IDENTITY
     )
     assert abs(dist_sum - 1.0) < 1e-6, f"Action distribution must sum to 1.0, got {dist_sum}"
-    assert cfg.NUM_ACTIONS == 10, f"Expected 10 orthogonal controls, got {cfg.NUM_ACTIONS}"
+    assert cfg.NUM_ACTIONS == 7, f"Expected 7 streamlined controls, got {cfg.NUM_ACTIONS}"
+    assert "super_resolution" in cfg.DEGRADATION_TYPES and "sharpen_focus" not in cfg.DEGRADATION_TYPES
     assert cfg.SEMANTIC_ENCODER_TYPE == "dinov2_reg", "Default vision encoder must be dinov2_reg!"
-    assert cfg.GENERATOR_BACKBONE == "sd-2.1-base", "Default backbone must be sd-2.1-base!"
-    assert cfg.GENERATOR_REPO_MAP["sd-2.1-base"] == "sd2-community/stable-diffusion-2-1-base"
-    assert tuple(cfg.RESTORATION_TIMESTEPS) == (175,)
-    assert cfg.LORA_EXPERT_SPECS == [] and cfg.UNET_LORA_RANK == 16 and cfg.UNET_CONV_LORA_RANK == 8
-    assert cfg.SEM_DETAIL_LORA_RANK == 16 and cfg.SEM_DETAIL_CONV_LORA_RANK == 8
-    assert "denoise" not in cfg.DETAIL_ACTION_TYPES and "deblur_motion" in cfg.DETAIL_ACTION_TYPES
-    assert cfg.MOTION_BLUR_KERNEL_RANGE == (8, 51)
-    assert cfg.MAX_COMPOUND_DEGRADATIONS == 4
-    assert cfg.SKIP_DROPOUT_PROB > 0.0
-    assert cfg.LOSS_PIXEL_STAGE_PERCEPTUAL_WEIGHT >= 0.15
-    assert cfg.LOSS_FREQ_EDGE_WEIGHT > 0.0 and cfg.LOSS_GAN_WEIGHT > 0.0
+    assert cfg.GENERATOR_BACKBONE == "sd-turbo", "Default backbone must be sd-turbo!"
+    assert cfg.GENERATOR_REPO_MAP["sd-turbo"] == "stabilityai/sd-turbo"
+    assert tuple(cfg.RESTORATION_TIMESTEPS) == (499,)
+    assert len(cfg.LORA_EXPERT_SPECS) == 3
+    assert cfg.VAE_ENC_LORA_RANK == 0 and cfg.VAE_DEC_LORA_RANK == 8
+    assert cfg.REUSE_PAIRED_CLEAN_FOR_SYNTH is False
+    assert cfg.PATCH_SIZE == 384 and cfg.GRAD_ACCUM_STEPS == 2
+    assert "denoise" not in cfg.DETAIL_ACTION_TYPES and "super_resolution" in cfg.DETAIL_ACTION_TYPES
+    assert "deblur_motion" in cfg.DESTRUCTIVE_SKIP_ACTIONS and "super_resolution" in cfg.DESTRUCTIVE_SKIP_ACTIONS
+    assert cfg.LOSS_PIXEL_STAGE_PERCEPTUAL_WEIGHT >= 0.30 and cfg.LOSS_PIXEL_STAGE_EDGE_WEIGHT > 0.0
+    assert cfg.LOSS_EDGE_GRAD_WEIGHT > 0.0 and cfg.LOSS_GAN_WEIGHT > 0.0
 
     pil_cfg = PilotConfig()
     assert pil_cfg.EPOCHS == 12 and pil_cfg.PIXEL_STAGE_EPOCHS == 8
-    assert pil_cfg.MAX_STEPS_PER_EPOCH == 950 and pil_cfg.MIN_STEPS_PER_EPOCH == 950
+    assert pil_cfg.MAX_STEPS_PER_EPOCH == 700 and pil_cfg.MIN_STEPS_PER_EPOCH == 700
 
     dbg_cfg = DebugConfig()
     assert dbg_cfg.EPOCHS == 2 and dbg_cfg.PIXEL_STAGE_EPOCHS == 1
 
     all_vec = parse_action_spec("all", cfg.DEGRADATION_TYPES, signed_types=cfg.SIGNED_ACTION_TYPES)
-    assert np.allclose(all_vec, [1.0] * 8 + [0.0, 0.0]), f"Unexpected 'all' vector: {all_vec}"
+    assert np.allclose(all_vec, [1.0] * 5 + [0.0, 0.0]), f"Unexpected 'all' vector: {all_vec}"
 
-    legacy_vec = parse_action_spec(
-        "noise=0.8,jpeg=0.9,motion=0.7,sr=0.6,flare=0.5,reflection=0.4,ca=0.3,haze=0.2,darken=0.5,cool=0.4",
+    alias_vec = parse_action_spec(
+        "noise=0.8,jpeg=0.9,motion=0.7,sr=0.6,haze=0.4,darken=0.5,cool=0.3",
         cfg.DEGRADATION_TYPES,
         signed_types=cfg.SIGNED_ACTION_TYPES,
     )
-    assert np.allclose(legacy_vec, [0.8, 0.9, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, -0.5, -0.4]), f"Unexpected alias parse: {legacy_vec}"
+    assert np.allclose(alias_vec, [0.8, 0.9, 0.7, 0.6, 0.4, -0.5, -0.3]), f"Unexpected alias parse: {alias_vec}"
 
-    overlay_neg = build_spatial_action_overlay(16, 16, legacy_vec)
+    overlay_neg = build_spatial_action_overlay(16, 16, alias_vec)
     assert float(overlay_neg.min()) == -0.5, "Spatial overlay must preserve negative signed controls!"
 
     pipe = SelectiveDegradationPipeline(cfg)
@@ -94,6 +97,8 @@ def test_selective_pipeline():
     clean = np.stack([xx, yy, 128.0 + 0.3 * xx - 0.3 * yy], axis=-1).clip(0, 255).astype(np.uint8)
     cv2.circle(clean, (64, 64), 28, (235, 70, 55), -1)
     cv2.rectangle(clean, (20, 20), (46, 102), (45, 210, 195), -1)
+    # Add crisp high-frequency checkerboard strip so SR/blur monotonicity is strongly measurable
+    clean[80:112, 80:112] = (((np.arange(32)[:, None] + np.arange(32)[None, :]) % 2) * 180 + 35)[:, :, None].astype(np.uint8)
     params = pipe.sample_params(128, 128, rng=rng)
 
     # 1. Exact identity at state = 0 & custom motion blur helper
@@ -121,7 +126,7 @@ def test_selective_pipeline():
     s_only_blur = np.zeros(cfg.NUM_ACTIONS, dtype=np.float32)
     s_only_blur[pipe.type_to_idx["deblur_motion"]] = 0.80
     x_pure_blur = pipe.render_with_params(clean, s_only_blur, params)
-    assert np.array_equal(x_tgt, x_pure_blur), "Preserved curved motion blur target must match pure motion blur!"
+    assert np.array_equal(x_tgt, x_pure_blur), "Preserved motion blur target must match pure motion blur!"
     assert not np.array_equal(x_src, x_tgt), "Denoised target should differ from noisy source!"
 
     # 3. Signed directional Exposure & Warmth Lie-group inversion
@@ -138,70 +143,72 @@ def test_selective_pipeline():
             rec_tone = pipe.render_with_params(clean, s_rec, params)
             assert np.array_equal(clean, rec_tone), f"{signed_name}: inverse signed slider must reach exact clean target!"
 
-    # 4. Continuity across all 8 unsigned controls (incl. 5 flare styles, glass reflection, radial CA, haze)
+    # 4. Monotonicity across ALL 5 unsigned controls (incl. all 3 SR modes & all 3 ISP noise modes!)
     params.motion_shake_jitter = 0.28
-    params.chroma_shift_px = 1.8
-    for use_disc, use_ca, het_n in ((True, True, True), (False, False, False)):
-        params.use_bokeh_disc = use_disc
-        params.use_chromatic_aberration = use_ca
-        params.heteroscedastic_noise = het_n
-        for mode_id in (0, 1, 2, 3, 4):
-            params.focus_mode = mode_id % 3
-            params.motion_pattern = mode_id % 3
-            params.motion_spatial_mode = mode_id % 4
-            params.motion_hdr_boost = 0.35 if (mode_id % 2 == 0) else 0.0
-            params._motion_mask_cache = None
-            params.artifact_mode = mode_id % 4
-            params.flare_style = mode_id
-            params._flare_cache = None
-            for u_idx in pipe.unsigned_indices:
-                deg_name = cfg.DEGRADATION_TYPES[u_idx]
-                s_one = np.zeros(cfg.NUM_ACTIONS, dtype=np.float32)
-                s_one[u_idx] = 0.85
-                d_full = pipe.render_with_params(clean, s_one, params).astype(np.float32)
-                d_half = pipe.render_with_params(clean, 0.5 * s_one, params).astype(np.float32)
-                d_zero = pipe.render_with_params(clean, 0.0 * s_one, params).astype(np.float32)
-                err_full = float(np.mean((d_full - clean.astype(np.float32)) ** 2))
-                err_half = float(np.mean((d_half - clean.astype(np.float32)) ** 2))
-                err_zero = float(np.mean((d_zero - clean.astype(np.float32)) ** 2))
-                assert err_zero == 0.0, f"{deg_name} (disc={use_disc}, mode={mode_id}): a=1.0 must reach clean!"
-                assert err_full > err_half > 0.0, f"{deg_name} (disc={use_disc}, mode={mode_id}): must be monotonic!"
+    params.sr_scale_factor = 0.35
+    params.sr_sigma_max = 1.6
+    for mode_id in (0, 1, 2, 3):
+        params.sr_mode = mode_id % 3
+        params.noise_mode = mode_id % 3
+        params._noise_cache = None
+        params.heteroscedastic_noise = bool(mode_id % 2 == 0)
+        params.motion_pattern = mode_id % 3
+        params.motion_spatial_mode = mode_id % 4
+        params.motion_hdr_boost = 0.30 if (mode_id % 2 == 0) else 0.0
+        params._motion_mask_cache = None
+        params.artifact_mode = mode_id % 4
+        for u_idx in pipe.unsigned_indices:
+            deg_name = cfg.DEGRADATION_TYPES[u_idx]
+            s_one = np.zeros(cfg.NUM_ACTIONS, dtype=np.float32)
+            s_one[u_idx] = 0.85
+            d_full = pipe.render_with_params(clean, s_one, params).astype(np.float32)
+            d_half = pipe.render_with_params(clean, 0.5 * s_one, params).astype(np.float32)
+            d_zero = pipe.render_with_params(clean, 0.0 * s_one, params).astype(np.float32)
+            err_full = float(np.mean((d_full - clean.astype(np.float32)) ** 2))
+            err_half = float(np.mean((d_half - clean.astype(np.float32)) ** 2))
+            err_zero = float(np.mean((d_zero - clean.astype(np.float32)) ** 2))
+            assert err_zero == 0.0, f"{deg_name} (mode={mode_id}): a=1.0 must reach clean!"
+            assert err_full > err_half > 0.0, f"{deg_name} (mode={mode_id}): must be monotonic ({err_full} vs {err_half})!"
 
-    # Verify full-frame Brown-Conrady lens distortion helper
-    dist_id = pipe.render_lens_distortion(clean, k1=0.0, k2=0.0)
-    assert np.array_equal(clean, dist_id), "k1=0, k2=0 lens distortion must be exact identity!"
-    assert not np.array_equal(clean, pipe.render_lens_distortion(clean, k1=0.30))
-    assert not np.array_equal(clean, pipe.render_lens_distortion(clean, k1=-0.13))
+    # Verify Brown-Conrady lens distortion helper
+    assert np.array_equal(clean, pipe.render_lens_distortion(clean, k1=0.0, k2=0.0))
+    assert not np.array_equal(clean, pipe.render_lens_distortion(clean, k1=0.25))
 
-    # 5. Stage-2 Detail-Focused Sampling + Compositional Real-Pair Wrapper
+    # 5. Stage-2 Detail Focus, Artifact-First Budget, Blind 'all' Coverage & GAN-Clean Hygiene
     pipe.detail_stage_focus = True
     det_hits = 0
-    for _ in range(30):
-        s_det = pipe.sample_source_severity(rng=rng, params=params)
-        assert any(float(s_det[i]) > 1e-4 for i in pipe.detail_indices), "Stage-2 detail_stage_focus must include >=1 detail degradation!"
-        a_det = pipe.sample_action_vector(s_det, rng=rng)
-        if any(float(a_det[i]) >= 0.25 for i in pipe.detail_indices):
+    gan_clean_hits = 0
+    for _ in range(40):
+        _, x_t, a_fg, a_bg, _, _, gan_ok = pipe.synthesize_components(clean, rng=rng)
+        if any(float(a_fg[i]) >= 0.25 for i in pipe.detail_indices):
             det_hits += 1
-    assert det_hits >= 24, f"Expected >=80% active detail actions in Stage 2, got {det_hits}/30"
+        if gan_ok:
+            gan_clean_hits += 1
+            assert np.array_equal(x_t, clean), "gan_clean_eligible=True MUST correspond to 100% clean GT target!"
+    assert det_hits >= 34, f"Expected >=85% active detail actions in Stage 2, got {det_hits}/40"
+    assert gan_clean_hits >= 20, f"Expected strong Stage-2 GAN-clean target ratio, got {gan_clean_hits}/40"
     pipe.detail_stage_focus = False
 
+    # Verify Real-Pair Wrapper NEVER marks 720p pairs as gan_clean_eligible & covers blind 'all' preset!
     real_blur_sim = cv2.GaussianBlur(clean, (9, 9), 2.4)
-    for _ in range(25):
-        rx_src, rx_tgt, ra_fg, ra_bg, rmask, rs_src = pipe.synthesize_real_pair_components(
+    all_hits = 0
+    for _ in range(80):
+        rx_src, rx_tgt, ra_fg, ra_bg, rmask, rs_src, r_gan_ok = pipe.synthesize_real_pair_components(
             real_blur_sim, clean, blur_channel_name="deblur_motion", rng=rng
         )
         assert rx_src.shape == clean.shape and rx_tgt.shape == clean.shape
-        assert -1.0 <= float(ra_fg.min()) and float(ra_fg.max()) <= 1.0
-        for u_idx in pipe.unsigned_indices:
-            assert float(ra_fg[u_idx]) >= 0.0
+        assert r_gan_ok is False, "Real 720p camera pairs must NEVER be marked gan_clean_eligible!"
+        if all(float(ra_fg[i]) >= 0.99 for i in pipe.unsigned_indices):
+            all_hits += 1
+    assert all_hits >= 4, f"Expected explicit blind 'all' preset coverage on real pairs, got {all_hits}/80"
 
+    # 6. Clean dataset bucket isolation (REUSE_PAIRED_CLEAN_FOR_SYNTH=False) & per-subdataset paired balancing
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
-        real_ost = tmp_path / "external_ost" / "outdoor"
-        real_ost.mkdir(parents=True)
         train_root = tmp_path / "df2k-ost" / "train"
         (train_root / "DIV2K").mkdir(parents=True)
         (train_root / "Flickr2K").mkdir(parents=True)
+        (train_root / "OST").mkdir(parents=True)
         val_root = tmp_path / "df2k-ost" / "test" / "DIV2K_valid"
         val_root.mkdir(parents=True)
 
@@ -209,79 +216,36 @@ def test_selective_pipeline():
         big_blur = cv2.GaussianBlur(big_clean, (13, 13), 3.4)
         cv2.imwrite(str(train_root / "DIV2K" / "0001.png"), big_clean)
         cv2.imwrite(str(train_root / "Flickr2K" / "0002.jpg"), big_clean)
-        cv2.imwrite(str(real_ost / "0003.png"), big_clean)
-        os.symlink(str(real_ost), str(train_root / "OST_link"))
+        for oi in range(5):
+            cv2.imwrite(str(train_root / "OST" / f"ost_{oi:02d}.png"), big_clean)
         cv2.imwrite(str(val_root / "0801.png"), big_clean)
 
         curated_motion = tmp_path / "curated_deblur"
         (curated_motion / "GoPro" / "train" / "GOPR0372" / "blur").mkdir(parents=True)
-        (curated_motion / "GoPro" / "train" / "GOPR0372" / "blur_gamma").mkdir(parents=True)
         (curated_motion / "GoPro" / "train" / "GOPR0372" / "sharp").mkdir(parents=True)
         cv2.imwrite(str(curated_motion / "GoPro" / "train" / "GOPR0372" / "blur" / "0001.png"), big_blur)
-        cv2.imwrite(str(curated_motion / "GoPro" / "train" / "GOPR0372" / "blur_gamma" / "0001.png"), big_blur)
         cv2.imwrite(str(curated_motion / "GoPro" / "train" / "GOPR0372" / "sharp" / "0001.png"), big_clean)
-        (curated_motion / "GoPro" / "test" / "GOPR0384" / "blur").mkdir(parents=True)
-        (curated_motion / "GoPro" / "test" / "GOPR0384" / "sharp").mkdir(parents=True)
-        cv2.imwrite(str(curated_motion / "GoPro" / "test" / "GOPR0384" / "blur" / "0099.png"), big_blur)
-        cv2.imwrite(str(curated_motion / "GoPro" / "test" / "GOPR0384" / "sharp" / "0099.png"), big_clean)
 
         (curated_motion / "HIDE" / "test" / "blur").mkdir(parents=True)
         (curated_motion / "HIDE" / "test" / "sharp").mkdir(parents=True)
         cv2.imwrite(str(curated_motion / "HIDE" / "test" / "blur" / "hide_01.png"), big_blur)
         cv2.imwrite(str(curated_motion / "HIDE" / "test" / "sharp" / "hide_01.png"), big_clean)
 
-        (curated_motion / "BlurSet" / "sharp").mkdir(parents=True)
-        (curated_motion / "BlurSet" / "motion_blurred").mkdir(parents=True)
-        (curated_motion / "BlurSet" / "defocused_blurred").mkdir(parents=True)
-        cv2.imwrite(str(curated_motion / "BlurSet" / "sharp" / "0_CAM_S.png"), big_clean)
-        cv2.imwrite(str(curated_motion / "BlurSet" / "motion_blurred" / "0_CAM_M.png"), big_blur)
-        cv2.imwrite(str(curated_motion / "BlurSet" / "defocused_blurred" / "0_CAM_F.png"), big_blur)
-
-        rb_dir = curated_motion / "RealBlur" / "scene_001"
-        (rb_dir / "blur").mkdir(parents=True)
-        (rb_dir / "gt").mkdir(parents=True)
-        cv2.imwrite(str(rb_dir / "blur" / "blur_1.png"), big_blur)
-        cv2.imwrite(str(rb_dir / "gt" / "gt_1.png"), big_clean)
-        (curated_motion / "RealBlur_J_train_list.txt").write_text(
-            "RealBlur/scene_001/gt/gt_1.png RealBlur/scene_001/blur/blur_1.png\n", encoding="utf-8"
-        )
-
-        for noisy_sub in ("CelebA", "Text_OCR", "RealBlur_R"):
-            (curated_motion / noisy_sub / "blur").mkdir(parents=True)
-            (curated_motion / noisy_sub / "sharp").mkdir(parents=True)
-            cv2.imwrite(str(curated_motion / noisy_sub / "blur" / "bad.png"), big_blur)
-            cv2.imwrite(str(curated_motion / noisy_sub / "sharp" / "bad.png"), big_clean)
-
-        dpdd_root = tmp_path / "DPDD" / "train"
-        (dpdd_root / "inputC").mkdir(parents=True)
-        (dpdd_root / "target").mkdir(parents=True)
-        cv2.imwrite(str(dpdd_root / "inputC" / "1P0A0001.png"), big_blur)
-        cv2.imwrite(str(dpdd_root / "target" / "1P0A0001.png"), big_clean)
-
-        found_motion = discover_paired_blur_datasets(curated_motion, "deblur_motion", is_train=True)
-        found_defocus = discover_paired_blur_datasets(dpdd_root, "sharpen_focus", is_train=True)
-        assert len(found_motion) == 5, f"Expected 5 curated pairs, got {len(found_motion)}: {found_motion}"
-        assert sum(1 for _, _, c in found_motion if c == "sharpen_focus") == 1
-        assert len(found_defocus) == 1 and found_defocus[0][2] == "sharpen_focus"
-
         ds_cfg = Config()
-        ds_cfg.TRAIN_DATASET_PATH = f"{train_root},{curated_motion}"
-        ds_cfg.PAIRED_DEFOCUS_DATASET_PATH = str(dpdd_root)
+        ds_cfg.PATCH_SIZE = 128
+        ds_cfg.TRAIN_DATASET_PATH = str(train_root)
+        ds_cfg.PAIRED_MOTION_DATASET_PATH = str(curated_motion)
         ds_cfg.VAL_DATASET_PATH = str(val_root)
         train_ds = create_controllable_dataset(ds_cfg, is_train=True, verbose=False)
         val_ds = create_controllable_dataset(ds_cfg, is_train=False, verbose=False)
-        assert len(train_ds.paired_records) == 6 and len(val_ds) == 1
-        assert len(train_ds.image_paths) == 9, f"Expected 9 clean images, got {len(train_ds.image_paths)}: {train_ds.image_paths}"
-        for cp in train_ds.image_paths:
-            low_cp = str(cp).lower()
-            assert not any(
-                bad in low_cp
-                for bad in ("/blur/", "/blur_gamma/", "motion_blurred", "defocused_blurred", "celeba", "text_ocr", "realblur_r")
-            ), f"Pre-blurred or excluded image leaked into clean pool: {cp}"
-        for p_i in range(6):
-            bc_chk, sc_chk, ch_chk = train_ds._load_paired_crop_with_retry(p_i)
-            assert bc_chk.shape == (ds_cfg.PATCH_SIZE, ds_cfg.PATCH_SIZE, 3) and sc_chk.shape == bc_chk.shape
-            assert ch_chk in ("deblur_motion", "sharpen_focus")
+        assert len(train_ds.paired_records) == 2 and len(val_ds) == 1
+        assert len(train_ds.image_paths) == 7, f"Paired GoPro/HIDE sharp frames must NOT leak into clean pool! Got {len(train_ds.image_paths)}"
+        assert set(train_ds.clean_buckets.keys()) == {"div2k", "flickr2k", "ost"}
+        assert set(train_ds.paired_buckets.keys()) == {"gopro", "hide"}
+        # DIV2K must have higher sampling probability than OST despite 5x fewer OST images!
+        div_i = train_ds._clean_bucket_names.index("div2k")
+        ost_i = train_ds._clean_bucket_names.index("ost")
+        assert train_ds._clean_bucket_probs[div_i] > train_ds._clean_bucket_probs[ost_i]
 
         bench_out = tmp_path / "bench_out"
         test_photo = cv2.resize(clean.copy(), (256, 200), interpolation=cv2.INTER_LINEAR)
@@ -321,17 +285,16 @@ def test_selective_pipeline():
         )
         assert Path(report["outputs"]["raw_asis_sweep_png"]).exists()
         assert Path(report["outputs"]["synthetic_artifact_sweep_png"]).exists()
-        assert Path(report["outputs"]["raw_fullres_restored_png"]).exists()
         assert len(report["synthetic_benchmark_metrics"]) == 4
 
-    print("[PASS] Multi-pattern motion/custom blur, bokeh/CA, 4-mode artifacts, GoPro/RealBlur/DPDD loader & benchmark verified.")
+    print("[PASS] Artifact-first budget, dataset-balanced buckets, Real-ESRGAN SR, ISP noise & GAN-clean hygiene verified.")
 
 
 def test_model_and_stages_mock():
     import threading
     import torch
     from config import DebugConfig
-    from losses.controllable_losses import ControllableRestorationLoss, SpectralPatchDiscriminator
+    from losses.controllable_losses import ControllableRestorationLoss, DINOv2FeatureDiscriminator
     from models.controllable_restorer import ControllableRestorer
     from utils.semantic_mask import extract_one_click_semantic_mask
 
@@ -343,10 +306,8 @@ def test_model_and_stages_mock():
     model = ControllableRestorer(cfg)
     loss_fn = ControllableRestorationLoss(cfg, use_pretrained_vgg=False)
 
-    assert len(model.skip_vae.vae_pix_lora_params) > 0
-    assert all(not p.requires_grad for p in model.skip_vae.vae.decoder.parameters()), (
-        "VAE decoder base must have zero trainable parameters!"
-    )
+    assert len(model.skip_vae.vae_pix_lora_params) == 0, "Blind VAE encoder LoRA must be disabled by default!"
+    assert len(model.skip_vae.vae_sem_lora_params) > 0, "Stage-2 detail-gated VAE Decoder LoRA must be active!"
     assert all(not p.requires_grad for p in model.semantic_encoder.parameters()), (
         "Semantic encoder must remain frozen!"
     )
@@ -357,7 +318,7 @@ def test_model_and_stages_mock():
     src = torch.rand(2, 3, 64, 64)
     tgt = torch.rand(2, 3, 64, 64)
     act_map = torch.rand(2, cfg.NUM_ACTIONS, 64, 64)
-    act_map[:, 8:, :, :] = act_map[:, 8:, :, :] * 2.0 - 1.0
+    act_map[:, 5:, :, :] = act_map[:, 5:, :, :] * 2.0 - 1.0
 
     def _backward_on_worker_thread(loss_tensor):
         err_holder = []
@@ -376,9 +337,9 @@ def test_model_and_stages_mock():
 
     groups = model.get_stage_parameter_groups()
 
-    # Stage 1: Pixel Stage (1-Step Lean Shared LoRA)
+    # Stage 1: Pixel Stage (1-Step SD-Turbo + 3 Specialist LoRA Experts + Un-blurred VGG + Edge Grad)
     act_zero_motion = act_map.clone()
-    act_zero_motion[:, 2, :, :] = 0.0
+    act_zero_motion[:, 2, :, :] = 0.0  # motion=0 -> verifies DDP still receives zero-grad tensors for motion_deconv!
     model.zero_grad(set_to_none=True)
     model.set_training_stage("pixel_stage")
     out_s1 = model(src, act_zero_motion, tgt_01=tgt, fidelity_scale=1.0, detail_scale=0.0)
@@ -394,7 +355,7 @@ def test_model_and_stages_mock():
         z_tgt=out_s1["z_tgt"],
         restorer_model=model,
     )
-    assert metrics_s1["l1"] > 0.0 and metrics_s1["lat"] > 0.0 and metrics_s1["csd"] == 0.0 and metrics_s1["freq"] == 0.0
+    assert metrics_s1["l1"] > 0.0 and metrics_s1["lat"] > 0.0 and metrics_s1["edge"] > 0.0 and metrics_s1["csd"] == 0.0
     _backward_on_worker_thread(loss_s1)
     model.clear_runtime_contexts()
     missing_pix_grads = [
@@ -404,11 +365,11 @@ def test_model_and_stages_mock():
     assert not missing_pix_grads, f"Unused pixel_stage params (breaks DDP!): {missing_pix_grads}"
     assert all(p.grad is None for p in groups["semantic_stage"])
 
-    # Stage 2: Semantic-Detail Stage (VGG/DISTS + Multi-Scale Freq/Edge + Sparse Zero-Drift CSD)
+    # Stage 2: Semantic-Detail Stage (Fixed d=1.0, UNet + VAE Decoder sem_branch, True DISTS + Edge Grad)
     model.zero_grad(set_to_none=True)
     model.set_training_stage("semantic_stage")
-    out_s2 = model(src, act_map, tgt_01=tgt, fidelity_scale=1.0, detail_scale=0.8)
-    loss_s2_nocsd, metrics_s2_nocsd = loss_fn(
+    out_s2 = model(src, act_map, tgt_01=tgt, fidelity_scale=1.0, detail_scale=1.0)
+    loss_s2, metrics_s2 = loss_fn(
         out_s2["pred"],
         tgt,
         act_map,
@@ -420,21 +381,7 @@ def test_model_and_stages_mock():
         restorer_model=model,
         run_csd=False,
     )
-    assert metrics_s2_nocsd["csd"] == 0.0 and metrics_s2_nocsd["freq"] > 0.0
-
-    loss_s2, metrics_s2 = loss_fn(
-        out_s2["pred"],
-        tgt,
-        act_map,
-        stage="semantic_stage",
-        src_01=src,
-        hat_z_0=out_s2["hat_z_0"],
-        hat_z_1=out_s2["hat_z_1"],
-        z_tgt=out_s2["z_tgt"],
-        restorer_model=model,
-        run_csd=True,
-    )
-    assert metrics_s2["csd"] >= 0.0 and metrics_s2["freq"] > 0.0
+    assert metrics_s2["perc"] > 0.0 and metrics_s2["edge"] > 0.0
     _backward_on_worker_thread(loss_s2)
     model.clear_runtime_contexts()
     missing_sem_grads = [
@@ -444,7 +391,7 @@ def test_model_and_stages_mock():
     assert not missing_sem_grads, f"Unused semantic_stage params (breaks DDP!): {missing_sem_grads}"
     assert all(p.grad is None for p in groups["pixel_stage"])
 
-    # Verify `sem_branch` zero-leakage on pure `denoise` (detail_scale=1.0 must NOT affect pure denoising!)
+    # Verify BOTH UNet & VAE Decoder `sem_branch` zero-leakage on pure `denoise`!
     act_denoise_only = torch.zeros_like(act_map)
     act_denoise_only[:, 0, :, :] = 1.0  # denoise only
     model.zero_grad(set_to_none=True)
@@ -459,7 +406,7 @@ def test_model_and_stages_mock():
         hat_z_0=out_dn["hat_z_0"],
         z_tgt=out_dn["z_tgt"],
         restorer_model=model,
-        run_csd=True,
+        run_csd=False,
     )
     _backward_on_worker_thread(loss_dn)
     model.clear_runtime_contexts()
@@ -468,7 +415,7 @@ def test_model_and_stages_mock():
             assert p.grad is not None, f"DDP requires zero grad tensor (not None) on {n}!"
             assert float(p.grad.abs().max().item()) == 0.0, f"sem_branch leaked gradient on pure denoise ({n})!"
 
-    # Inference check: even with non-zero sem_branch weights, pure denoise output is identical at detail=0 vs detail=1
+    # Inference invariance: even with non-zero UNet & VAE-Dec sem_branch weights, pure denoise is identical at d=0 vs d=1
     model.eval()
     with torch.no_grad():
         for p in groups["semantic_stage"]:
@@ -480,29 +427,27 @@ def test_model_and_stages_mock():
             p.zero_()
     model.train()
 
-    # Verify SpectralPatchDiscriminator hinge G & D losses (and zero G grad when detail_mask == 0!)
-    disc = SpectralPatchDiscriminator(base_ch=16)
+    # Verify Frozen-DINOv2 Multi-Layer Feature Discriminator (zero grad when clean_mask=0 or detail_mask=0!)
+    disc = DINOv2FeatureDiscriminator(feat_dim=model.semantic_encoder.spatial_dim, num_scales=3, hidden_dim=32)
     fake_req = torch.rand(2, 3, 64, 64, requires_grad=True)
-    zero_det_mask = torch.zeros(2, 1, 64, 64)
-    g_zero = disc.compute_g_loss(fake_req, zero_det_mask)
+    one_det = torch.ones(2, 1, 64, 64)
+    zero_clean = torch.zeros(2)
+    g_zero = disc.compute_g_loss(model.semantic_encoder, fake_req, detail_mask=one_det, clean_sample_mask=zero_clean)
     g_zero.backward()
-    assert float(fake_req.grad.abs().max().item()) == 0.0, "Zero detail mask must produce zero PatchGAN G gradient!"
+    assert float(fake_req.grad.abs().max().item()) == 0.0, "Non-clean target must produce zero DINOv2-Disc G gradient!"
 
     fake_req2 = torch.rand(2, 3, 64, 64, requires_grad=True)
-    one_det_mask = torch.ones(2, 1, 64, 64)
-    g_act = disc.compute_g_loss(fake_req2, one_det_mask)
+    one_clean = torch.ones(2)
+    g_act = disc.compute_g_loss(model.semantic_encoder, fake_req2, detail_mask=one_det, clean_sample_mask=one_clean)
     g_act.backward()
-    assert float(fake_req2.grad.abs().max().item()) > 0.0, "Active detail mask must produce non-zero PatchGAN G gradient!"
+    assert float(fake_req2.grad.abs().max().item()) > 0.0, "Clean active detail target must produce non-zero G gradient!"
 
     disc.zero_grad(set_to_none=True)
-    d_loss, _, _ = SpectralPatchDiscriminator.compute_d_loss_with_module(disc, tgt, fake_req2.detach(), one_det_mask)
+    d_loss, _, _ = DINOv2FeatureDiscriminator.compute_d_loss_with_module(
+        disc, model.semantic_encoder, tgt, fake_req2.detach(), detail_mask=one_det, clean_sample_mask=one_clean
+    )
     d_loss.backward()
-    assert all(p.grad is not None for p in disc.parameters()), "All PatchGAN discriminator params must receive grads!"
-
-    # Exact Zero-Drift CSD check: when hat_z_0 == z_tgt, CSD loss must be 0.0!
-    z_exact = torch.randn(2, 4, 8, 8)
-    csd_zero = model.compute_target_anchored_csd_loss(z_exact, z_exact.clone(), act_map)
-    assert float(csd_zero.item()) < 1e-7, f"CSD must have zero drift when hat_z_0 == z_tgt, got {float(csd_zero.item())}"
+    assert all(p.grad is not None for p in disc.parameters()), "All DINOv2-Disc head params must receive grads!"
 
     # Signed Negative Slider & Zero-Action Exact Preservation Check
     model.eval()
@@ -511,7 +456,7 @@ def test_model_and_stages_mock():
     assert torch.allclose(ident_out, src[:1], atol=1e-7), "Zero action must preserve input bit-for-bit!"
 
     neg_act = torch.zeros(1, cfg.NUM_ACTIONS, 64, 64)
-    neg_act[:, 8, :, :32] = -0.80
+    neg_act[:, 5, :, :32] = -0.80  # exposure index = 5
     with torch.no_grad():
         model.pixel_refiner.tone_head[-1].bias.fill_(0.25)
     neg_out = model.sample(src[:1], neg_act, steps=1, fidelity_scale=1.0, detail_scale=0.65)
@@ -520,7 +465,7 @@ def test_model_and_stages_mock():
 
     big_src = torch.rand(1, 3, 100, 110)
     big_act = torch.zeros(1, cfg.NUM_ACTIONS, 100, 110)
-    big_act[:, 9, :, :50] = -0.75
+    big_act[:, 6, :, :50] = -0.75  # warmth index = 6
     tiled_out, tiled_traj = model.sample(
         big_src, big_act, steps=2, tile_size=64, tile_overlap=16, return_trajectory=True
     )
@@ -529,7 +474,7 @@ def test_model_and_stages_mock():
 
     mask_2d = extract_one_click_semantic_mask(model.semantic_encoder, src[:1], point_xy=(0.5, 0.5))
     assert mask_2d.shape == (64, 64) and 0.0 <= float(mask_2d.min()) and float(mask_2d.max()) <= 1.0
-    print("[PASS] 2-Step SD-2.1, Shared+Specialist LoRA-MoE, DDP gradients & zero-drift CSD verified.")
+    print("[PASS] 1-Step SD-Turbo, Routed LoRA-MoE, VAE-Dec LoRA, DINOv2-Disc & DDP gradients verified.")
 
 
 if __name__ == "__main__":

@@ -378,7 +378,12 @@ class DualLoRALinear(nn.Module):
 
         device = base_linear.weight.device
         in_f, out_f = base_linear.in_features, base_linear.out_features
-        self.shared_branch = _LoRABranch(in_f, out_f, rank=rank, alpha=alpha, is_conv=False, device=device)
+        if int(rank) > 0:
+            self.shared_branch: Optional[_LoRABranch] = _LoRABranch(
+                in_f, out_f, rank=int(rank), alpha=alpha, is_conv=False, device=device
+            )
+        else:
+            self.shared_branch = None
 
         self.expert_indices: Dict[str, Tuple[int, ...]] = {}
         self.pix_experts = nn.ModuleDict()
@@ -399,7 +404,8 @@ class DualLoRALinear(nn.Module):
             self.sem_branch = None
 
     def pixel_parameters(self) -> List[nn.Parameter]:
-        return list(self.shared_branch.parameters()) + list(self.pix_experts.parameters())
+        shared_p = list(self.shared_branch.parameters()) if self.shared_branch is not None else []
+        return shared_p + list(self.pix_experts.parameters())
 
     def semantic_parameters(self) -> List[nn.Parameter]:
         return list(self.sem_branch.parameters()) if self.sem_branch is not None else []
@@ -428,16 +434,19 @@ class DualLoRALinear(nn.Module):
 
         skip_zero_branches = not (self.training and torch.is_grad_enabled())
         delta = None
-        if abs(lam_pix) >= 1e-6:
-            pix_sum = self.shared_branch(x)
+        if abs(lam_pix) >= 1e-6 and (self.shared_branch is not None or len(self.pix_experts) > 0):
+            pix_sum = self.shared_branch(x) if self.shared_branch is not None else None
             for ename, expert in self.pix_experts.items():
                 route_w = _compute_linear_expert_route(
                     spatial_map, self.expert_indices[ename], tuple(x.shape), x.device
                 )
                 if skip_zero_branches and float(route_w.max().item()) < 1e-6:
                     continue
-                pix_sum = pix_sum + expert(x) * route_w.to(pix_sum.dtype)
-            delta = float(lam_pix) * pix_sum
+                exp_out = expert(x)
+                exp_term = exp_out * route_w.to(exp_out.dtype)
+                pix_sum = exp_term if pix_sum is None else (pix_sum + exp_term)
+            if pix_sum is not None:
+                delta = float(lam_pix) * pix_sum
 
         if self.sem_branch is not None and abs(lam_sem) >= 1e-6:
             if self.sem_indices and spatial_map is not None:
@@ -481,9 +490,12 @@ class DualLoRAConv2d(nn.Module):
             dilation=base_conv.dilation,
             device=device,
         )
-        self.shared_branch = _LoRABranch(
-            base_conv.in_channels, base_conv.out_channels, rank=rank, alpha=alpha, **conv_kwargs
-        )
+        if int(rank) > 0:
+            self.shared_branch: Optional[_LoRABranch] = _LoRABranch(
+                base_conv.in_channels, base_conv.out_channels, rank=int(rank), alpha=alpha, **conv_kwargs
+            )
+        else:
+            self.shared_branch = None
 
         self.expert_indices: Dict[str, Tuple[int, ...]] = {}
         self.pix_experts = nn.ModuleDict()
@@ -512,7 +524,8 @@ class DualLoRAConv2d(nn.Module):
             self.sem_branch = None
 
     def pixel_parameters(self) -> List[nn.Parameter]:
-        return list(self.shared_branch.parameters()) + list(self.pix_experts.parameters())
+        shared_p = list(self.shared_branch.parameters()) if self.shared_branch is not None else []
+        return shared_p + list(self.pix_experts.parameters())
 
     def semantic_parameters(self) -> List[nn.Parameter]:
         return list(self.sem_branch.parameters()) if self.sem_branch is not None else []
@@ -543,8 +556,8 @@ class DualLoRAConv2d(nn.Module):
         target_hw = (out.shape[-2], out.shape[-1])
         bsz = out.shape[0]
         delta = None
-        if abs(lam_pix) >= 1e-6:
-            pix_sum = self.shared_branch(x)
+        if abs(lam_pix) >= 1e-6 and (self.shared_branch is not None or len(self.pix_experts) > 0):
+            pix_sum = self.shared_branch(x) if self.shared_branch is not None else None
             for ename, expert in self.pix_experts.items():
                 route_2d = _compute_conv_expert_route(
                     spatial_map, self.expert_indices[ename], target_hw, bsz, out.device
@@ -554,8 +567,10 @@ class DualLoRAConv2d(nn.Module):
                 exp_out = expert(x)
                 if exp_out.shape[-2:] != target_hw:
                     exp_out = F.interpolate(exp_out, size=target_hw, mode="bilinear", align_corners=False)
-                pix_sum = pix_sum + exp_out * route_2d.to(pix_sum.dtype)
-            delta = float(lam_pix) * pix_sum
+                exp_term = exp_out * route_2d.to(exp_out.dtype)
+                pix_sum = exp_term if pix_sum is None else (pix_sum + exp_term)
+            if pix_sum is not None:
+                delta = float(lam_pix) * pix_sum
 
         if self.sem_branch is not None and abs(lam_sem) >= 1e-6:
             if self.sem_indices and spatial_map is not None:

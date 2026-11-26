@@ -1,22 +1,22 @@
-"""Clean 5-Term Loss Objective for 2-Stage Controllable Restoration.
+"""Crisp Phase-Aligned Loss Objective & Zero-VRAM Frozen-DINOv2 Discriminator (S3Diff / ADD Style).
 
 Stage 1 (`pixel_stage`):
-  - Charbonnier L1 (`LOSS_L1_WEIGHT`)
-  - Latent Charbonnier (`LOSS_LATENT_WEIGHT`, supports 1-step & 2-step)
-  - Light VGG LPIPS (`LOSS_PIXEL_STAGE_PERCEPTUAL_WEIGHT`)
+  - Charbonnier RGB L1 (`LOSS_L1_WEIGHT`)
+  - Latent Charbonnier (`LOSS_LATENT_WEIGHT`)
+  - Un-blurred Full-Res Multi-Layer VGG Perceptual (`LOSS_PIXEL_STAGE_PERCEPTUAL_WEIGHT`)
+  - Phase-Aligned Multi-Scale Edge Gradient L1 (`LOSS_PIXEL_STAGE_EDGE_WEIGHT`)
   - Idle-only preservation (`LOSS_PRESERVE_WEIGHT`)
 
-Stage 2 (`semantic_stage`):
-  - 4x Low-Pass Charbonnier L1 (`LOSS_SEMANTIC_STAGE_LP_L1_WEIGHT`) + light Full-Res Subpixel Anchor
-    (`LOSS_SEMANTIC_STAGE_FULL_L1_WEIGHT`) to prevent geometric jitter without suppressing micro-texture
-  - 2x Low-Pass Latent Charbonnier (`LOSS_SEMANTIC_STAGE_LATENT_LP_WEIGHT`)
-  - Full-res VGG LPIPS + DISTS Local Patch Texture (`LOSS_PERCEPTUAL_WEIGHT`)
-  - Multi-Scale Sobel Edge + High-Frequency FFT Magnitude (`LOSS_FREQ_EDGE_WEIGHT`)
-  - Sparse Zero-Drift Target-Anchored CSD (`LOSS_CSD_WEIGHT`, every `CSD_EVERY_N_STEPS` steps)
-  - Idle-only preservation (`LOSS_PRESERVE_WEIGHT`)
+Stage 2 (`semantic_stage`, trained at fixed `detail_scale = 1.0`):
+  - Structural Anchor: 2x Low-Pass Charbonnier (`LOSS_SEMANTIC_STAGE_LP_L1_WEIGHT`) +
+    Full-Res Charbonnier (`LOSS_SEMANTIC_STAGE_FULL_L1_WEIGHT`) + light Latent Anchor
+  - Un-blurred VGG + True Gaussian-Windowed DISTS WITH Structural Covariance (`LOSS_PERCEPTUAL_WEIGHT`)
+  - Phase-Aligned Multi-Scale Sobel + Laplacian Edge Gradient L1 (`LOSS_EDGE_GRAD_WEIGHT`)
+  - Frozen DINOv2 Multi-Layer Feature Discriminator (`LOSS_GAN_WEIGHT`), strictly masked to
+    100% fully restored (`s_tgt == 0`), high-resolution clean photography ONLY!
 """
 
-from typing import Dict, Iterable, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -25,7 +25,7 @@ import torchvision.models as models
 
 
 class MultiLayerVGGPerceptual(nn.Module):
-    """Full-res (`relu1_2..relu4_4`) LPIPS + optional DISTS Local Patch Texture matching."""
+    """Un-blurred full-res (`relu1_2..relu4_4`) VGG Perceptual + True Covariance-Aware DISTS."""
 
     LAYER_MAP = {
         "relu1_2": 3,
@@ -71,13 +71,50 @@ class MultiLayerVGGPerceptual(nn.Module):
 
         self.register_buffer("mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
         self.register_buffer("std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
-        k1d = torch.tensor([0.25, 0.50, 0.25], dtype=torch.float32)
-        k2d = (k1d[:, None] * k1d[None, :]).view(1, 1, 3, 3).repeat(3, 1, 1, 1)
-        self.register_buffer("aa_kernel", k2d, persistent=False)
 
-    def _antialias_rgb(self, rgb_01: torch.Tensor) -> torch.Tensor:
-        padded = F.pad(rgb_01.float(), (1, 1, 1, 1), mode="reflect")
-        return F.conv2d(padded, self.aa_kernel, groups=3)
+        # Separable 1D Gaussian kernel (window=7, sigma=1.5) for fast local-window covariance DISTS
+        coords = torch.arange(7, dtype=torch.float32) - 3.0
+        g1 = torch.exp(-(coords * coords) / (2.0 * 1.5 * 1.5))
+        g1 = g1 / g1.sum()
+        self.register_buffer("gauss_1d_h", g1.view(1, 1, 7, 1), persistent=False)
+        self.register_buffer("gauss_1d_w", g1.view(1, 1, 1, 7), persistent=False)
+
+    def _local_gauss_mean(self, feat: torch.Tensor) -> torch.Tensor:
+        """Separable 7x7 Gaussian local average per channel (handles arbitrary C cleanly)."""
+        c = feat.shape[1]
+        kh = self.gauss_1d_h.expand(c, 1, 7, 1)
+        kw = self.gauss_1d_w.expand(c, 1, 1, 7)
+        h = F.pad(feat, (0, 0, 3, 3), mode="reflect")
+        h = F.conv2d(h, kh, groups=c)
+        h = F.pad(h, (3, 3, 0, 0), mode="reflect")
+        return F.conv2d(h, kw, groups=c)
+
+    def _true_dists_map(self, x_f: torch.Tensor, y_f: torch.Tensor) -> torch.Tensor:
+        """True covariance-aware DISTS distance map `[B, 1, H, W]` locking crisp edge phase & contrast."""
+        ch_scale = y_f.abs().mean(dim=(0, 2, 3), keepdim=True).clamp(min=0.05)
+        xn = x_f / ch_scale
+        yn = y_f / ch_scale
+
+        if xn.shape[-2] >= 7 and xn.shape[-1] >= 7:
+            mu_x = self._local_gauss_mean(xn)
+            mu_y = self._local_gauss_mean(yn)
+            var_x = (self._local_gauss_mean(xn * xn) - mu_x * mu_x).clamp(min=0.0)
+            var_y = (self._local_gauss_mean(yn * yn) - mu_y * mu_y).clamp(min=0.0)
+            cov_xy = self._local_gauss_mean(xn * yn) - mu_x * mu_y
+        else:
+            mu_x = xn.mean(dim=(2, 3), keepdim=True)
+            mu_y = yn.mean(dim=(2, 3), keepdim=True)
+            var_x = ((xn - mu_x) ** 2).mean(dim=(2, 3), keepdim=True)
+            var_y = ((yn - mu_y) ** 2).mean(dim=(2, 3), keepdim=True)
+            cov_xy = ((xn - mu_x) * (yn - mu_y)).mean(dim=(2, 3), keepdim=True)
+
+        c1 = 1e-4
+        c2 = 1e-3
+        # Mean texture similarity l(x, y) and phase-locked structural covariance similarity s(x, y)
+        l_sim = (2.0 * mu_x * mu_y + c1) / (mu_x * mu_x + mu_y * mu_y + c1)
+        s_sim = (2.0 * cov_xy + c2) / (var_x + var_y + c2)
+        dists_ch = 0.35 * (1.0 - l_sim) + 0.65 * (1.0 - s_sim)
+        return dists_ch.clamp(min=0.0, max=2.0).mean(dim=1, keepdim=True)
 
     def forward(
         self,
@@ -86,11 +123,10 @@ class MultiLayerVGGPerceptual(nn.Module):
         spatial_weight: Optional[torch.Tensor] = None,
         use_dists_texture: bool = False,
     ) -> torch.Tensor:
-        p_rgb = pred_01.float() if use_dists_texture else self._antialias_rgb(pred_01)
-        x = (p_rgb - self.mean) / self.std
+        # Always full-res un-blurred RGB (never pre-blurring Stage-1 perceptual features!)
+        x = (pred_01.float() - self.mean) / self.std
         with torch.no_grad():
-            t_rgb = target_01.float() if use_dists_texture else self._antialias_rgb(target_01)
-            y_in = (t_rgb - self.mean) / self.std
+            y_in = (target_01.float() - self.mean) / self.std
 
         total_pos = pred_01.new_zeros((), dtype=torch.float32)
 
@@ -113,66 +149,54 @@ class MultiLayerVGGPerceptual(nn.Module):
                 y_unit = y_f / torch.sqrt(torch.sum(y_f * y_f, dim=1, keepdim=True) + 1e-8)
                 lpips_map = 0.5 * ((x_unit - y_unit) ** 2).sum(dim=1, keepdim=True)
 
-                if w_l is not None:
-                    pos_dist = (lpips_map * w_l).mean(dim=(1, 2, 3))
-                else:
-                    pos_dist = lpips_map.mean(dim=(1, 2, 3))
-
                 if use_dists_texture:
-                    tex_dist = pred_01.new_zeros((x_f.shape[0],), dtype=torch.float32)
-                    win_cnt = 0
-                    ch_scale = y_f.abs().mean(dim=(0, 2, 3), keepdim=True).clamp(min=0.05)
-                    xn = x_f / ch_scale
-                    yn = y_f / ch_scale
-                    for win_k, win_s in ((8, 4), (16, 8)):
-                        if xn.shape[-2] >= win_k and xn.shape[-1] >= win_k:
-                            mu_x = F.avg_pool2d(xn, kernel_size=win_k, stride=win_s)
-                            mu_y = F.avg_pool2d(yn, kernel_size=win_k, stride=win_s)
-                            var_x = (F.avg_pool2d(xn * xn, kernel_size=win_k, stride=win_s) - mu_x * mu_x).clamp(min=0.0)
-                            var_y = (F.avg_pool2d(yn * yn, kernel_size=win_k, stride=win_s) - mu_y * mu_y).clamp(min=0.0)
-                            std_x = torch.sqrt(var_x + 1e-6)
-                            std_y = torch.sqrt(var_y + 1e-6)
-                            patch_err = (0.30 * (mu_x - mu_y).abs() + 0.70 * (std_x - std_y).abs()).mean(
-                                dim=1, keepdim=True
-                            )
-                            if spatial_weight is not None:
-                                w_p = F.adaptive_avg_pool2d(spatial_weight.float(), output_size=patch_err.shape[-2:])
-                                w_p = w_p / w_p.mean(dim=(2, 3), keepdim=True).clamp(min=1e-4)
-                                tex_dist = tex_dist + (patch_err * w_p).mean(dim=(1, 2, 3))
-                            else:
-                                tex_dist = tex_dist + patch_err.mean(dim=(1, 2, 3))
-                            win_cnt += 1
-                    if win_cnt > 0:
-                        pos_dist = 0.40 * pos_dist + 0.60 * (tex_dist / float(win_cnt))
+                    dists_map = self._true_dists_map(x_f, y_f)
+                    if dists_map.shape[-2:] != lpips_map.shape[-2:]:
+                        dists_map = F.interpolate(
+                            dists_map, size=lpips_map.shape[-2:], mode="bilinear", align_corners=False
+                        )
+                    comb_map = 0.40 * lpips_map + 0.60 * dists_map
+                else:
+                    comb_map = lpips_map
+
+                if w_l is not None:
+                    pos_dist = (comb_map * w_l).mean(dim=(1, 2, 3))
+                else:
+                    pos_dist = comb_map.mean(dim=(1, 2, 3))
 
                 total_pos = total_pos + sw * pos_dist.mean()
 
         return total_pos
 
 
-class MultiScaleFreqEdgeLoss(nn.Module):
-    """Phase-invariant multi-scale high-frequency FFT log-magnitude loss (sharpens texture without 1px phase lock)."""
+class MultiScaleEdgeGradientLoss(nn.Module):
+    """Phase-aligned multi-scale signed Sobel X/Y + Laplacian edge loss (crisp edges, zero smear)."""
 
     def __init__(self):
         super().__init__()
-        self.register_buffer("luma_w", torch.tensor([0.299, 0.587, 0.114], dtype=torch.float32).view(1, 3, 1, 1), persistent=False)
+        self.register_buffer(
+            "luma_w",
+            torch.tensor([0.299, 0.587, 0.114], dtype=torch.float32).view(1, 3, 1, 1),
+            persistent=False,
+        )
+        sobel_x = torch.tensor([[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]], dtype=torch.float32) / 4.0
+        sobel_y = sobel_x.t().contiguous()
+        lap = torch.tensor([[0.0, -1.0, 0.0], [-1.0, 4.0, -1.0], [0.0, -1.0, 0.0]], dtype=torch.float32) / 4.0
+        kernels = torch.stack([sobel_x, sobel_y, lap], dim=0).unsqueeze(1)  # [3, 1, 3, 3]
+        self.register_buffer("edge_kernels", kernels, persistent=False)
 
-    def _to_luma(self, rgb_01: torch.Tensor) -> torch.Tensor:
-        return (rgb_01.float() * self.luma_w).sum(dim=1, keepdim=True)
-
-    @staticmethod
-    def _fft_hf_l1(p_y: torch.Tensor, t_y: torch.Tensor) -> torch.Tensor:
-        fp = torch.fft.rfft2(p_y, norm="ortho")
-        ft = torch.fft.rfft2(t_y, norm="ortho")
-        mag_p = torch.log1p(torch.sqrt(fp.real * fp.real + fp.imag * fp.imag + 1e-8))
-        mag_t = torch.log1p(torch.sqrt(ft.real * ft.real + ft.imag * ft.imag + 1e-8))
-
-        fh, fw = mag_p.shape[-2], mag_p.shape[-1]
-        fy = torch.fft.fftfreq(p_y.shape[-2], device=p_y.device, dtype=torch.float32).abs() * 2.0
-        fx = torch.fft.rfftfreq(p_y.shape[-1], device=p_y.device, dtype=torch.float32).abs() * 2.0
-        rad = torch.sqrt(fy[:, None] ** 2 + fx[None, :] ** 2).clamp(0.0, 1.0)
-        freq_w = (0.15 + 0.85 * rad).view(1, 1, fh, fw)
-        return ((mag_p - mag_t).abs() * freq_w).mean()
+    def _edge_loss_single_scale(
+        self,
+        p_y: torch.Tensor,
+        t_y: torch.Tensor,
+        w_map: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        gp = F.conv2d(F.pad(p_y, (1, 1, 1, 1), mode="reflect"), self.edge_kernels)
+        gt = F.conv2d(F.pad(t_y, (1, 1, 1, 1), mode="reflect"), self.edge_kernels)
+        diff = torch.sqrt((gp - gt) ** 2 + 1e-6)
+        if w_map is not None:
+            return (diff * w_map).mean()
+        return diff.mean()
 
     def forward(
         self,
@@ -181,100 +205,150 @@ class MultiScaleFreqEdgeLoss(nn.Module):
         spatial_weight: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         with torch.amp.autocast(device_type=pred_01.device.type, enabled=False):
-            p_y = self._to_luma(pred_01)
-            t_y = self._to_luma(target_01.detach())
+            p_y = (pred_01.float() * self.luma_w).sum(dim=1, keepdim=True)
+            t_y = (target_01.detach().float() * self.luma_w).sum(dim=1, keepdim=True)
 
             if spatial_weight is not None:
-                w_fft = F.adaptive_avg_pool2d(spatial_weight.float(), output_size=p_y.shape[-2:])
-                w_fft = w_fft / w_fft.mean(dim=(2, 3), keepdim=True).clamp(min=1e-4)
-                p_in = p_y * w_fft
-                t_in = t_y * w_fft
+                w1 = F.adaptive_avg_pool2d(spatial_weight.float(), output_size=p_y.shape[-2:])
+                w1 = w1 / w1.mean(dim=(2, 3), keepdim=True).clamp(min=1e-4)
             else:
-                p_in, t_in = p_y, t_y
+                w1 = None
 
-            loss = self._fft_hf_l1(p_in, t_in)
-            if p_in.shape[-2] >= 32 and p_in.shape[-1] >= 32:
-                p_half = F.avg_pool2d(p_in, kernel_size=2, stride=2)
-                t_half = F.avg_pool2d(t_in, kernel_size=2, stride=2)
-                loss = 0.65 * loss + 0.35 * self._fft_hf_l1(p_half, t_half)
+            loss = self._edge_loss_single_scale(p_y, t_y, w1)
+            if p_y.shape[-2] >= 32 and p_y.shape[-1] >= 32:
+                p_half = F.avg_pool2d(p_y, kernel_size=2, stride=2)
+                t_half = F.avg_pool2d(t_y, kernel_size=2, stride=2)
+                w2 = F.avg_pool2d(w1, kernel_size=2, stride=2) if w1 is not None else None
+                loss = 0.65 * loss + 0.35 * self._edge_loss_single_scale(p_half, t_half, w2)
             return loss
 
 
-class SpectralPatchDiscriminator(nn.Module):
-    """Lightweight Spectral-Norm Hinge PatchGAN (~2.7M params) for Stage-2 photographic sharpness.
+# Backward-compatible symbol alias
+MultiScaleFreqEdgeLoss = MultiScaleEdgeGradientLoss
 
-    Runs in FP32 (~4ms/step on T4) and masks generator gradients strictly to active `DETAIL_ACTION_TYPES`
-    regions so pure `denoise`/tone pixels never receive adversarial texture push.
+
+class DINOv2FeatureDiscriminator(nn.Module):
+    """Zero-extra-backbone-VRAM Frozen-DINOv2 Multi-Layer Feature Discriminator (S3Diff / SD-Turbo ADD style).
+
+    Attaches lightweight Spectral-Norm 2D conv heads onto 3 multi-depth spatial patch grids extracted
+    from the already-loaded frozen `SemanticEncoder` (DINOv2-with-Registers). Unlike a scratch pixel
+    PatchGAN, it already understands crisp photographic realism from step 1 and is strictly masked
+    to 100% clean, fully restored (`s_tgt == 0`), high-res ground-truth targets!
     """
 
-    def __init__(self, in_channels: int = 3, base_ch: int = 64):
+    def __init__(self, feat_dim: int = 768, num_scales: int = 3, hidden_dim: int = 192):
         super().__init__()
+        self.feat_dim = int(feat_dim)
+        self.num_scales = max(1, int(num_scales))
         sn = nn.utils.spectral_norm
-        self.net = nn.Sequential(
-            sn(nn.Conv2d(in_channels, base_ch, kernel_size=4, stride=2, padding=1)),
-            nn.LeakyReLU(0.2, inplace=True),
-            sn(nn.Conv2d(base_ch, base_ch * 2, kernel_size=4, stride=2, padding=1)),
-            nn.LeakyReLU(0.2, inplace=True),
-            sn(nn.Conv2d(base_ch * 2, base_ch * 4, kernel_size=4, stride=2, padding=1)),
-            nn.LeakyReLU(0.2, inplace=True),
-            sn(nn.Conv2d(base_ch * 4, base_ch * 8, kernel_size=4, stride=1, padding=1)),
-            nn.LeakyReLU(0.2, inplace=True),
-            sn(nn.Conv2d(base_ch * 8, 1, kernel_size=4, stride=1, padding=1)),
+        self.heads = nn.ModuleList(
+            [
+                nn.Sequential(
+                    sn(nn.Conv2d(self.feat_dim, hidden_dim, kernel_size=3, stride=1, padding=1)),
+                    nn.LeakyReLU(0.2, inplace=True),
+                    sn(nn.Conv2d(hidden_dim, hidden_dim // 2, kernel_size=3, stride=1, padding=1)),
+                    nn.LeakyReLU(0.2, inplace=True),
+                    sn(nn.Conv2d(hidden_dim // 2, 1, kernel_size=1, stride=1, padding=0)),
+                )
+                for _ in range(self.num_scales)
+            ]
         )
 
-    def forward(self, rgb_01: torch.Tensor) -> torch.Tensor:
-        with torch.amp.autocast(device_type=rgb_01.device.type, enabled=False):
-            x = rgb_01.float() * 2.0 - 1.0
-            return self.net(x)
+    def forward(self, grids: List[torch.Tensor]) -> List[torch.Tensor]:
+        outs: List[torch.Tensor] = []
+        for idx, head in enumerate(self.heads):
+            g = grids[min(idx, len(grids) - 1)]
+            with torch.amp.autocast(device_type=g.device.type, enabled=False):
+                outs.append(head(g.float()))
+        return outs
 
     @staticmethod
-    def _resize_mask(mask: Optional[torch.Tensor], target_hw: Tuple[int, int]) -> Optional[torch.Tensor]:
-        if mask is None:
-            return None
-        m = mask.float().clamp(0.0, 1.0)
-        if m.shape[-2:] != target_hw:
-            m = F.adaptive_avg_pool2d(m, output_size=target_hw)
+    def _combine_masks(
+        target_hw: Tuple[int, int],
+        detail_mask: Optional[torch.Tensor],
+        clean_sample_mask: Optional[torch.Tensor],
+        bsz: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        if detail_mask is not None:
+            m = detail_mask.float().clamp(0.0, 1.0)
+            if m.shape[-2:] != target_hw:
+                m = F.adaptive_avg_pool2d(m, output_size=target_hw)
+        else:
+            m = torch.ones((bsz, 1, target_hw[0], target_hw[1]), device=device, dtype=torch.float32)
+
+        if clean_sample_mask is not None:
+            cm = clean_sample_mask.to(device=device, dtype=torch.float32).view(bsz, 1, 1, 1).clamp(0.0, 1.0)
+            m = m * cm
         return m
 
     def compute_g_loss(
         self,
+        semantic_encoder: nn.Module,
         fake_01: torch.Tensor,
         detail_mask: Optional[torch.Tensor] = None,
+        clean_sample_mask: Optional[torch.Tensor] = None,
+        max_size: int = 252,
     ) -> torch.Tensor:
-        """Generator hinge loss (-E[D(fake)]) gated strictly to active detail regions."""
-        logits = self.forward(fake_01)
-        m = self._resize_mask(detail_mask, logits.shape[-2:])
-        if m is not None:
-            return -(logits * m).mean()
-        return -logits.mean()
+        """Generator Hinge GAN loss (`-E[D(fake)]`) gated strictly to clean fully-restored detail regions."""
+        grids = semantic_encoder.extract_discriminator_grids(fake_01, max_size=max_size, enable_grad=True)
+        logits_list = self.forward(grids)
+        bsz = fake_01.shape[0]
+        total = fake_01.new_zeros((), dtype=torch.float32)
+        for logits in logits_list:
+            m = self._combine_masks(logits.shape[-2:], detail_mask, clean_sample_mask, bsz, logits.device)
+            m_sum = m.sum()
+            if float(m_sum.item()) > 1e-4:
+                total = total + (-(logits * m).sum() / m_sum.clamp(min=1.0))
+            else:
+                total = total + (logits * 0.0).mean()
+        return total / float(len(logits_list))
 
     @classmethod
     def compute_d_loss_with_module(
         cls,
         disc_module: nn.Module,
+        semantic_encoder: nn.Module,
         real_01: torch.Tensor,
         fake_01_detached: torch.Tensor,
         detail_mask: Optional[torch.Tensor] = None,
+        clean_sample_mask: Optional[torch.Tensor] = None,
+        max_size: int = 252,
     ) -> Tuple[torch.Tensor, float, float]:
-        """Single-pass DDP-safe hinge discriminator loss (concatenates real+fake to avoid double SN buffer update)."""
+        """Single-pass DDP-safe Hinge D loss strictly on clean high-res fully-restored targets."""
+        bsz = real_01.shape[0]
         cat_x = torch.cat([real_01.detach(), fake_01_detached.detach()], dim=0)
-        cat_logits = disc_module(cat_x)
-        d_real, d_fake = cat_logits.chunk(2, dim=0)
+        with torch.no_grad():
+            cat_grids = semantic_encoder.extract_discriminator_grids(cat_x, max_size=max_size, enable_grad=False)
+        cat_logits_list = disc_module(cat_grids)
 
-        m = cls._resize_mask(detail_mask, d_real.shape[-2:])
-        if m is not None:
-            w = 0.15 + 0.85 * m
-            loss_real = (F.relu(1.0 - d_real) * w).mean()
-            loss_fake = (F.relu(1.0 + d_fake) * w).mean()
-        else:
-            loss_real = F.relu(1.0 - d_real).mean()
-            loss_fake = F.relu(1.0 + d_fake).mean()
-        loss_d = 0.5 * (loss_real + loss_fake)
-        return loss_d, float(d_real.detach().mean().item()), float(d_fake.detach().mean().item())
+        loss_d_total = real_01.new_zeros((), dtype=torch.float32)
+        real_mean_acc = 0.0
+        fake_mean_acc = 0.0
+        for cat_logits in cat_logits_list:
+            d_real, d_fake = cat_logits.chunk(2, dim=0)
+            m = cls._combine_masks(d_real.shape[-2:], detail_mask, clean_sample_mask, bsz, d_real.device)
+            m_sum = m.sum()
+            if float(m_sum.item()) > 1e-4:
+                loss_real = (F.relu(1.0 - d_real) * m).sum() / m_sum.clamp(min=1.0)
+                loss_fake = (F.relu(1.0 + d_fake) * m).sum() / m_sum.clamp(min=1.0)
+                loss_d_total = loss_d_total + 0.5 * (loss_real + loss_fake)
+            else:
+                # Zero-weight touch keeps all DDP discriminator heads synchronized without corrupting weights!
+                loss_d_total = loss_d_total + (d_real * 0.0 + d_fake * 0.0).mean()
+            real_mean_acc += float(d_real.detach().mean().item())
+            fake_mean_acc += float(d_fake.detach().mean().item())
+
+        n_sc = float(len(cat_logits_list))
+        return loss_d_total / n_sc, real_mean_acc / n_sc, fake_mean_acc / n_sc
+
+
+# Backward-compatible symbol alias
+SpectralPatchDiscriminator = DINOv2FeatureDiscriminator
 
 
 class ControllableRestorationLoss(nn.Module):
-    """Clean 5-term controllable restoration objective (Charbonnier, Latent, VGG/DISTS, Freq/Edge, Idle + Sparse CSD)."""
+    """Crisp phase-aligned 2-stage objective (Charbonnier, Latent, Un-blurred VGG/True-DISTS, Edge Grad, Idle)."""
 
     def __init__(self, config, use_pretrained_vgg: bool = True):
         super().__init__()
@@ -285,7 +359,8 @@ class ControllableRestorationLoss(nn.Module):
             layers=getattr(config, "PERCEPTUAL_LAYERS", ["relu1_2", "relu2_2", "relu3_4", "relu4_4"]),
             use_pretrained=use_vgg,
         )
-        self.freq_edge = MultiScaleFreqEdgeLoss()
+        self.edge_grad = MultiScaleEdgeGradientLoss()
+        self.freq_edge = self.edge_grad  # Backward-compatible attribute alias
 
         b1d = torch.tensor([1.0, 4.0, 6.0, 4.0, 1.0], dtype=torch.float32) / 16.0
         b2d = (b1d[:, None] * b1d[None, :]).view(1, 1, 5, 5).repeat(3, 1, 1, 1)
@@ -295,10 +370,9 @@ class ControllableRestorationLoss(nn.Module):
         padded = F.pad(rgb, (2, 2, 2, 2), mode="reflect")
         return F.conv2d(padded, self.gauss5_kernel, groups=3)
 
-    def _lowpass_4x(self, rgb_01: torch.Tensor) -> torch.Tensor:
-        """Anti-aliased 4x low-pass structural filter (locks shapes & color while freeing 1-3px detail)."""
-        h = self._gaussian_blur5(rgb_01.float())[:, :, ::2, ::2]
-        return self._gaussian_blur5(h)[:, :, ::2, ::2]
+    def _lowpass_2x(self, rgb_01: torch.Tensor) -> torch.Tensor:
+        """Anti-aliased 2x low-pass structural anchor (locks exact shapes & colors while freeing 1px detail)."""
+        return self._gaussian_blur5(rgb_01.float())[:, :, ::2, ::2]
 
     @staticmethod
     def _build_spatial_focus_weight(action_map: torch.Tensor) -> torch.Tensor:
@@ -362,13 +436,13 @@ class ControllableRestorationLoss(nn.Module):
         spatial_w = self._build_spatial_focus_weight(action_map)
 
         if is_detail_stage and pred_01.shape[-2] >= 16 and pred_01.shape[-1] >= 16:
-            pred_lp4 = self._lowpass_4x(pred_01)
-            tgt_lp4 = self._lowpass_4x(target_01)
-            w_lp4 = F.adaptive_avg_pool2d(spatial_w, output_size=pred_lp4.shape[-2:])
-            w_lp4 = w_lp4 / w_lp4.mean(dim=(2, 3), keepdim=True).clamp(min=1e-4)
-            loss_l1_lp = self.charbonnier_loss(pred_lp4, tgt_lp4, w_lp4)
-            full_w = float(getattr(self.config, "LOSS_SEMANTIC_STAGE_FULL_L1_WEIGHT", 0.15))
-            lp_w = float(getattr(self.config, "LOSS_SEMANTIC_STAGE_LP_L1_WEIGHT", 0.70))
+            pred_lp2 = self._lowpass_2x(pred_01)
+            tgt_lp2 = self._lowpass_2x(target_01)
+            w_lp2 = F.adaptive_avg_pool2d(spatial_w, output_size=pred_lp2.shape[-2:])
+            w_lp2 = w_lp2 / w_lp2.mean(dim=(2, 3), keepdim=True).clamp(min=1e-4)
+            loss_l1_lp = self.charbonnier_loss(pred_lp2, tgt_lp2, w_lp2)
+            full_w = float(getattr(self.config, "LOSS_SEMANTIC_STAGE_FULL_L1_WEIGHT", 0.20))
+            lp_w = float(getattr(self.config, "LOSS_SEMANTIC_STAGE_LP_L1_WEIGHT", 0.35))
             if full_w > 0.0:
                 loss_l1_full = self.charbonnier_loss(pred_01, target_01, spatial_w)
                 l1_term = lp_w * loss_l1_lp + full_w * loss_l1_full
@@ -406,15 +480,20 @@ class ControllableRestorationLoss(nn.Module):
         )
 
         lat_weight = (
-            float(getattr(self.config, "LOSS_SEMANTIC_STAGE_LATENT_LP_WEIGHT", 0.25))
+            float(getattr(self.config, "LOSS_SEMANTIC_STAGE_LATENT_LP_WEIGHT", 0.10))
             if is_detail_stage
-            else float(getattr(self.config, "LOSS_LATENT_WEIGHT", 0.50))
+            else float(getattr(self.config, "LOSS_LATENT_WEIGHT", 0.25))
         )
         preserve_weight = float(getattr(self.config, "LOSS_PRESERVE_WEIGHT", 0.50))
         perc_w = (
-            float(getattr(self.config, "LOSS_PIXEL_STAGE_PERCEPTUAL_WEIGHT", 0.10))
+            float(getattr(self.config, "LOSS_PIXEL_STAGE_PERCEPTUAL_WEIGHT", 0.35))
             if stage == "pixel_stage"
             else float(self.config.LOSS_PERCEPTUAL_WEIGHT)
+        )
+        edge_w = (
+            float(getattr(self.config, "LOSS_PIXEL_STAGE_EDGE_WEIGHT", 0.25))
+            if stage == "pixel_stage"
+            else float(getattr(self.config, "LOSS_EDGE_GRAD_WEIGHT", getattr(self.config, "LOSS_FREQ_EDGE_WEIGHT", 0.35)))
         )
 
         total = l1_term + lat_weight * loss_latent + preserve_weight * loss_preserve
@@ -430,11 +509,10 @@ class ControllableRestorationLoss(nn.Module):
             )
             total = total + perc_w * loss_perc
 
-        loss_freq = pred_01.new_zeros((), dtype=torch.float32)
-        freq_w = float(getattr(self.config, "LOSS_FREQ_EDGE_WEIGHT", 0.35))
-        if stage in ("semantic_stage", "joint") and freq_w > 0.0:
-            loss_freq = self.freq_edge(pred_01, target_01, spatial_weight=spatial_w)
-            total = total + freq_w * loss_freq
+        loss_edge = pred_01.new_zeros((), dtype=torch.float32)
+        if edge_w > 0.0:
+            loss_edge = self.edge_grad(pred_01, target_01, spatial_weight=spatial_w)
+            total = total + edge_w * loss_edge
 
         loss_csd = pred_01.new_zeros((), dtype=torch.float32)
         csd_w = float(getattr(self.config, "LOSS_CSD_WEIGHT", 0.0))
@@ -453,7 +531,8 @@ class ControllableRestorationLoss(nn.Module):
             "l1": float(loss_l1.detach().item()),
             "lat": float(loss_latent.detach().item()),
             "perc": float(loss_perc.detach().item()),
-            "freq": float(loss_freq.detach().item()),
+            "edge": float(loss_edge.detach().item()),
+            "freq": float(loss_edge.detach().item()),
             "pres": float(loss_preserve.detach().item()),
             "csd": float(loss_csd.detach().item()),
             "total": float(total.detach().item()),

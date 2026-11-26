@@ -697,7 +697,7 @@ class ControllableRestorer(nn.Module):
             + list(self.pixel_refiner.pixel_stage_parameters())
             + [self.velocity_scale]
         )
-        semantic_params = list(self.unet_sem_lora_params)
+        semantic_params = list(self.unet_sem_lora_params) + list(self.skip_vae.vae_sem_lora_params)
         return {
             "pixel_stage": pixel_params,
             "semantic_stage": semantic_params,
@@ -789,11 +789,11 @@ class ControllableRestorer(nn.Module):
         num_sched = int(self.alphas_cumprod.numel())
         raw = getattr(self.config, "RESTORATION_TIMESTEPS", None)
         if raw is None:
-            raw = (int(getattr(self.config, "RESTORATION_TIMESTEP", 199)),)
+            raw = (int(getattr(self.config, "RESTORATION_TIMESTEP", 499)),)
         elif isinstance(raw, int):
             raw = (raw,)
         steps = tuple(max(1, min(num_sched - 1, int(t))) for t in raw)
-        return steps if steps else (min(199, num_sched - 1),)
+        return steps if steps else (min(499, num_sched - 1),)
 
     def _predict_clean_latent(
         self,
@@ -804,6 +804,7 @@ class ControllableRestorer(nn.Module):
         detail_scale: float,
         timestep_val: int,
     ) -> torch.Tensor:
+        """Exact 1-step DDPMScheduler pred_original_sample (pix2pix-turbo / S3Diff / OSEDiff)."""
         bsz = z_t.shape[0]
         num_sched = int(self.alphas_cumprod.numel())
         t_val = max(1, min(num_sched - 1, int(timestep_val)))
@@ -817,11 +818,10 @@ class ControllableRestorer(nn.Module):
         alpha_bar = abar_table.index_select(0, t_unet).view(-1, 1, 1, 1).float()
         sqrt_alpha_bar = torch.sqrt(alpha_bar.clamp(min=1e-6))
         sqrt_one_minus = torch.sqrt((1.0 - alpha_bar).clamp(min=0.0))
-        sigma_t = sqrt_one_minus / sqrt_alpha_bar
 
+        # Feed unit-variance latent `z_t` directly into UNet (matches SD-Turbo / S3Diff / pix2pix-turbo!)
         unet_dtype = infer_module_dtype(self.unet, fallback=z_t.dtype)
-        z_scaled = z_t.float() if self.prediction_type == "sample" else (sqrt_alpha_bar * z_t.float())
-        z_in = z_scaled.to(unet_dtype)
+        z_in = z_t.to(unet_dtype)
         if self.training and torch.is_grad_enabled() and not z_in.requires_grad:
             z_in = z_in.detach().requires_grad_(True)
 
@@ -839,12 +839,12 @@ class ControllableRestorer(nn.Module):
                 ).sample.float()
 
         if self.prediction_type == "v_prediction":
-            return alpha_bar * z_t.float() - sqrt_one_minus * (self.velocity_scale * raw_pred)
+            return sqrt_alpha_bar * z_t.float() - sqrt_one_minus * (self.velocity_scale * raw_pred)
         if self.prediction_type == "sample":
             return z_t.float() + self.velocity_scale * (raw_pred - z_t.float())
 
         eps_pred = self.velocity_scale * raw_pred
-        return z_t.float() - sigma_t * eps_pred
+        return (z_t.float() - sqrt_one_minus * eps_pred) / sqrt_alpha_bar
 
     def compute_target_anchored_csd_loss(
         self,

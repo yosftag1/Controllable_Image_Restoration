@@ -1,6 +1,7 @@
 """2-Stage Multi-GPU AMP Training Script for Controllable Pretrained Restoration."""
 
 import argparse
+from contextlib import nullcontext
 from datetime import timedelta
 import gc
 import json
@@ -57,7 +58,7 @@ from data.selective_dataset import (
     dataloader_worker_init_fn,
     unpack_batch_action_map,
 )
-from losses.controllable_losses import ControllableRestorationLoss, SpectralPatchDiscriminator
+from losses.controllable_losses import ControllableRestorationLoss, DINOv2FeatureDiscriminator
 from models.controllable_restorer import ControllableRestorer
 from utils.semantic_mask import build_spatial_action_overlay, parse_action_spec
 
@@ -406,13 +407,14 @@ def save_controllable_validation_grid(
 
         s_demo = np.zeros(config.NUM_ACTIONS, dtype=np.float32)
         scenario_id = idx % 4
+        sr_key = "super_resolution" if "super_resolution" in pipeline.type_to_idx else "sharpen_focus"
         if scenario_id == 0:
-            # Row 1: Pure severe curved motion blur — apples-to-apples detail_scale (0.0 vs 0.5 vs 1.0)
+            # Row 1: Pure curved motion blur — apples-to-apples detail_scale (0.0 vs 0.5 vs 1.0)
             row_tag = "Row1[PureMotion]"
             params.motion_spatial_mode = 0
             params.motion_pattern = 1
             params.motion_hdr_boost = 0.25
-            s_demo[pipeline.type_to_idx["deblur_motion"]] = 0.68
+            s_demo[pipeline.type_to_idx["deblur_motion"]] = 0.70
             runs = [
                 ("Denoise Only (Keep Blur)", "denoise=1.0", None, None, 1.0, 0.0),
                 ("Deblur Pixel (d=0.0)", "deblur_motion=1.0", None, None, 1.0, 0.0),
@@ -420,44 +422,46 @@ def save_controllable_validation_grid(
                 ("Deblur Detail (d=1.0)", "deblur_motion=1.0", None, None, 1.0, 1.00),
             ]
         elif scenario_id == 1:
-            # Row 2: Pure optical bokeh defocus — apples-to-apples detail_scale (0.0 vs 0.5 vs 1.0)
-            row_tag = "Row2[PureBokeh]"
-            params.focus_mode = 0
-            params.use_bokeh_disc = True
-            s_demo[pipeline.type_to_idx["sharpen_focus"]] = 0.72
+            # Row 2: Real-ESRGAN Blind Super-Resolution / Crisp Detail — apples-to-apples detail_scale
+            row_tag = "Row2[SuperRes]"
+            params.sr_mode = 0
+            params.sr_scale_factor = 0.35
+            params.sr_sigma_max = 1.4
+            s_demo[pipeline.type_to_idx[sr_key]] = 0.80
             runs = [
-                ("Denoise Only (Keep Bokeh)", "denoise=1.0", None, None, 1.0, 0.0),
-                ("Defocus Pixel (d=0.0)", "sharpen_focus=1.0", None, None, 1.0, 0.0),
-                ("Defocus Detail (d=0.5)", "sharpen_focus=1.0", None, None, 1.0, 0.50),
-                ("Defocus Detail (d=1.0)", "sharpen_focus=1.0", None, None, 1.0, 1.00),
+                ("Denoise Only (Keep Soft)", "denoise=1.0", None, None, 1.0, 0.0),
+                ("SR Pixel (d=0.0)", f"{sr_key}=1.0", None, None, 1.0, 0.0),
+                ("SR Detail (d=0.5)", f"{sr_key}=1.0", None, None, 1.0, 0.50),
+                ("SR Detail (d=1.0)", f"{sr_key}=1.0", None, None, 1.0, 1.00),
             ]
         elif scenario_id == 2:
-            # Row 3: Compound Selective + Spatial Mask (Motion + Noise + Dark Exposure)
-            row_tag = "Row3[Noise+Motion+Dark]"
+            # Row 3: Heavy ISP Noise + Motion Blur + Dark Exposure (tests both exact & blind 'all' preset!)
+            row_tag = "Row3[NoisyMotion+Dark]"
             params.motion_spatial_mode = 0
-            s_demo[pipeline.type_to_idx["deblur_motion"]] = 0.60
-            s_demo[pipeline.type_to_idx["denoise"]] = 0.72
+            params.noise_mode = 1
+            s_demo[pipeline.type_to_idx["deblur_motion"]] = 0.65
+            s_demo[pipeline.type_to_idx["denoise"]] = 0.75
             s_demo[pipeline.type_to_idx["exposure"]] = -0.65
             runs = [
                 ("Denoise Only (Keep Blur)", "denoise=1.0", None, None, 1.0, 0.0),
-                ("Denoise+Bright (Keep Blur)", "denoise=1.0,exposure=0.65", None, None, 1.0, 0.0),
-                ("Full Exact (d=0.5)", "denoise=1.0,exposure=0.65,motion=1.0", None, None, 1.0, 0.50),
+                ("Exact Target (d=0.5)", "denoise=1.0,exposure=0.65,motion=1.0", None, None, 1.0, 0.50),
+                ("Blind 'all'+Exp (d=0.5)", "all,exposure=0.65", None, None, 1.0, 0.50),
                 ("Split Mask (L=Full R=Dn)", "denoise=1.0,exposure=0.65,motion=1.0", "denoise=1.0,exposure=0.65", "left_half", 1.0, 0.50),
             ]
         else:
-            # Row 4: Banding/JPEG + Warm Cast + Haze (remaining controls, apples-to-apples exact sliders)
+            # Row 4: Banding/JPEG + Warm Cast + Haze (tests selective & blind 'all' preset)
             row_tag = "Row4[Band+Warm+Haze]"
             params.artifact_mode = 2
             s_demo[pipeline.type_to_idx["deartifact"]] = 0.78
             s_demo[pipeline.type_to_idx["warmth"]] = 0.65
             if "dehaze" in pipeline.type_to_idx:
-                s_demo[pipeline.type_to_idx["dehaze"]] = 0.55
+                s_demo[pipeline.type_to_idx["dehaze"]] = 0.58
             full_spec = "deartifact=1.0,warmth=-0.65,dehaze=1.0" if "dehaze" in pipeline.type_to_idx else "deartifact=1.0,warmth=-0.65"
             runs = [
                 ("Deartifact Only", "deartifact=1.0", None, None, 1.0, 0.0),
                 ("+Cool WB (Keep Haze)", "deartifact=1.0,warmth=-0.65", None, None, 1.0, 0.0),
                 ("Full Exact (d=0.5)", full_spec, None, None, 1.0, 0.50),
-                ("Split Mask (L=Full R=Deart)", full_spec, "deartifact=1.0", "left_half", 1.0, 0.50),
+                ("Blind 'all'+Cool (d=0.5)", "all,warmth=-0.65", None, None, 1.0, 0.50),
             ]
 
         src_u8 = pipeline.render_with_params(clean_u8, s_demo, params)
@@ -586,39 +590,49 @@ def save_checkpoint(
         "disc_state_dict": disc_state_dict,
         "disc_optimizer_state_dict": disc_opt_state_dict,
         "model_config": {
-            "MODEL_VERSION": getattr(config, "MODEL_VERSION", "v6_1step_lean"),
+            "MODEL_VERSION": getattr(config, "MODEL_VERSION", "v7_sdturbo_crisp7"),
             "DEGRADATION_TYPES": list(config.DEGRADATION_TYPES),
             "SIGNED_ACTION_TYPES": list(getattr(config, "SIGNED_ACTION_TYPES", ["exposure", "warmth"])),
             "DETAIL_ACTION_TYPES": list(
                 getattr(
                     config,
                     "DETAIL_ACTION_TYPES",
-                    ["deblur_motion", "sharpen_focus", "deartifact", "deflare", "dereflection"],
+                    ["deblur_motion", "super_resolution", "deartifact", "dehaze"],
+                )
+            ),
+            "DESTRUCTIVE_SKIP_ACTIONS": list(
+                getattr(
+                    config,
+                    "DESTRUCTIVE_SKIP_ACTIONS",
+                    ["deblur_motion", "super_resolution", "dehaze"],
                 )
             ),
             "LORA_EXPERT_SPECS": [dict(sp) for sp in getattr(config, "LORA_EXPERT_SPECS", [])],
             "SEMANTIC_ENCODER_TYPE": config.SEMANTIC_ENCODER_TYPE,
             "DINOV2_REG_MODEL_ID": getattr(config, "DINOV2_REG_MODEL_ID", "facebook/dinov2-with-registers-base"),
             "GENERATOR_BACKBONE": config.GENERATOR_BACKBONE,
-            "RESTORATION_TIMESTEPS": list(getattr(config, "RESTORATION_TIMESTEPS", (175,))),
+            "RESTORATION_TIMESTEPS": list(getattr(config, "RESTORATION_TIMESTEPS", (499,))),
             "PROMPT_SEQ_LEN": getattr(config, "PROMPT_SEQ_LEN", 77),
             "UNET_LORA_RANK": config.UNET_LORA_RANK,
             "UNET_LORA_ALPHA": config.UNET_LORA_ALPHA,
             "UNET_CONV_LORA_RANK": getattr(config, "UNET_CONV_LORA_RANK", config.UNET_LORA_RANK),
             "UNET_CONV_LORA_ALPHA": getattr(config, "UNET_CONV_LORA_ALPHA", config.UNET_LORA_ALPHA),
-            "SEM_DETAIL_LORA_RANK": getattr(config, "SEM_DETAIL_LORA_RANK", 8),
-            "SEM_DETAIL_LORA_ALPHA": getattr(config, "SEM_DETAIL_LORA_ALPHA", 8.0),
+            "SEM_DETAIL_LORA_RANK": getattr(config, "SEM_DETAIL_LORA_RANK", 16),
+            "SEM_DETAIL_LORA_ALPHA": getattr(config, "SEM_DETAIL_LORA_ALPHA", 16.0),
             "SEM_DETAIL_CONV_LORA_RANK": getattr(
-                config, "SEM_DETAIL_CONV_LORA_RANK", getattr(config, "SEM_DETAIL_LORA_RANK", 8)
+                config, "SEM_DETAIL_CONV_LORA_RANK", getattr(config, "SEM_DETAIL_LORA_RANK", 12)
             ),
             "SEM_DETAIL_CONV_LORA_ALPHA": getattr(
-                config, "SEM_DETAIL_CONV_LORA_ALPHA", getattr(config, "SEM_DETAIL_LORA_ALPHA", 8.0)
+                config, "SEM_DETAIL_CONV_LORA_ALPHA", getattr(config, "SEM_DETAIL_LORA_ALPHA", 12.0)
             ),
-            "VAE_ENC_LORA_RANK": config.VAE_ENC_LORA_RANK,
-            "VAE_ENC_LORA_ALPHA": getattr(config, "VAE_ENC_LORA_ALPHA", float(config.VAE_ENC_LORA_RANK)),
+            "VAE_ENC_LORA_RANK": getattr(config, "VAE_ENC_LORA_RANK", 0),
+            "VAE_ENC_LORA_ALPHA": getattr(config, "VAE_ENC_LORA_ALPHA", 0.0),
+            "VAE_DEC_LORA_RANK": getattr(config, "VAE_DEC_LORA_RANK", 8),
+            "VAE_DEC_LORA_ALPHA": getattr(config, "VAE_DEC_LORA_ALPHA", 8.0),
             "ACTION_HIDDEN_DIM": config.ACTION_HIDDEN_DIM,
             "SPATIAL_MOD_HIDDEN_DIM": config.SPATIAL_MOD_HIDDEN_DIM,
             "TONE_HEAD_HIDDEN_DIM": getattr(config, "TONE_HEAD_HIDDEN_DIM", 32),
+            "PATCH_SIZE": int(getattr(config, "PATCH_SIZE", 384)),
         },
     }
     torch.save(payload, str(path))
@@ -792,21 +806,24 @@ def _build_train_loader(
 
     is_debug = bool(getattr(config, "_debug_mode", False))
     global_bsz = config.BATCH_SIZE
+    grad_accum = max(1, int(getattr(config, "GRAD_ACCUM_STEPS", 1) or 1))
     per_gpu_bsz = max(1, global_bsz // max(1, world_size))
     total_nw = int(config.NUM_WORKERS)
     nw = max(1, total_nw // max(1, world_size)) if total_nw > 0 else 0
 
-    max_steps = int(getattr(config, "MAX_STEPS_PER_EPOCH", 0) or 0)
-    min_steps = int(getattr(config, "MIN_STEPS_PER_EPOCH", 0) or 0) if not is_debug else 0
-    full_steps = max(1, len(train_dataset) // max(1, global_bsz))
+    max_opt_steps = int(getattr(config, "MAX_STEPS_PER_EPOCH", 0) or 0)
+    min_opt_steps = int(getattr(config, "MIN_STEPS_PER_EPOCH", 0) or 0) if not is_debug else 0
+    max_micro = max_opt_steps * grad_accum if max_opt_steps > 0 else 0
+    min_micro = min_opt_steps * grad_accum if min_opt_steps > 0 else 0
+    full_micro = max(1, len(train_dataset) // max(1, global_bsz))
 
     target_steps = 0
-    if max_steps > 0 and max_steps < full_steps:
-        target_steps = max_steps
-    elif min_steps > 0 and full_steps < min_steps:
-        target_steps = min_steps
-        if max_steps > 0:
-            target_steps = min(target_steps, max_steps)
+    if max_micro > 0 and max_micro < full_micro:
+        target_steps = max_micro
+    elif min_micro > 0 and full_micro < min_micro:
+        target_steps = min_micro
+        if max_micro > 0:
+            target_steps = min(target_steps, max_micro)
 
     sampler = None
     if target_steps > 0:
@@ -892,21 +909,22 @@ def train(
 
         if num_gpus == 1 and not batch_size_overridden and config.BATCH_SIZE >= 8 and not debug:
             config.BATCH_SIZE = 4
+        grad_accum = max(1, int(getattr(config, "GRAD_ACCUM_STEPS", 1) or 1))
 
         if is_main:
             mode_tag = f"DDP ({world_size} GPUs)" if is_ddp else f"{device} (GPUs: {num_gpus})"
             gckpt_tag = "ON" if getattr(config, "GRADIENT_CHECKPOINTING", True) else "OFF"
-            t_steps = list(getattr(config, "RESTORATION_TIMESTEPS", (175,)))
+            t_steps = list(getattr(config, "RESTORATION_TIMESTEPS", (499,)))
             t_tag = f"{len(t_steps)}step_t={t_steps}"
             exp_names = [sp.get("name", "?") for sp in getattr(config, "LORA_EXPERT_SPECS", [])]
             exp_tag = str(exp_names) if exp_names else f"SharedLean(lin={config.UNET_LORA_RANK},conv={getattr(config, 'UNET_CONV_LORA_RANK', config.UNET_LORA_RANK)})"
-            csd_every = max(1, int(getattr(config, "CSD_EVERY_N_STEPS", 4)))
+            eff_bsz = config.BATCH_SIZE * grad_accum
             print(
-                f"Device: {mode_tag} | Global Batch Size: {config.BATCH_SIZE} "
-                f"({max(1, config.BATCH_SIZE // max(1, world_size))}/GPU) | "
+                f"Device: {mode_tag} | Patch: {config.PATCH_SIZE}px | Eff Batch: {eff_bsz} "
+                f"({max(1, config.BATCH_SIZE // max(1, world_size))}/GPU x {grad_accum} accum) | "
                 f"Backbone: {config.GENERATOR_BACKBONE} ({t_tag}) | LoRA: {exp_tag} | "
                 f"Vision: {config.SEMANTIC_ENCODER_TYPE} | Controls: {config.NUM_ACTIONS} | "
-                f"GAN_w: {getattr(config, 'LOSS_GAN_WEIGHT', 0.0)} | CSD_w: {getattr(config, 'LOSS_CSD_WEIGHT', 0.0)} | "
+                f"DINO_GAN_w: {getattr(config, 'LOSS_GAN_WEIGHT', 0.0)} | "
                 f"AMP: {'ENABLED' if use_amp else 'DISABLED'} | GradCkpt: {gckpt_tag}",
                 flush=True,
             )
@@ -1172,11 +1190,12 @@ def train(
                 else:
                     model = raw_model
 
-                # Setup or tear down lightweight Spectral-Norm Hinge PatchGAN Discriminator for Stage 2
-                gan_weight = float(getattr(config, "LOSS_GAN_WEIGHT", 0.08))
+                # Setup or tear down zero-extra-VRAM Frozen-DINOv2 Multi-Layer Feature Discriminator (Stage 2)
+                gan_weight = float(getattr(config, "LOSS_GAN_WEIGHT", 0.15))
                 if stage in ("semantic_stage", "joint") and gan_weight > 0.0:
                     if raw_disc is None:
-                        raw_disc = SpectralPatchDiscriminator().to(device)
+                        dino_dim = int(raw_model.semantic_encoder.spatial_dim)
+                        raw_disc = DINOv2FeatureDiscriminator(feat_dim=dino_dim, num_scales=3).to(device)
                         disc_lr = float(getattr(config, "GAN_DISC_LR", 1.5e-4))
                         disc_opt = optim.AdamW(
                             raw_disc.parameters(), lr=disc_lr, betas=(0.0, 0.99), weight_decay=config.WEIGHT_DECAY
@@ -1186,12 +1205,12 @@ def train(
                                 raw_disc.load_state_dict(resumed_disc_state)
                                 if resumed_disc_opt_state is not None:
                                     disc_opt.load_state_dict(resumed_disc_opt_state)
-                                sem_step_counter = int(getattr(config, "GAN_WARMUP_STEPS", 100)) + 150
+                                sem_step_counter = int(getattr(config, "GAN_WARMUP_STEPS", 50)) + 150
                                 if is_main:
-                                    print("Restored PatchGAN discriminator state for resumed semantic stage.", flush=True)
+                                    print("Restored DINOv2 Feature Discriminator state for resumed semantic stage.", flush=True)
                             except Exception as dexc:
                                 if is_main:
-                                    print(f"[Note] Re-initialized PatchGAN discriminator cleanly ({dexc}).", flush=True)
+                                    print(f"[Note] Re-initialized DINOv2 Feature Discriminator cleanly ({dexc}).", flush=True)
                             resumed_disc_state = None
                             resumed_disc_opt_state = None
                         if is_ddp:
@@ -1206,8 +1225,8 @@ def train(
                         if is_main:
                             d_params = sum(p.numel() for p in raw_disc.parameters())
                             print(
-                                f"  [PatchGAN] Active Spectral-Norm Discriminator ({d_params:,} params, "
-                                f"gan_w={gan_weight}, warmup={getattr(config, 'GAN_WARMUP_STEPS', 100)} steps)",
+                                f"  [DINOv2-Disc] Frozen DINOv2 Multi-Layer Discriminator ({d_params:,} head params, "
+                                f"gan_w={gan_weight}, warmup={getattr(config, 'GAN_WARMUP_STEPS', 50)} opt steps, clean HR targets only)",
                                 flush=True,
                             )
                 else:
@@ -1224,11 +1243,12 @@ def train(
 
             model.train()
             running = {}
-            num_steps = len(train_loader)
+            num_micro = len(train_loader)
+            num_opt_steps = max(1, (num_micro + grad_accum - 1) // grad_accum)
             use_tqdm = bool(getattr(config, "USE_TQDM", False))
             log_interval = max(1, int(getattr(config, "LOG_INTERVAL", 100)))
             sample_every = max(0, int(getattr(config, "SAMPLE_EVERY_N_STEPS", 500)))
-            step_width = max(4, len(str(num_steps)))
+            step_width = max(4, len(str(num_opt_steps)))
             epoch_start_t = time.perf_counter()
 
             pbar = (
@@ -1244,29 +1264,51 @@ def train(
             )
 
             csd_every = max(1, int(getattr(config, "CSD_EVERY_N_STEPS", 4)))
-            gan_target_w = float(getattr(config, "LOSS_GAN_WEIGHT", 0.08))
-            gan_warmup = max(0, int(getattr(config, "GAN_WARMUP_STEPS", 100)))
+            gan_target_w = float(getattr(config, "LOSS_GAN_WEIGHT", 0.15))
+            gan_warmup = max(0, int(getattr(config, "GAN_WARMUP_STEPS", 50)))
+            dino_disc_max_sz = int(getattr(config, "DINO_DISC_MAX_SIZE", 252))
             det_idx_dev = raw_model.detail_action_indices.to(device)
 
-            for step_idx, batch in enumerate(pbar, start=1):
+            optimizer.zero_grad(set_to_none=True)
+            if disc_opt is not None:
+                disc_opt.zero_grad(set_to_none=True)
+            opt_step_idx = 0
+
+            for micro_idx, batch in enumerate(pbar, start=1):
+                is_sync_step = (micro_idx % grad_accum == 0) or (micro_idx == num_micro)
+                cur_accum_div = (
+                    grad_accum
+                    if (micro_idx <= (num_micro // grad_accum) * grad_accum)
+                    else max(1, num_micro % grad_accum)
+                )
+
                 src = batch["source"].to(device, non_blocking=True)
                 tgt = batch["target"].to(device, non_blocking=True)
                 act_map = unpack_batch_action_map(batch, device)
+                if "gan_clean_eligible" in batch:
+                    clean_gan_mask = batch["gan_clean_eligible"].to(device, non_blocking=True).float()
+                else:
+                    clean_gan_mask = torch.ones((src.shape[0],), device=device, dtype=torch.float32)
 
-                optimizer.zero_grad(set_to_none=True)
                 pred_detached = None
                 det_mask = None
 
                 try:
-                    d_scale = 0.0 if stage == "pixel_stage" else float(random.uniform(0.35, 1.0))
-                    do_csd = (stage in ("semantic_stage", "joint")) and (step_idx == 1 or (step_idx % csd_every == 0))
+                    # Stage 2 trains at FIXED `detail_scale = 1.0` (eliminates +38% random-scale overshoot!)
+                    d_scale = 0.0 if stage == "pixel_stage" else 1.0
+                    next_opt_step = opt_step_idx + 1
+                    do_csd = (
+                        is_sync_step
+                        and (stage in ("semantic_stage", "joint"))
+                        and (next_opt_step == 1 or (next_opt_step % csd_every == 0))
+                    )
                     use_gan = (raw_disc is not None) and (stage in ("semantic_stage", "joint")) and (gan_target_w > 0.0)
                     if use_gan:
-                        sem_step_counter += 1
-                        if sem_step_counter <= gan_warmup:
+                        eff_counter = sem_step_counter + (1 if is_sync_step else 0)
+                        if eff_counter <= gan_warmup:
                             eff_gan_w = 0.0
                         else:
-                            eff_gan_w = gan_target_w * min(1.0, float(sem_step_counter - gan_warmup) / 150.0)
+                            eff_gan_w = gan_target_w * min(1.0, float(eff_counter - gan_warmup) / 100.0)
                         if det_idx_dev.numel() > 0:
                             det_mask = act_map.float().index_select(1, det_idx_dev).abs().amax(dim=1, keepdim=True).clamp(0.0, 1.0)
                         else:
@@ -1274,127 +1316,158 @@ def train(
                     else:
                         eff_gan_w = 0.0
 
-                    with torch.amp.autocast("cuda", enabled=use_amp):
-                        out = model(
-                            src,
-                            act_map,
-                            tgt_01=tgt,
-                            fidelity_scale=1.0,
-                            detail_scale=d_scale,
-                        )
-                        loss, metrics = loss_fn(
-                            pred_01=out["pred"],
-                            target_01=tgt,
-                            action_map=act_map,
-                            stage=stage,
-                            src_01=src,
-                            hat_z_0=out.get("hat_z_0"),
-                            hat_z_1=out.get("hat_z_1"),
-                            z_tgt=out.get("z_tgt"),
-                            restorer_model=raw_model,
-                            run_csd=do_csd,
-                        )
+                    sync_ctx = model.no_sync() if (is_ddp and not is_sync_step) else nullcontext()
+                    with sync_ctx:
+                        with torch.amp.autocast("cuda", enabled=use_amp):
+                            out = model(
+                                src,
+                                act_map,
+                                tgt_01=tgt,
+                                fidelity_scale=1.0,
+                                detail_scale=d_scale,
+                            )
+                            loss, metrics = loss_fn(
+                                pred_01=out["pred"],
+                                target_01=tgt,
+                                action_map=act_map,
+                                stage=stage,
+                                src_01=src,
+                                hat_z_0=out.get("hat_z_0"),
+                                hat_z_1=out.get("hat_z_1"),
+                                z_tgt=out.get("z_tgt"),
+                                restorer_model=raw_model,
+                                run_csd=do_csd,
+                            )
 
-                    if use_gan:
-                        pred_detached = out["pred"].detach()
-                        if eff_gan_w > 0.0:
-                            for dp in raw_disc.parameters():
-                                dp.requires_grad = False
-                            raw_disc.eval()
-                            loss_g_gan = raw_disc.compute_g_loss(out["pred"], det_mask)
-                            loss = loss + eff_gan_w * loss_g_gan
-                            metrics["g_gan"] = float(loss_g_gan.detach().item())
-                            metrics["total"] = float(loss.detach().item())
+                        if use_gan:
+                            pred_detached = out["pred"].detach()
+                            if eff_gan_w > 0.0:
+                                for dp in raw_disc.parameters():
+                                    dp.requires_grad = False
+                                raw_disc.eval()
+                                with torch.amp.autocast("cuda", enabled=use_amp):
+                                    loss_g_gan = raw_disc.compute_g_loss(
+                                        raw_model.semantic_encoder,
+                                        out["pred"],
+                                        detail_mask=det_mask,
+                                        clean_sample_mask=clean_gan_mask,
+                                        max_size=dino_disc_max_sz,
+                                    )
+                                loss = loss + eff_gan_w * loss_g_gan
+                                metrics["g_gan"] = float(loss_g_gan.detach().item())
+                                metrics["total"] = float(loss.detach().item())
+                            else:
+                                metrics["g_gan"] = 0.0
+
+                        scaled_loss = loss / float(cur_accum_div)
+                        if scaler is not None and use_amp:
+                            scaler.scale(scaled_loss).backward()
                         else:
-                            metrics["g_gan"] = 0.0
+                            scaled_loss.backward()
 
-                    if scaler is not None and use_amp:
-                        scaler.scale(loss).backward()
-                        scaler.unscale_(optimizer)
-                        torch.nn.utils.clip_grad_norm_(
-                            [p for p in raw_model.parameters() if p.requires_grad], config.GRAD_CLIP_NORM
-                        )
-                        scaler.step(optimizer)
-                        scaler.update()
-                    else:
-                        loss.backward()
-                        torch.nn.utils.clip_grad_norm_(
-                            [p for p in raw_model.parameters() if p.requires_grad], config.GRAD_CLIP_NORM
-                        )
-                        optimizer.step()
+                    if is_sync_step:
+                        if scaler is not None and use_amp:
+                            scaler.unscale_(optimizer)
+                            torch.nn.utils.clip_grad_norm_(
+                                [p for p in raw_model.parameters() if p.requires_grad], config.GRAD_CLIP_NORM
+                            )
+                            scaler.step(optimizer)
+                            scaler.update()
+                        else:
+                            torch.nn.utils.clip_grad_norm_(
+                                [p for p in raw_model.parameters() if p.requires_grad], config.GRAD_CLIP_NORM
+                            )
+                            optimizer.step()
+                        optimizer.zero_grad(set_to_none=True)
+                        opt_step_idx += 1
+                        if use_gan:
+                            sem_step_counter += 1
                 finally:
                     raw_model.clear_runtime_contexts()
 
-                # Discriminator update (FP32 single concatenated pass — 100% DDP & SpectralNorm safe!)
+                # DINOv2 Feature Discriminator update (accumulated across grad_accum micro-batches, 1:1 with G!)
                 if raw_disc is not None and disc_opt is not None and pred_detached is not None:
                     for dp in raw_disc.parameters():
                         dp.requires_grad = True
                     disc_model.train()
-                    disc_opt.zero_grad(set_to_none=True)
-                    loss_d, _, _ = SpectralPatchDiscriminator.compute_d_loss_with_module(
-                        disc_model, tgt, pred_detached, det_mask
-                    )
-                    loss_d.backward()
-                    torch.nn.utils.clip_grad_norm_(raw_disc.parameters(), 1.0)
-                    disc_opt.step()
+                    d_sync_ctx = disc_model.no_sync() if (is_ddp and not is_sync_step) else nullcontext()
+                    with d_sync_ctx:
+                        with torch.amp.autocast("cuda", enabled=use_amp):
+                            loss_d, _, _ = DINOv2FeatureDiscriminator.compute_d_loss_with_module(
+                                disc_model,
+                                raw_model.semantic_encoder,
+                                tgt,
+                                pred_detached,
+                                detail_mask=det_mask,
+                                clean_sample_mask=clean_gan_mask,
+                                max_size=dino_disc_max_sz,
+                            )
+                        (loss_d / float(cur_accum_div)).backward()
+                    if is_sync_step:
+                        torch.nn.utils.clip_grad_norm_(raw_disc.parameters(), 1.0)
+                        disc_opt.step()
+                        disc_opt.zero_grad(set_to_none=True)
                     metrics["d_loss"] = float(loss_d.detach().item())
 
                 del out, pred_detached
                 for k, v in metrics.items():
                     running[k] = running.get(k, 0.0) + v
 
-                if is_main and (step_idx == 1 or step_idx % log_interval == 0 or step_idx == num_steps):
-                    avg_tot = running["total"] / step_idx
+                if is_sync_step and is_main and (
+                    opt_step_idx == 1 or opt_step_idx % log_interval == 0 or opt_step_idx == num_opt_steps
+                ):
+                    avg_tot = running["total"] / micro_idx
                     gpu_str = format_gpu_postfix()
                     if use_tqdm:
                         pbar.set_postfix({"loss": f"{avg_tot:.4f}", "gpu": gpu_str})
                     else:
                         elapsed = max(1e-6, time.perf_counter() - epoch_start_t)
-                        sec_per_it = elapsed / step_idx
-                        rate_str = f"{sec_per_it:.2f}s/it" if sec_per_it >= 1.0 else f"{1.0 / sec_per_it:.2f}it/s"
-                        eta_str = _format_duration(sec_per_it * (num_steps - step_idx))
-                        pct = 100.0 * step_idx / max(1, num_steps)
+                        sec_per_it = elapsed / max(1, opt_step_idx)
+                        rate_str = f"{sec_per_it:.2f}s/step" if sec_per_it >= 1.0 else f"{1.0 / sec_per_it:.2f}step/s"
+                        eta_str = _format_duration(sec_per_it * (num_opt_steps - opt_step_idx))
+                        pct = 100.0 * opt_step_idx / max(1, num_opt_steps)
                         cur_lr = optimizer.param_groups[-1]["lr"]
-                        avg_l1 = running.get("l1", 0.0) / step_idx
-                        avg_lat = running.get("lat", 0.0) / step_idx
-                        avg_perc = running.get("perc", 0.0) / step_idx
+                        avg_l1 = running.get("l1", 0.0) / micro_idx
+                        avg_lat = running.get("lat", 0.0) / micro_idx
+                        avg_perc = running.get("perc", 0.0) / micro_idx
+                        avg_edge = running.get("edge", 0.0) / micro_idx
                         if stage == "pixel_stage":
-                            avg_pres = running.get("pres", 0.0) / step_idx
+                            avg_pres = running.get("pres", 0.0) / micro_idx
                             loss_parts = (
                                 f"loss={avg_tot:.4f} l1={avg_l1:.4f} lat={avg_lat:.4f} "
-                                f"perc={avg_perc:.4f} pres={avg_pres:.4f}"
+                                f"perc={avg_perc:.4f} edge={avg_edge:.4f} pres={avg_pres:.4f}"
                             )
                         else:
-                            avg_freq = running.get("freq", 0.0) / step_idx
-                            avg_ggan = running.get("g_gan", 0.0) / step_idx
-                            avg_dloss = running.get("d_loss", 0.0) / step_idx
-                            avg_csd = running.get("csd", 0.0) / step_idx
+                            avg_ggan = running.get("g_gan", 0.0) / micro_idx
+                            avg_dloss = running.get("d_loss", 0.0) / micro_idx
+                            avg_csd = running.get("csd", 0.0) / micro_idx
                             gan_part = f" g_gan={avg_ggan:.3f} d={avg_dloss:.3f}" if raw_disc is not None else ""
                             csd_part = f" csd={avg_csd:.4f}" if getattr(config, "LOSS_CSD_WEIGHT", 0.0) > 0.0 else ""
                             loss_parts = (
                                 f"loss={avg_tot:.4f} l1={avg_l1:.4f} lat={avg_lat:.4f} "
-                                f"perc={avg_perc:.4f} freq={avg_freq:.4f}{gan_part}{csd_part}"
+                                f"perc={avg_perc:.4f} edge={avg_edge:.4f}{gan_part}{csd_part}"
                             )
                         print(
                             f"[Epoch {epoch:03d}/{config.EPOCHS} | {stage}] "
-                            f"{step_idx:0{step_width}d}/{num_steps} ({pct:5.1f}%) | "
+                            f"{opt_step_idx:0{step_width}d}/{num_opt_steps} ({pct:5.1f}%) | "
                             f"{loss_parts} | lr={cur_lr:.2e} | {rate_str} ETA {eta_str} | {gpu_str}",
                             flush=True,
                         )
 
                 should_mid_sample = (
-                    sample_every > 0
-                    and (step_idx % sample_every == 0)
-                    and (num_steps - step_idx) > min(75, sample_every // 5)
+                    is_sync_step
+                    and sample_every > 0
+                    and (opt_step_idx % sample_every == 0)
+                    and (num_opt_steps - opt_step_idx) > min(75, sample_every // 5)
                 )
                 if should_mid_sample:
                     if is_main and val_dataset is not None:
                         if device.type == "cuda":
                             torch.cuda.empty_cache()
                         preview_path, row_summary = save_controllable_validation_grid(
-                            raw_model, val_dataset, device, config, epoch, stage, step=step_idx, return_summary=True
+                            raw_model, val_dataset, device, config, epoch, stage, step=opt_step_idx, return_summary=True
                         )
-                        cap_str = f"Preview @ Epoch {epoch:03d}/{config.EPOCHS} Step {step_idx:0{step_width}d}/{num_steps} [{stage}]"
+                        cap_str = f"Preview @ Epoch {epoch:03d}/{config.EPOCHS} Step {opt_step_idx:0{step_width}d}/{num_opt_steps} [{stage}]"
                         print(
                             f"  ↳ [{cap_str}] Saved sweep -> {preview_path}\n"
                             f"    {row_summary}",
@@ -1407,7 +1480,7 @@ def train(
             if scheduler is not None:
                 scheduler.step()
 
-            epoch_summary = {k: v / max(1, num_steps) for k, v in running.items()}
+            epoch_summary = {k: v / max(1, num_micro) for k, v in running.items()}
             if is_ddp and epoch_summary:
                 keys_sorted = sorted(epoch_summary.keys())
                 vec = torch.tensor([epoch_summary[k] for k in keys_sorted], device=device, dtype=torch.float64)
@@ -1542,11 +1615,15 @@ def main():
         default=None,
     )
     parser.add_argument("--training-mode", type=str, choices=["staged", "joint"], default=None)
-    parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--patch-size", type=int, default=None, help="Training crop resolution (e.g. 256, 384, 512)")
+    parser.add_argument("--batch-size", type=int, default=None, help="Global micro-batch size across all GPUs")
+    parser.add_argument("--grad-accum", type=int, default=None, help="Gradient accumulation steps (eff batch = batch_size * grad_accum)")
+    parser.add_argument("--timestep", type=int, default=None, help="Override 1-step diffusion timestep (default: 499 for sd-turbo)")
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--pixel-epochs", type=int, help="Override Pixel-Stage epochs", default=None)
     parser.add_argument("--extra-epochs", type=int, default=None, help="When resuming, run N more epochs past checkpoint")
     parser.add_argument("--remaining-pixel-epochs", type=int, default=None, help="When resuming, run K more pixel_stage epochs")
+    parser.add_argument("--gan-weight", type=float, default=None, help="Override Stage-2 Frozen DINOv2 Discriminator weight (0=disable)")
     parser.add_argument("--csd-weight", type=float, default=None, help="Override Stage-2 Target-Anchored CSD loss weight")
     parser.add_argument("--steps-per-epoch", type=int, default=None, help="Cap optimizer steps per epoch")
     parser.add_argument("--min-steps-per-epoch", type=int, default=None, help="Minimum optimizer steps per epoch on small folders")
@@ -1599,22 +1676,31 @@ def main():
         config.PAIRED_DEFOCUS_DATASET_PATH = args.paired_defocus_root
     if args.paired_prob is not None:
         config.PAIRED_REAL_PROB = float(np.clip(args.paired_prob, 0.0, 1.0))
+        config.MOTION_REAL_PAIR_FRAC = config.PAIRED_REAL_PROB
     if args.output_dir:
         config.OUTPUT_DIR = args.output_dir
     if args.checkpoint_dir:
         config.CHECKPOINT_DIR = args.checkpoint_dir
     if args.log_dir:
         config.LOG_DIR = args.log_dir
+    if args.patch_size is not None:
+        ps_aligned = max(64, (int(args.patch_size) // 8) * 8)
+        config.PATCH_SIZE = ps_aligned
+        config.EVAL_SWEEP_CROP_SIZE = ps_aligned
     if args.batch_size:
         config.BATCH_SIZE = args.batch_size
+    if args.grad_accum is not None:
+        config.GRAD_ACCUM_STEPS = max(1, int(args.grad_accum))
+    if args.timestep is not None:
+        config.RESTORATION_TIMESTEPS = (max(1, min(999, int(args.timestep))),)
     if args.speedrun:
-        config.MAX_STEPS_PER_EPOCH = 350
-        config.MIN_STEPS_PER_EPOCH = 350
+        config.MAX_STEPS_PER_EPOCH = 300
+        config.MIN_STEPS_PER_EPOCH = 300
         config.CURRICULUM_WARMUP_EPOCHS = 1
         config.LEARNING_RATE = 1.35e-4
         config.VAL_IMAGES_COUNT = 40
         config.LOG_INTERVAL = 40
-        config.SAMPLE_EVERY_N_STEPS = 175
+        config.SAMPLE_EVERY_N_STEPS = 150
         if not args.resume:
             config.PIXEL_STAGE_EPOCHS = 5
             config.EPOCHS = 7
@@ -1622,6 +1708,8 @@ def main():
         config.EPOCHS = args.epochs
     if args.pixel_epochs is not None:
         config.PIXEL_STAGE_EPOCHS = args.pixel_epochs
+    if args.gan_weight is not None:
+        config.LOSS_GAN_WEIGHT = max(0.0, float(args.gan_weight))
     if args.csd_weight is not None:
         config.LOSS_CSD_WEIGHT = float(args.csd_weight)
     if args.steps_per_epoch is not None:

@@ -52,7 +52,7 @@ SLIDER_SPECS: List[Tuple[str, str, str, float, float, float]] = [
     (
         "denoise",
         "Sensor Noise Removal",
-        "0.0 = preserve ISO/film grain | 1.0 = full luminance & chroma denoise",
+        "0.0 = preserve ISO/film grain | 1.0 = full camera ISP luminance & chroma denoise",
         0.0,
         1.0,
         1.0,
@@ -74,33 +74,9 @@ SLIDER_SPECS: List[Tuple[str, str, str, float, float, float]] = [
         1.0,
     ),
     (
-        "sharpen_focus",
-        "Focus & Detail Sharpening",
-        "0.0 = preserve portrait bokeh | 1.0 = sharpen optical defocus & low-res softness",
-        0.0,
-        1.0,
-        1.0,
-    ),
-    (
-        "deflare",
-        "Lens Flare & Glare Removal",
-        "0.0 = preserve sunlight flare | 1.0 = remove starbursts, veiling glare & lens ghosts",
-        0.0,
-        1.0,
-        1.0,
-    ),
-    (
-        "dereflection",
-        "Glass Reflection Removal",
-        "0.0 = preserve window reflections | 1.0 = remove double-pane glass ghosts",
-        0.0,
-        1.0,
-        1.0,
-    ),
-    (
-        "dechromatic",
-        "Chromatic Aberration Removal",
-        "0.0 = preserve | 1.0 = remove radial purple/cyan lens color fringing",
+        "super_resolution",
+        "Super-Resolution & Crisp Detail",
+        "0.0 = keep original softness | 1.0 = blind SR & crisp high-frequency detail enhancement",
         0.0,
         1.0,
         1.0,
@@ -131,67 +107,55 @@ SLIDER_SPECS: List[Tuple[str, str, str, float, float, float]] = [
     ),
 ]
 
-# Order matches SLIDER_SPECS: [denoise, deartifact, deblur_motion, sharpen_focus, deflare, dereflection, dechromatic, dehaze, exposure, warmth]
+# Order matches SLIDER_SPECS: [denoise, deartifact, deblur_motion, super_resolution, dehaze, exposure, warmth]
 RESTORE_PRESETS = {
-    "Restore All Artifacts (Keep Original Tone & WB)": [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0],
-    "Identity / Zero-Action Lock ('none')": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-    "Night Action Shot (Denoise + Brighten +0.65, KEEP Motion Blur)": [1.0, 0.4, 0.0, 0.0, 0.5, 0.0, 0.3, 0.0, 0.65, 0.0],
-    "Portrait Bokeh Cleanup (Denoise + Deband + Cool WB, KEEP Bokeh)": [1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.3, 0.0, 0.0, -0.35],
-    "Backlit Window Shot (Deflare + Dereflection + Dehaze + CA)": [0.3, 0.3, 0.0, 0.5, 1.0, 1.0, 1.0, 0.8, 0.0, 0.0],
-    "Washed-Out Overexposed Fix (Darken -0.60 + Sharpen + Deband)": [0.3, 1.0, 0.0, 1.0, 0.5, 0.0, 0.3, 0.5, -0.60, 0.0],
-    "Old Compressed Web Photo (DeJPEG + Sharpen Focus)": [0.4, 1.0, 0.3, 1.0, 0.0, 0.0, 0.2, 0.0, 0.0, 0.0],
-    "Artistic Golden-Hour Grade Only (Zero Structural Change)": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.25, 0.50],
+    "Restore All Artifacts (Keep Original Tone & WB)": [1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0],
+    "Identity / Zero-Action Lock ('none')": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+    "Crisp Super-Resolution Only (Enhance Details)": [0.0, 0.3, 0.0, 1.0, 0.0, 0.0, 0.0],
+    "Noisy Motion Blur Fix (Denoise + Motion Deblur)": [1.0, 0.3, 1.0, 0.0, 0.0, 0.0, 0.0],
+    "Night Action Shot (Denoise + Brighten +0.65, KEEP Motion Blur)": [1.0, 0.4, 0.0, 0.0, 0.0, 0.65, 0.0],
+    "Old Compressed Web Photo (DeJPEG + Super-Resolution)": [0.4, 1.0, 0.0, 1.0, 0.0, 0.0, 0.0],
+    "Washed-Out Hazy Fix (Dehaze + Darken -0.55 + Super-Res)": [0.2, 0.6, 0.0, 1.0, 1.0, -0.55, 0.0],
+    "Artistic Golden-Hour Grade Only (Zero Structural Change)": [0.0, 0.0, 0.0, 0.0, 0.0, 0.25, 0.50],
 }
 
 SYNTH_RECIPES = {
     "Custom Sliders": None,
-    "Night Handheld (Dark Exposure -0.68 + Heavy Noise + Motion Blur)": {
-        "denoise": 0.72,
+    "Noisy Motion Blur (Dark -0.65 + Heavy ISP Noise + Motion Blur)": {
+        "denoise": 0.75,
         "deartifact": 0.0,
-        "deblur_motion": 0.75,
-        "sharpen_focus": 0.0,
-        "deflare": 0.0,
-        "dereflection": 0.0,
-        "dechromatic": 0.0,
+        "deblur_motion": 0.72,
+        "super_resolution": 0.0,
         "dehaze": 0.0,
-        "exposure": -0.68,
+        "exposure": -0.65,
         "warmth": 0.0,
     },
-    "Backlit Window Shot (Flare + Glass Reflection + Haze + CA)": {
+    "Low-Res Super-Resolution + Compression (SR 0.80 + JPEG 0.70)": {
         "denoise": 0.0,
-        "deartifact": 0.0,
+        "deartifact": 0.70,
         "deblur_motion": 0.0,
-        "sharpen_focus": 0.0,
-        "deflare": 0.75,
-        "dereflection": 0.80,
-        "dechromatic": 0.85,
-        "dehaze": 0.55,
+        "super_resolution": 0.80,
+        "dehaze": 0.0,
         "exposure": 0.0,
         "warmth": 0.0,
     },
-    "Washout + Bokeh + Warm Cast (Bright +0.65 + Defocus + Banding + Warm +0.55)": {
+    "Hazy + Banded + Warm Cast (Haze 0.65 + Banding 0.60 + Warm +0.55)": {
         "denoise": 0.0,
-        "deartifact": 0.65,
+        "deartifact": 0.60,
         "deblur_motion": 0.0,
-        "sharpen_focus": 0.70,
-        "deflare": 0.0,
-        "dereflection": 0.0,
-        "dechromatic": 0.45,
-        "dehaze": 0.0,
-        "exposure": 0.65,
+        "super_resolution": 0.55,
+        "dehaze": 0.65,
+        "exposure": 0.0,
         "warmth": 0.55,
     },
-    "Compressed Low-Res Web Photo (Low-Res + Heavy JPEG + Cool Cast -0.50)": {
-        "denoise": 0.0,
+    "Compressed Noisy Web Photo (SR 0.75 + Heavy JPEG + Noise + Cool -0.45)": {
+        "denoise": 0.45,
         "deartifact": 0.80,
-        "deblur_motion": 0.40,
-        "sharpen_focus": 0.75,
-        "deflare": 0.0,
-        "dereflection": 0.0,
-        "dechromatic": 0.0,
+        "deblur_motion": 0.0,
+        "super_resolution": 0.75,
         "dehaze": 0.0,
         "exposure": 0.0,
-        "warmth": -0.50,
+        "warmth": -0.45,
     },
 }
 
@@ -347,12 +311,12 @@ def build_gradio_app(
     except TypeError:
         pass
 
-    with gr.Blocks(title="Controllable Image Restoration Studio (V5)") as demo:
+    with gr.Blocks(title="Controllable Image Restoration Studio (V7 SD-Turbo)") as demo:
         gr.Markdown(
-            "## Controllable Pretrained Image Restoration Studio (V5)\n"
-            "Fix specific degradations with **4 orthogonal `[0, 1]` restoration sliders**, adjust mood & lighting with "
-            "**2 directional `[-1, +1]` Exposure & Warmth sliders**, dial **Generative Texture Detail**, "
-            "or **click any object** for localized restoration."
+            "## Controllable Pretrained Image Restoration Studio (V7 SD-Turbo)\n"
+            "Fix specific degradations with **5 orthogonal `[0, 1]` restoration & Super-Resolution sliders**, "
+            "adjust mood & lighting with **2 directional `[-1, +1]` Exposure & Warmth sliders**, dial "
+            "**Crisp Detail (`detail_scale`)**, upscale **2× / 4×**, or **click any object** for localized restoration."
         )
 
         status_md = gr.Markdown(_format_ckpt_banner(inferencer))
@@ -387,11 +351,11 @@ def build_gradio_app(
                             )
                             restore_btn = gr.Button("Restore Image", variant="primary", scale=2)
 
-                        gr.Markdown("#### A. Structural & Optical Artifact Restoration (`0.0` = Preserve, `1.0` = Full Fix)")
+                        gr.Markdown("#### A. Structural Restoration & Super-Resolution (`0.0` = Preserve, `1.0` = Full Fix)")
                         slider_controls = []
-                        for row_idx in (0, 2, 4, 6):
+                        for row_slice in ((0, 2), (2, 4), (4, 5)):
                             with gr.Row():
-                                for _, label_txt, info_txt, lo_v, hi_v, def_v in SLIDER_SPECS[row_idx : row_idx + 2]:
+                                for _, label_txt, info_txt, lo_v, hi_v, def_v in SLIDER_SPECS[row_slice[0] : row_slice[1]]:
                                     s = gr.Slider(
                                         minimum=lo_v,
                                         maximum=hi_v,
@@ -404,7 +368,7 @@ def build_gradio_app(
 
                         gr.Markdown("#### B. Directional Tone & White Balance (`-1.0`  ↔  `0.0` Keep  ↔  `+1.0`)")
                         with gr.Row():
-                            for _, label_txt, info_txt, lo_v, hi_v, def_v in SLIDER_SPECS[8:10]:
+                            for _, label_txt, info_txt, lo_v, hi_v, def_v in SLIDER_SPECS[5:7]:
                                 s = gr.Slider(
                                     minimum=lo_v,
                                     maximum=hi_v,
@@ -415,20 +379,29 @@ def build_gradio_app(
                                 )
                                 slider_controls.append(s)
 
-                        gr.Markdown("#### C. Texture Synthesis Dial")
+                        gr.Markdown("#### C. Crisp Detail & Super-Resolution Upscale")
                         default_det = (
                             0.0
                             if inferencer.ckpt_stage == "pixel_stage"
                             else float(inferencer.config.DEFAULT_DETAIL_SCALE)
                         )
-                        detail_slider = gr.Slider(
-                            minimum=0.0,
-                            maximum=1.0,
-                            value=default_det,
-                            step=0.05,
-                            label="Generative Texture Detail (detail_scale)",
-                            info="0.0 = strict pixel-faithful PSNR | 0.35 = natural crispness | 0.75-1.0 = strong detail",
-                        )
+                        with gr.Row():
+                            detail_slider = gr.Slider(
+                                minimum=0.0,
+                                maximum=1.0,
+                                value=default_det,
+                                step=0.05,
+                                label="Crisp Detail Scale (detail_scale)",
+                                info="0.0 = Stage-1 faithful | 0.5-1.0 = Stage-2 crisp photographic detail (0% overshoot)",
+                                scale=3,
+                            )
+                            upscale_radio = gr.Radio(
+                                choices=[("1x (Same Size)", 1), ("2x Super-Res", 2), ("4x Super-Res", 4)],
+                                value=1,
+                                label="Output Upscale",
+                                info="2x/4x runs bicubic pre-upscale + tiled Super-Resolution",
+                                scale=2,
+                            )
 
                         with gr.Accordion("Localized Spatial Mask / 1-Click Semantic Object Control", open=False):
                             mask_mode = gr.Radio(
@@ -535,17 +508,17 @@ def build_gradio_app(
                         with gr.Row():
                             synth_recipe_dd = gr.Dropdown(
                                 choices=list(SYNTH_RECIPES.keys()),
-                                value="Night Handheld (Dark Exposure -0.68 + Heavy Noise + Motion Blur)",
+                                value="Noisy Motion Blur (Dark -0.65 + Heavy ISP Noise + Motion Blur)",
                                 label="Degradation Recipe Preset",
                                 scale=3,
                             )
                             synth_seed_num = gr.Number(value=42, precision=0, label="Random Seed", scale=1)
 
                         synth_sliders = []
-                        default_recipe = SYNTH_RECIPES["Night Handheld (Dark Exposure -0.68 + Heavy Noise + Motion Blur)"]
-                        for row_idx in (0, 2, 4, 6, 8):
+                        default_recipe = SYNTH_RECIPES["Noisy Motion Blur (Dark -0.65 + Heavy ISP Noise + Motion Blur)"]
+                        for row_slice in ((0, 2), (2, 4), (4, 5), (5, 7)):
                             with gr.Row():
-                                for deg_key, label_txt, _, lo_v, hi_v, _ in SLIDER_SPECS[row_idx : row_idx + 2]:
+                                for deg_key, label_txt, _, lo_v, hi_v, _ in SLIDER_SPECS[row_slice[0] : row_slice[1]]:
                                     s = gr.Slider(
                                         minimum=lo_v,
                                         maximum=hi_v,
@@ -708,6 +681,7 @@ def build_gradio_app(
             cached_mask: Optional[np.ndarray],
             clean_gt_np: Optional[np.ndarray],
             d_scale: float,
+            up_val: int,
             tile_val: int,
             lens_k1_val: float,
             *slider_vals,
@@ -751,6 +725,7 @@ def build_gradio_app(
                 active_mask = np.clip(m_f, 0.0, 1.0)
                 mask_preview = render_mask_overlay_preview(rgb, active_mask)
 
+            up_factor = max(1, int(up_val or 1))
             t0 = time.perf_counter()
             with _INFER_LOCK:
                 restored_u8, _, _ = inferencer.restore(
@@ -763,26 +738,32 @@ def build_gradio_app(
                     detail_scale=float(d_scale),
                     tile_size=int(tile_val),
                     lens_distortion_k1=float(lens_k1_val),
+                    upscale=up_factor,
                 )
             elapsed_ms = (time.perf_counter() - t0) * 1000.0
 
-            diff_abs = np.abs(restored_u8.astype(np.float32) - rgb.astype(np.float32))
+            ref_rgb = (
+                cv2.resize(rgb, (restored_u8.shape[1], restored_u8.shape[0]), interpolation=cv2.INTER_CUBIC)
+                if restored_u8.shape[:2] != rgb.shape[:2]
+                else rgb
+            )
+            diff_abs = np.abs(restored_u8.astype(np.float32) - ref_rgb.astype(np.float32))
             mean_px_diff = float(diff_abs.mean())
             max_px_diff = float(diff_abs.max())
-            heatmap_u8 = _make_diff_heatmap(rgb, restored_u8, amp=4.0)
+            heatmap_u8 = _make_diff_heatmap(ref_rgb, restored_u8, amp=4.0)
             png_path = _save_temp_png(restored_u8, prefix="restored")
 
-            h, w = rgb.shape[:2]
+            h, w = restored_u8.shape[:2]
             summary_parts = [
-                f"**Resolution:** `{w}×{h}`",
+                f"**Resolution:** `{w}×{h}`" + (f" (`{up_factor}x` SR)" if up_factor > 1 else ""),
                 f"**Latency:** `{elapsed_ms:.0f} ms`",
-                f"**Generative Detail:** `{float(d_scale):.2f}`",
+                f"**Crisp Detail:** `{float(d_scale):.2f}`",
                 f"**Pixel Δ:** mean `{mean_px_diff:.2f}` / max `{max_px_diff:.1f}` (out of 255)",
             ]
             if clean_gt_np is not None and clean_gt_np.shape == restored_u8.shape:
-                in_psnr = compute_psnr_u8(rgb, clean_gt_np)
+                in_psnr = compute_psnr_u8(ref_rgb, clean_gt_np)
                 out_psnr = compute_psnr_u8(restored_u8, clean_gt_np)
-                in_ssim = compute_ssim_u8(rgb, clean_gt_np)
+                in_ssim = compute_ssim_u8(ref_rgb, clean_gt_np)
                 out_ssim = compute_ssim_u8(restored_u8, clean_gt_np)
                 gain = out_psnr - in_psnr
                 summary_parts.append(
@@ -790,7 +771,7 @@ def build_gradio_app(
                     f"SSIM `{in_ssim:.3f} -> {out_ssim:.3f}`"
                 )
 
-            comp_payload = (rgb, restored_u8) if has_image_slider else _make_side_by_side(rgb, restored_u8)
+            comp_payload = (ref_rgb, restored_u8) if has_image_slider else _make_side_by_side(ref_rgb, restored_u8)
             return (
                 comp_payload,
                 restored_u8,
@@ -813,6 +794,7 @@ def build_gradio_app(
                 extracted_mask_state,
                 clean_ref_state,
                 detail_slider,
+                upscale_radio,
                 tile_slider,
                 lens_k1_slider,
                 *slider_controls,
@@ -869,7 +851,7 @@ def build_gradio_app(
             full_act = synth_pipeline.compute_full_restore_action(state_vec)
             suggested = [round(float(x) * 20.0) / 20.0 for x in full_act.tolist()]
             if all(abs(v) < 1e-4 for v in suggested):
-                suggested = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0]
+                suggested = [1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0]
             return (
                 deg_rgb,
                 clean_rgb,

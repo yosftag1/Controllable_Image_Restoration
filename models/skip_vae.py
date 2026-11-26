@@ -1,9 +1,12 @@
-"""Skip-Connected AutoencoderKL with Lightweight Encoder LoRA & Frozen Natural Decoder.
+"""Skip-Connected AutoencoderKL with Action-Gated Skips & Detail-Gated Stage-2 Decoder LoRA.
 
-1. `vae.encoder` receives lightweight pixel-stage LoRA (when `VAE_ENC_LORA_RANK > 0`).
-2. `vae.decoder` stays 100% frozen so every decoded edge lies on SD's natural image manifold.
-3. `_SpatialSkipBridge` passes action-gated multi-scale encoder skips into the frozen decoder,
-   smoothly fading fine high-res skips as `detail_scale` increases so Stage-2 micro-texture is never washed out.
+1. `vae.encoder` stays frozen by default (`VAE_ENC_LORA_RANK=0`) to avoid blind unconditioned shifts.
+2. `vae.decoder` stays 100% frozen in Stage 1 (`detail_scale=0.0`) and on `denoise`/tone, while
+   optionally receiving a lightweight Stage-2 `sem_branch`-only LoRA (`VAE_DEC_LORA_RANK=8`,
+   strictly gated by `detail_scale * detail_route`) so 1-2px edges decode razor-crisp!
+3. `_SpatialSkipBridge` shuts down encoder skips (~90-98%) on destructive tasks (`deblur_motion`,
+   `super_resolution`, `dehaze`) in BOTH Stage 1 and Stage 2 so blurry/hazy input features never
+   bleed into the decoder, while preserving crisp skips for `denoise`, `deartifact`, and tone.
 """
 
 import math
@@ -18,7 +21,7 @@ from .lora_layers import infer_module_dtype, inject_generator_dual_lora
 
 
 class _SpatialSkipBridge(nn.Module):
-    """Lean action-gated spatial skip bridge from VAE Encoder to Frozen VAE Decoder."""
+    """Lean action-gated spatial skip bridge from VAE Encoder to VAE Decoder."""
 
     def __init__(
         self,
@@ -151,7 +154,7 @@ class _MockTinyVAE(nn.Module):
 
 
 class SkipConnectedVAE(nn.Module):
-    """Wraps AutoencoderKL with lightweight Encoder LoRA, action-gated skip bridges & frozen Decoder."""
+    """Wraps AutoencoderKL with destructive-task skip shutdown & Stage-2 detail-gated Decoder LoRA."""
 
     def __init__(self, vae: nn.Module, config):
         super().__init__()
@@ -163,7 +166,32 @@ class SkipConnectedVAE(nn.Module):
         for p in self.vae.parameters():
             p.requires_grad = False
 
-        enc_rank = int(getattr(config, "VAE_ENC_LORA_RANK", 8) or 0)
+        deg_names = list(getattr(config, "DEGRADATION_TYPES", []))
+        signed_set = set(getattr(config, "SIGNED_ACTION_TYPES", ["exposure", "warmth"]))
+        struct_idx = [i for i, n in enumerate(deg_names) if n not in signed_set]
+        self.register_buffer("struct_action_indices", torch.tensor(struct_idx, dtype=torch.long), persistent=False)
+
+        raw_destr = getattr(
+            config,
+            "DESTRUCTIVE_SKIP_ACTIONS",
+            ["deblur_motion", "super_resolution", "sharpen_focus", "dehaze", "deflare", "dereflection"],
+        )
+        destr_set = set(raw_destr)
+        destr_idx = [i for i, n in enumerate(deg_names) if n in destr_set]
+        self.register_buffer("destructive_action_indices", torch.tensor(destr_idx, dtype=torch.long), persistent=False)
+
+        raw_detail = getattr(config, "DETAIL_ACTION_TYPES", None)
+        if raw_detail:
+            detail_set = set(raw_detail)
+            detail_idx = [i for i, n in enumerate(deg_names) if n in detail_set]
+        else:
+            detail_idx = list(struct_idx)
+        if not detail_idx:
+            detail_idx = list(struct_idx)
+        self.register_buffer("detail_action_indices", torch.tensor(detail_idx, dtype=torch.long), persistent=False)
+
+        # Optional VAE Encoder LoRA (disabled by default: VAE_ENC_LORA_RANK=0 avoids blind unconditioned drift)
+        enc_rank = int(getattr(config, "VAE_ENC_LORA_RANK", 0) or 0)
         enc_alpha = float(getattr(config, "VAE_ENC_LORA_ALPHA", float(enc_rank)))
         if enc_rank > 0:
             enc_pix_params, _ = inject_generator_dual_lora(
@@ -177,26 +205,40 @@ class SkipConnectedVAE(nn.Module):
             )
         else:
             enc_pix_params = []
-
         self.vae_pix_lora_params = list(enc_pix_params)
 
+        # Probe skip & decoder channel dimensions before wrapping decoder convs
         with torch.no_grad():
             enc_dev = next(self.vae.encoder.parameters()).device
             dummy = torch.zeros(1, 3, 64, 64, device=enc_dev)
             z_dummy, enc_skips = self._raw_encode(dummy)
             dec_channels = self._probe_decoder_channels(z_dummy)
 
-        deg_names = list(getattr(config, "DEGRADATION_TYPES", []))
-        signed_set = set(getattr(config, "SIGNED_ACTION_TYPES", ["exposure", "warmth"]))
-        struct_idx = [i for i, n in enumerate(deg_names) if n not in signed_set]
-        self.register_buffer("struct_action_indices", torch.tensor(struct_idx, dtype=torch.long), persistent=False)
-        blur_set = {"deblur_motion", "sharpen_focus"}
-        blur_idx = [i for i, n in enumerate(deg_names) if n in blur_set]
-        self.register_buffer("blur_action_indices", torch.tensor(blur_idx, dtype=torch.long), persistent=False)
+        # Stage-2 detail-gated VAE Decoder LoRA (`rank=0` for pixel stage -> 100% frozen at detail_scale=0!)
+        dec_sem_rank = int(getattr(config, "VAE_DEC_LORA_RANK", 8) or 0)
+        dec_sem_alpha = float(getattr(config, "VAE_DEC_LORA_ALPHA", float(dec_sem_rank)))
+        if dec_sem_rank > 0:
+            _, dec_sem_params = inject_generator_dual_lora(
+                self.vae.decoder,
+                rank=0,
+                alpha=0.0,
+                conv_rank=0,
+                conv_alpha=0.0,
+                expert_specs=None,
+                sem_rank=dec_sem_rank,
+                sem_alpha=dec_sem_alpha,
+                sem_conv_rank=dec_sem_rank,
+                sem_conv_alpha=dec_sem_alpha,
+                sem_indices=detail_idx,
+                include_conv=True,
+            )
+        else:
+            dec_sem_params = []
+        self.vae_sem_lora_params = list(dec_sem_params)
 
         num_actions = config.NUM_ACTIONS
         mod_hidden = getattr(config, "SPATIAL_MOD_HIDDEN_DIM", 64)
-        self.skip_dropout_prob = float(getattr(config, "SKIP_DROPOUT_PROB", 0.25))
+        self.skip_dropout_prob = float(getattr(config, "SKIP_DROPOUT_PROB", 0.15))
 
         self.up_skip_bridges = nn.ModuleList(
             [
@@ -226,7 +268,12 @@ class SkipConnectedVAE(nn.Module):
     ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
         enc = self.vae.encoder
         vae_dtype = infer_module_dtype(enc, fallback=x_minus1_to_1.dtype)
-        use_ckpt = getattr(self, "gradient_checkpointing", False) and self.training and torch.is_grad_enabled()
+        use_ckpt = (
+            getattr(self, "gradient_checkpointing", False)
+            and self.training
+            and torch.is_grad_enabled()
+            and len(self.vae_pix_lora_params) > 0
+        )
 
         h = enc.conv_in(x_minus1_to_1.to(vae_dtype))
         if use_ckpt and not h.requires_grad:
@@ -285,7 +332,7 @@ class SkipConnectedVAE(nn.Module):
         detail_scale: float = 0.0,
         release_skips: bool = False,
     ) -> torch.Tensor:
-        """Decode latents back to [0, 1] RGB through frozen natural-manifold AutoencoderKL decoder."""
+        """Decode latents to [0, 1] RGB, suppressing blurry/veiled skips on destructive tasks."""
         dec = self.vae.decoder
         vae_dtype = infer_module_dtype(dec, fallback=latents.dtype)
         use_ckpt = getattr(self, "gradient_checkpointing", False) and self.training and torch.is_grad_enabled()
@@ -296,7 +343,6 @@ class SkipConnectedVAE(nn.Module):
             keep_mask = (
                 torch.rand((bsz, 1, 1, 1), device=latents.device, dtype=torch.float32) < keep_prob
             ).float() * float(skip_scale)
-            # Ensure at least one sample keeps skips so bridge parameters always receive gradients under DDP
             if float(keep_mask.sum().item()) == 0.0 and float(skip_scale) > 0.0:
                 keep_mask[0] = float(skip_scale)
         else:
@@ -312,11 +358,10 @@ class SkipConnectedVAE(nn.Module):
         h = grad_checkpoint(dec.mid_block, h, use_reentrant=False) if use_ckpt else dec.mid_block(h)
 
         detail_env = min(1.0, max(0.0, float(detail_scale)))
-        # Keep non-blur encoder skips 100% intact (zero generative drift on `denoise`/tone!),
-        # while strongly fading blurry input skips across ALL 3 scales (32x32, 64x64, 128x128) on blur tasks
-        # (`0.50/0.70/0.85` in Stage 1 -> `0.75/0.90/0.95` at `detail_scale=1.0`, leaving >=5% for DDP grads).
-        blur_base_fade = (0.50, 0.70, 0.85)
-        blur_detail_fade = (0.25, 0.20, 0.10)
+        # Keep `denoise`/`deartifact`/tone encoder skips intact while shutting down blurry/low-res/hazy
+        # input skips across ALL 3 scales in BOTH Stage 1 (90/95/98% off) and Stage 2 (95/98/98% off).
+        destr_base_fade = (0.90, 0.95, 0.98)
+        destr_detail_fade = (0.05, 0.03, 0.00)
         skip_indices = [2, 1, 0]
         for idx, up_block in enumerate(dec.up_blocks):
             if idx < 3 and len(enc_skips) > skip_indices[idx]:
@@ -325,17 +370,17 @@ class SkipConnectedVAE(nn.Module):
                 if release_skips and not use_ckpt:
                     enc_skips[s_idx] = None
                 if enc_skip is not None:
-                    level_fade = blur_base_fade[idx] + blur_detail_fade[idx] * detail_env
-                    if level_fade > 1e-4 and self.blur_action_indices.numel() > 0:
+                    level_fade = destr_base_fade[idx] + destr_detail_fade[idx] * detail_env
+                    if level_fade > 1e-4 and self.destructive_action_indices.numel() > 0:
                         thw = h.shape[-2:]
                         a_loc = (
                             F.interpolate(action_map.float(), size=thw, mode="area")
                             if action_map.shape[-2:] != thw
                             else action_map.float()
                         )
-                        bi = self.blur_action_indices.to(a_loc.device)
-                        blur_act = a_loc.index_select(1, bi).abs().amax(dim=1, keepdim=True).clamp(0.0, 1.0)
-                        eff_keep = keep_mask * (1.0 - level_fade * blur_act).clamp(0.0, 1.0)
+                        di = self.destructive_action_indices.to(a_loc.device)
+                        destr_act = a_loc.index_select(1, di).abs().amax(dim=1, keepdim=True).clamp(0.0, 1.0)
+                        eff_keep = keep_mask * (1.0 - level_fade * destr_act).clamp(0.0, 1.0)
                     else:
                         eff_keep = keep_mask
 

@@ -1,5 +1,17 @@
-"""Losses for 2-stage controllable restoration training."""
+from .controllable_losses import (
+    ControllableRestorationLoss,
+    DINOv2FeatureDiscriminator,
+    MultiLayerVGGPerceptual,
+    MultiScaleEdgeGradientLoss,
+    MultiScaleFreqEdgeLoss,
+    SpectralPatchDiscriminator,
+)
 
-from .controllable_losses import ControllableRestorationLoss, SpectralPatchDiscriminator
-
-__all__ = ["ControllableRestorationLoss", "SpectralPatchDiscriminator"]
+__all__ = [
+    "ControllableRestorationLoss",
+    "DINOv2FeatureDiscriminator",
+    "MultiLayerVGGPerceptual",
+    "MultiScaleEdgeGradientLoss",
+    "MultiScaleFreqEdgeLoss",
+    "SpectralPatchDiscriminator",
+]

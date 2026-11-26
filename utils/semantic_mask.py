@@ -37,44 +37,33 @@ SHORT_ALIASES: Dict[str, str] = {
     "motion_blur": "deblur_motion",
     "deblur_motion": "deblur_motion",
     "deblur": "deblur_motion",
-    # 4. Optical defocus & low-res focus sharpening [0, 1]
-    "focus": "sharpen_focus",
-    "sharpen": "sharpen_focus",
-    "sharpen_focus": "sharpen_focus",
-    "defocus": "sharpen_focus",
-    "defocus_blur": "sharpen_focus",
-    "bokeh": "sharpen_focus",
-    "sr": "sharpen_focus",
-    "upscale": "sharpen_focus",
-    "downsample": "sharpen_focus",
-    "downsample_upsample": "sharpen_focus",
-    # 5. Lens flare & veiling glare removal [0, 1]
-    "flare": "deflare",
-    "deflare": "deflare",
-    "lens_flare": "deflare",
-    "glare": "deflare",
-    # 6. Window / glass reflection removal [0, 1]
-    "reflection": "dereflection",
-    "dereflection": "dereflection",
-    "glass": "dereflection",
-    "refl": "dereflection",
-    # 7. Chromatic aberration removal [0, 1]
-    "ca": "dechromatic",
-    "chromatic": "dechromatic",
-    "dechromatic": "dechromatic",
-    "fringing": "dechromatic",
-    "aberration": "dechromatic",
-    # 8. Atmospheric haze / fog removal [0, 1]
+    # 4. Super-Resolution & Crisp Detail Enhancement [0, 1]
+    "sr": "super_resolution",
+    "super_res": "super_resolution",
+    "super_resolution": "super_resolution",
+    "superres": "super_resolution",
+    "upscale": "super_resolution",
+    "detail": "super_resolution",
+    "details": "super_resolution",
+    "focus": "super_resolution",
+    "sharpen": "super_resolution",
+    "sharpen_focus": "super_resolution",
+    "defocus": "super_resolution",
+    "defocus_blur": "super_resolution",
+    "bokeh": "super_resolution",
+    "downsample": "super_resolution",
+    "downsample_upsample": "super_resolution",
+    # 5. Atmospheric haze / fog removal [0, 1]
     "haze": "dehaze",
     "dehaze": "dehaze",
     "fog": "dehaze",
     "mist": "dehaze",
-    # 9. Signed directional exposure [-1, +1] (- = darken, + = brighten)
+    # 6. Signed directional exposure [-1, +1] (- = darken, + = brighten)
     "exposure": "exposure",
     "exposure_issue": "exposure",
     "ev": "exposure",
     "light": "exposure",
-    # 10. Signed directional white balance / warmth [-1, +1] (- = cool, + = warm)
+    # 7. Signed directional white balance / warmth [-1, +1] (- = cool, + = warm)
     "warmth": "warmth",
     "wb": "warmth",
     "temp": "warmth",

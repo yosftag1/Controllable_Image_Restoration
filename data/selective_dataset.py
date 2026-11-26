@@ -1,4 +1,21 @@
-"""Seed-synchronized selective, localized & directional degradation + Real-Pair Hybrid Dataset (V5)."""
+"""Artifact-First, Dataset-Balanced Selective Restoration & Real-World SR Dataset (V7).
+
+Key design principles:
+1. Streamlined 7-control orthogonal schema:
+   `denoise`, `deartifact`, `deblur_motion`, `super_resolution`, `dehaze`, `exposure`, `warmth`.
+2. Balanced around ARTIFACTS first (`ARTIFACT_SAMPLING_WEIGHTS` prioritizing `deblur_motion`,
+   `super_resolution`, `denoise`), and balanced across DATASETS inside each artifact:
+   - Clean pool is grouped by dataset source (`DIV2K`, `Flickr2K`, `LSDIR`, `OST`, etc.) so 800
+     razor-sharp DIV2K images aren't drowned out by 10k OST images, and soft 720p GoPro/HIDE/RealBlur
+     frames are NEVER dumped into the clean pool (`REUSE_PAIRED_CLEAN_FOR_SYNTH = False`).
+   - Within `deblur_motion`, real paired datasets are balanced per sub-dataset (`GoPro`, `HIDE`,
+     `RealBlur`, `BlurDataset`) alongside crisp synthetic DIV2K/DF2K motion blur.
+3. Single-artifact-first curriculum (~84% single-artifact early -> ~62% single / 38% compound),
+   explicit `"all"` action vector coverage (`16%` on both synthetic and real pairs), and boosted
+   `denoise + deblur_motion` co-occurrence with realistic demosaiced & noise-before-JPEG ISP noise.
+4. Strict `gan_clean_eligible` flag per sample so Stage-2 DINOv2 Discriminator ONLY treats 100%
+   restored (`s_tgt == 0`), crisp high-res clean photography as REAL.
+"""
 
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -24,64 +41,72 @@ class DegradationParams:
     height: int
     width: int
     noise_seed: int                  # Deterministic seed for lazy sensor noise realization
-    motion_angle: float              # Primary trajectory angle in [0, 180)
+    noise_mode: int = 0              # 0=white/heteroscedastic, 1=demosaiced correlated ISP, 2=noise-before-JPEG
+    heteroscedastic_noise: bool = False
+    motion_angle: float = 0.0        # Primary trajectory angle in [0, 180)
     motion_curve_bend: float = 0.0   # Quadratic Bezier camera-shake curvature in [-max_bend, +max_bend]
     motion_dwell_end: float = 0.0    # Shutter turnaround endpoint dwell in [0, 0.35]
     motion_shake_jitter: float = 0.0 # S-curve / handheld tremor amplitude in [-0.35, +0.35]
     motion_pattern: int = 0          # 0 = Bezier arc, 1 = S-curve tremor, 2 = micro-shake jitter
-    motion_spatial_mode: int = 0     # 0=uniform, 1=parallax (BG heavy/FG mild), 2=moving FG, 3=smooth 3-basis field
-    motion_hdr_boost: float = 0.0    # Linear-light specular highlight lift before blur for realistic streaks
+    motion_spatial_mode: int = 0     # 0=uniform, 1=parallax, 2=moving FG, 3=smooth 3-basis field
+    motion_hdr_boost: float = 0.0    # Linear-light specular highlight lift before blur
     motion_angle_delta: float = 0.0  # Spatial angle shift (deg) across smooth non-uniform blur field
-    motion_bg_ratio: float = 0.10    # Relative blur length on sharp/minor layer in parallax & moving-subject modes
+    motion_bg_ratio: float = 0.10    # Relative blur length on sharp/minor layer in non-uniform modes
     motion_field_seed: int = 17      # Deterministic seed for spatial motion blur mask / depth field
-    use_bokeh_disc: bool = True      # True = optical circle-of-confusion disc PSF, False = Gaussian softness
-    focus_mode: int = 0              # 0 = optical defocus/bokeh, 1 = low-res bicubic, 2 = hybrid lens+resample
-    use_chromatic_aberration: bool = False  # Subtle lateral R/B lens fringing in optical focus mode
-    chroma_shift_px: float = 0.0     # Lateral R/B chromatic shift amplitude in pixels
-    artifact_mode: int = 0           # 0 = JPEG, 1 = 8-bit banding, 2 = JPEG+banding, 3 = 4:2:0 chroma+ringing+JPEG
-    jpeg_quality: int = 20           # Frozen base JPEG quality in [10, 32] for monotonic severity blending
-    banding_levels: int = 12         # Frozen base quantization levels in [7, 16]
-    heteroscedastic_noise: bool = False  # Signal-dependent CMOS shot+read noise modulation
-    flare_style: int = 0             # 0=Wave-Optics FFT, 1=Anamorphic, 2=Off-frame Wash, 3=Ghost Chain, 4=Rainbow Arc
-    flare_cx: float = 0.80           # Flare light center X in normalized coords (can be off-frame)
-    flare_cy: float = 0.16           # Flare light center Y in normalized coords
-    flare_seed: int = 7              # Deterministic seed for FFT dust/scratches & ghosts
-    flare_tint: Tuple[float, float, float] = (1.0, 0.88, 0.68)
-    refl_sigma: float = 2.6          # Glass reflection optical defocus sigma
-    refl_dx: float = 5.0             # Double-pane horizontal ghost offset (px)
-    refl_dy: float = 3.0             # Double-pane vertical ghost offset (px)
-    refl_angle: float = 0.6          # Planar Fresnel gradient angle
-    ca_max_scale: float = 0.016      # Radial R/B magnification delta at severity=1.0
-    haze_seed: int = 11              # Seed for smooth spatial atmospheric depth map
+    # Real-ESRGAN-style blind super-resolution / crisp detail parameters
+    sr_mode: int = 0                 # 0=anisotropic blur+down-up, 1=2-stage blur+down-up+mild JPEG, 2=optical softness+mild down-up
+    sr_blur_angle: float = 0.0       # Anisotropic optical PSF angle (deg)
+    sr_blur_aniso: float = 1.0       # Aspect ratio between sigma_x and sigma_y in [0.55, 1.0]
+    sr_down_interp: int = 0          # 0=INTER_AREA, 1=INTER_LINEAR, 2=INTER_CUBIC
+    sr_up_interp: int = 0            # 0=INTER_CUBIC, 1=INTER_LINEAR
+    sr_scale_factor: float = 0.35    # Base min scale in SR_DOWNSAMPLE_SCALE_RANGE at sev=1.0
+    sr_sigma_max: float = 1.5        # Base max optical blur sigma in SR_BLUR_SIGMA_RANGE at sev=1.0
+    # Compression & banding
+    artifact_mode: int = 0           # 0=JPEG, 1=8-bit banding, 2=JPEG+banding, 3=4:2:0 chroma+ringing+JPEG
+    jpeg_quality: int = 20           # Frozen base JPEG quality for monotonic severity blending
+    banding_levels: int = 12         # Frozen base quantization levels
+    # Atmospheric haze
+    haze_seed: int = 11
     haze_airlight: Tuple[float, float, float] = (215.0, 224.0, 236.0)
-    exposure_sign: float = 1.0       # -1.0 (dark/underexposed) or +1.0 (bright/washed-out)
-    warmth_sign: float = 1.0         # -1.0 (cold blue cast) or +1.0 (warm amber/yellow cast)
+    # Signed tone/WB signs
+    exposure_sign: float = 1.0       # -1.0 (dark) or +1.0 (bright)
+    warmth_sign: float = 1.0         # -1.0 (cool blue) or +1.0 (warm amber)
     _noise_cache: Optional[np.ndarray] = field(default=None, repr=False)
-    _flare_cache: Optional[Tuple[np.ndarray, np.ndarray]] = field(default=None, repr=False)
-    _refl_cache: Optional[Tuple[np.ndarray, np.ndarray]] = field(default=None, repr=False)
     _haze_depth_cache: Optional[np.ndarray] = field(default=None, repr=False)
     _motion_mask_cache: Optional[np.ndarray] = field(default=None, repr=False)
 
     def get_noise_unit(self) -> np.ndarray:
-        """Lazily materialize realistic sensor noise (80% RGB independent + 20% correlated luminance grain)."""
+        """Lazily materialize realistic sensor noise (pixel-independent or demosaiced correlated ISP)."""
         if self._noise_cache is None:
             nrng = np.random.default_rng(self.noise_seed)
             rgb_n = nrng.standard_normal((self.height, self.width, 3), dtype=np.float32)
             luma_n = nrng.standard_normal((self.height, self.width, 1), dtype=np.float32)
-            self._noise_cache = np.float32(0.82) * rgb_n + np.float32(0.35) * luma_n
+            raw_n = np.float32(0.82) * rgb_n + np.float32(0.35) * luma_n
+            if self.noise_mode == 1:
+                # Spatially correlated Bayer-demosaiced camera ISP grain + coarser chroma blotches
+                luma_corr = cv2.GaussianBlur(raw_n, (3, 3), sigmaX=0.65, sigmaY=0.65)
+                ch_small = cv2.resize(
+                    nrng.standard_normal((max(8, self.height // 2), max(8, self.width // 2), 3), dtype=np.float32),
+                    (self.width, self.height),
+                    interpolation=cv2.INTER_LINEAR,
+                )
+                ch_zero_mean = ch_small - ch_small.mean(axis=2, keepdims=True)
+                comb = np.float32(0.80) * luma_corr + np.float32(0.55) * ch_zero_mean
+                # Re-normalize to ~unit std so severity scales consistently across noise modes
+                std_est = max(1e-4, float(comb.std()))
+                self._noise_cache = comb * np.float32(1.0 / std_est)
+            else:
+                self._noise_cache = raw_n
         return self._noise_cache
 
 
 class SelectiveDegradationPipeline:
-    """Synthesizes (x_src, A_spatial, x_tgt) pairs from clean GT or Compositional Real Camera Blur Pairs."""
+    """Synthesizes (x_src, A_spatial, x_tgt) pairs from crisp GT or Real Camera Deblur Pairs."""
 
     PHYSICAL_ORDER = [
         "dehaze",
-        "dereflection",
-        "sharpen_focus",
-        "dechromatic",
+        "super_resolution",
         "deblur_motion",
-        "deflare",
         "exposure",
         "warmth",
         "deartifact",
@@ -99,8 +124,8 @@ class SelectiveDegradationPipeline:
 
         self.min_severity = float(getattr(config, "MIN_SEVERITY", 0.25))
         self.max_compound = int(getattr(config, "MAX_COMPOUND_DEGRADATIONS", 3))
-        self.compound_prob = float(getattr(config, "COMPOUND_PROB", 0.70))
-        self.spatial_mask_prob = float(getattr(config, "SPATIAL_MASK_PROB", 0.25))
+        self.compound_prob = float(getattr(config, "COMPOUND_PROB", 0.38))
+        self.spatial_mask_prob = float(getattr(config, "SPATIAL_MASK_PROB", 0.20))
 
         self._curriculum_boost_val: float = 0.0
         self._curriculum_shared = (
@@ -110,20 +135,44 @@ class SelectiveDegradationPipeline:
         self._detail_focus_shared = (
             torch.zeros(1, dtype=torch.uint8).share_memory_() if torch is not None else None
         )
+
         raw_detail_types = getattr(
             config,
             "DETAIL_ACTION_TYPES",
-            ["deblur_motion", "sharpen_focus", "deartifact", "deflare", "dereflection"],
+            ["deblur_motion", "super_resolution", "deartifact", "dehaze"],
         )
         self.detail_indices = [self.type_to_idx[n] for n in raw_detail_types if n in self.type_to_idx]
-        self.blur_indices = [
-            self.type_to_idx[n] for n in ("deblur_motion", "sharpen_focus") if n in self.type_to_idx
-        ]
+
+        # Normalized Stage-1 & Stage-2 primary artifact budgets
+        self.stage1_artifact_probs = self._build_artifact_probs(
+            getattr(config, "ARTIFACT_SAMPLING_WEIGHTS", None)
+        )
+        self.stage2_artifact_probs = self._build_artifact_probs(
+            getattr(config, "STAGE2_ARTIFACT_SAMPLING_WEIGHTS", None), fallback=self.stage1_artifact_probs
+        )
 
         self.exp_kappa = float(getattr(config, "EXPOSURE_STRENGTH_KAPPA", 2.15))
         self.warm_r_kappa = float(getattr(config, "WARMTH_R_KAPPA", 1.15))
         self.warm_g_kappa = float(getattr(config, "WARMTH_G_KAPPA", 0.12))
         self.warm_b_kappa = float(getattr(config, "WARMTH_B_KAPPA", 1.30))
+
+    def _build_artifact_probs(
+        self, weights_map: Optional[Dict[str, float]], fallback: Optional[np.ndarray] = None
+    ) -> np.ndarray:
+        if not weights_map:
+            if fallback is not None:
+                return fallback.copy()
+            return np.full(self.num_types, 1.0 / max(1, self.num_types), dtype=np.float64)
+        arr = np.array(
+            [max(0.0, float(weights_map.get(name, 0.0))) for name in self.degradation_types],
+            dtype=np.float64,
+        )
+        s = float(arr.sum())
+        if s <= 1e-8:
+            if fallback is not None:
+                return fallback.copy()
+            return np.full(self.num_types, 1.0 / max(1, self.num_types), dtype=np.float64)
+        return arr / s
 
     @property
     def curriculum_single_boost(self) -> float:
@@ -156,6 +205,13 @@ class SelectiveDegradationPipeline:
             return deg_name_or_idx in self.signed_indices
         return str(deg_name_or_idx) in self.signed_types
 
+    def sample_primary_artifact(self, rng: np.random.Generator = None) -> str:
+        """Sample the primary artifact strictly according to configured artifact budget."""
+        rng = rng or np.random.default_rng()
+        probs = self.stage2_artifact_probs if self.detail_stage_focus else self.stage1_artifact_probs
+        idx = int(rng.choice(self.num_types, p=probs))
+        return self.degradation_types[idx]
+
     def sample_params(self, height: int, width: int, rng: np.random.Generator = None) -> DegradationParams:
         """Sample all stochastic physical realizations upfront, independent of severity."""
         rng = rng or np.random.default_rng()
@@ -163,76 +219,51 @@ class SelectiveDegradationPipeline:
         max_bend = float(getattr(self.config, "MOTION_CURVE_MAX_BEND", 0.38))
         min_q, max_q = self.config.JPEG_QUALITY_RANGE
         min_lvl, max_lvl = self.config.BANDING_LEVELS_RANGE
-        f_style = int(rng.choice([0, 1, 2, 3, 4], p=[0.24, 0.18, 0.22, 0.22, 0.14]))
-        if f_style == 2:
-            # Off-frame light source just outside border
-            side = int(rng.integers(0, 4))
-            if side == 0:
-                fcx, fcy = float(rng.uniform(-0.22, -0.04)), float(rng.uniform(0.05, 0.90))
-            elif side == 1:
-                fcx, fcy = float(rng.uniform(1.04, 1.22)), float(rng.uniform(0.05, 0.90))
-            elif side == 2:
-                fcx, fcy = float(rng.uniform(0.10, 0.90)), float(rng.uniform(-0.22, -0.04))
-            else:
-                fcx, fcy = float(rng.uniform(0.10, 0.90)), float(rng.uniform(1.04, 1.22))
-        else:
-            fcx = float(rng.uniform(0.08, 0.92))
-            fcy = float(rng.uniform(0.08, 0.42) if rng.random() < 0.7 else rng.uniform(0.55, 0.92))
-        tint_presets = [
-            (1.0, 0.88, 0.66),
-            (1.0, 0.94, 0.82),
-            (0.92, 0.96, 1.00),
-            (1.0, 0.82, 0.56),
-        ]
-        f_tint = tint_presets[int(rng.integers(0, len(tint_presets)))]
+        sr_s_lo, sr_s_hi = getattr(self.config, "SR_DOWNSAMPLE_SCALE_RANGE", (0.25, 0.65))
+        sr_b_lo, sr_b_hi = getattr(self.config, "SR_BLUR_SIGMA_RANGE", (0.4, 2.2))
+
         air_base = float(rng.uniform(195.0, 238.0))
         air_col = (
             float(np.clip(air_base + rng.uniform(-10.0, 8.0), 175.0, 248.0)),
             float(np.clip(air_base + rng.uniform(-4.0, 8.0), 180.0, 248.0)),
             float(np.clip(air_base + rng.uniform(2.0, 18.0), 185.0, 250.0)),
         )
-        nonunif_p = float(np.clip(getattr(self.config, "MOTION_NONUNIFORM_PROB", 0.60), 0.0, 0.95))
+        nonunif_p = float(np.clip(getattr(self.config, "MOTION_NONUNIFORM_PROB", 0.25), 0.0, 0.90))
         if rng.random() < nonunif_p:
-            # Non-uniform modes: 1=Parallax (BG heavy / FG mild-sharp), 2=Moving FG subject, 3=Smooth 3-basis field
             m_spatial_mode = int(rng.choice([1, 2, 3], p=[0.38, 0.30, 0.32]))
         else:
             m_spatial_mode = 0
-        hdr_p = float(np.clip(getattr(self.config, "MOTION_HDR_STREAK_PROB", 0.65), 0.0, 1.0))
-        m_hdr_boost = float(rng.uniform(0.18, 0.45)) if rng.random() < hdr_p else 0.0
-        m_angle_delta = float(rng.uniform(-32.0, 32.0))
+        hdr_p = float(np.clip(getattr(self.config, "MOTION_HDR_STREAK_PROB", 0.55), 0.0, 1.0))
+        m_hdr_boost = float(rng.uniform(0.15, 0.40)) if rng.random() < hdr_p else 0.0
+        m_angle_delta = float(rng.uniform(-28.0, 28.0))
         m_bg_ratio = 0.0 if rng.random() < 0.35 else float(rng.uniform(0.05, 0.24))
+
         return DegradationParams(
             height=height,
             width=width,
             noise_seed=int(rng.integers(0, 2**31 - 1)),
+            noise_mode=int(rng.choice([0, 1, 2], p=[0.45, 0.30, 0.25])),
+            heteroscedastic_noise=bool(rng.random() < 0.45),
             motion_angle=float(rng.uniform(min_angle, max_angle)),
             motion_curve_bend=float(rng.uniform(-max_bend, max_bend)),
             motion_dwell_end=float(rng.uniform(0.0, 0.35)),
             motion_shake_jitter=float(rng.uniform(-0.35, 0.35)),
-            motion_pattern=int(rng.choice([0, 1, 2], p=[0.42, 0.36, 0.22])),
+            motion_pattern=int(rng.choice([0, 1, 2], p=[0.45, 0.35, 0.20])),
             motion_spatial_mode=m_spatial_mode,
             motion_hdr_boost=m_hdr_boost,
             motion_angle_delta=m_angle_delta,
             motion_bg_ratio=m_bg_ratio,
             motion_field_seed=int(rng.integers(0, 2**31 - 1)),
-            use_bokeh_disc=bool(rng.random() < 0.78),
-            focus_mode=int(rng.choice([0, 1, 2], p=[0.56, 0.24, 0.20])),
-            use_chromatic_aberration=bool(rng.random() < 0.20),
-            chroma_shift_px=float(rng.uniform(0.8, 2.0)),
-            artifact_mode=int(rng.choice([0, 1, 2, 3], p=[0.38, 0.20, 0.20, 0.22])),
+            sr_mode=int(rng.choice([0, 1, 2], p=[0.50, 0.30, 0.20])),
+            sr_blur_angle=float(rng.uniform(0.0, 180.0)),
+            sr_blur_aniso=float(rng.uniform(0.55, 1.0)),
+            sr_down_interp=int(rng.choice([0, 1, 2], p=[0.45, 0.30, 0.25])),
+            sr_up_interp=int(rng.choice([0, 1], p=[0.65, 0.35])),
+            sr_scale_factor=float(rng.uniform(sr_s_lo, sr_s_hi)),
+            sr_sigma_max=float(rng.uniform(sr_b_lo, sr_b_hi)),
+            artifact_mode=int(rng.choice([0, 1, 2, 3], p=[0.40, 0.18, 0.20, 0.22])),
             jpeg_quality=int(rng.integers(min_q, max(min_q + 1, (min_q + max_q) // 2))),
             banding_levels=int(rng.integers(min_lvl, max(min_lvl + 1, (min_lvl + max_lvl) // 2))),
-            heteroscedastic_noise=bool(rng.random() < 0.40),
-            flare_style=f_style,
-            flare_cx=fcx,
-            flare_cy=fcy,
-            flare_seed=int(rng.integers(0, 2**31 - 1)),
-            flare_tint=f_tint,
-            refl_sigma=float(rng.uniform(1.8, 4.0)),
-            refl_dx=float(rng.uniform(3.0, 7.0)) * (-1.0 if rng.random() < 0.5 else 1.0),
-            refl_dy=float(rng.uniform(2.0, 5.0)) * (-1.0 if rng.random() < 0.5 else 1.0),
-            refl_angle=float(rng.uniform(0.0, 2.0 * np.pi)),
-            ca_max_scale=float(rng.uniform(0.010, 0.022)),
             haze_seed=int(rng.integers(0, 2**31 - 1)),
             haze_airlight=air_col,
             exposure_sign=-1.0 if rng.random() < 0.5 else 1.0,
@@ -252,7 +283,7 @@ class SelectiveDegradationPipeline:
         return s_tgt
 
     def compute_full_restore_action(self, s_src: np.ndarray) -> np.ndarray:
-        """Return the exact user action vector that restores `s_src` completely back to clean `0.0`."""
+        """Return exact user action vector restoring `s_src` completely back to clean `0.0`."""
         act = np.zeros(self.num_types, dtype=np.float32)
         for k in self.unsigned_indices:
             if float(s_src[k]) > 1e-4:
@@ -263,7 +294,7 @@ class SelectiveDegradationPipeline:
         return act
 
     def compute_partial_restore_action(self, s_src: np.ndarray, fraction: float = 0.5) -> np.ndarray:
-        """Return the user action vector that removes `fraction` of every active degradation."""
+        """Return user action vector removing `fraction` of every active degradation."""
         frac = float(np.clip(fraction, 0.0, 1.0))
         act = np.zeros(self.num_types, dtype=np.float32)
         for k in self.unsigned_indices:
@@ -309,12 +340,10 @@ class SelectiveDegradationPipeline:
         dy_arr = t_vals * np.float32(ty) + np.float32(curve_bend) * quad_zero_mean * np.float32(ny)
 
         if pattern == 1 and abs(shake_jitter) > 1e-4:
-            # S-curve handheld trajectory wobble
             s_wave = np.sin(np.float32(np.pi) * t_vals) * np.float32(shake_jitter)
             dx_arr = dx_arr + s_wave * np.float32(nx)
             dy_arr = dy_arr + s_wave * np.float32(ny)
         elif pattern == 2 and abs(shake_jitter) > 1e-4:
-            # Multi-frequency handheld micro-shake tremor
             wobble_n = np.sin(np.float32(2.5 * np.pi) * t_vals) * np.float32(0.75 * shake_jitter)
             wobble_t = np.cos(np.float32(2.0 * np.pi) * t_vals) * np.float32(0.18 * abs(shake_jitter))
             dx_arr = dx_arr + wobble_n * np.float32(nx) + wobble_t * np.float32(tx)
@@ -325,7 +354,6 @@ class SelectiveDegradationPipeline:
         k_size = 2 * half_k + 1
         psf = np.zeros((k_size, k_size), dtype=np.float32)
 
-        # Subpixel bilinear splatting of shift `(dx, dy)` onto compact 2D correlation kernel
         fx = float(half_k) - dx_arr
         fy = float(half_k) - dy_arr
         x0 = np.floor(fx).astype(np.int32)
@@ -351,12 +379,11 @@ class SelectiveDegradationPipeline:
         seed: int,
         ref_lin_rgb: Optional[np.ndarray] = None,
     ) -> np.ndarray:
-        """Deterministic smooth [H, W, 1] spatial field in [0, 1] for parallax / moving-subject / 3-basis blur."""
+        """Deterministic smooth [H, W, 1] spatial field in [0, 1] for non-uniform motion blur."""
         mrng = np.random.default_rng(seed)
         gh, gw = max(16, h // 4), max(16, w // 4)
 
         if mode in (1, 2):
-            # Foreground/background region mask (LAB region, soft ellipse, or depth split)
             sub = float(mrng.random())
             if sub < 0.40 and ref_lin_rgb is not None:
                 srgb_small = np.clip(
@@ -403,7 +430,6 @@ class SelectiveDegradationPipeline:
                     field_small = np.float32(1.0) / (np.float32(1.0) + np.exp(-sharpness * (proj - offset)))
                     field = cv2.resize(field_small, (w, h), interpolation=cv2.INTER_LINEAR)
         else:
-            # Mode 3: smooth continuous depth/perspective/radial camera-roll blur field in [0, 1]
             yy, xx = np.meshgrid(
                 np.linspace(0.0, 1.0, gh, dtype=np.float32),
                 np.linspace(0.0, 1.0, gw, dtype=np.float32),
@@ -433,16 +459,18 @@ class SelectiveDegradationPipeline:
     def _apply_motion_blur_field(
         self, lin_rgb: np.ndarray, severity: float, params: DegradationParams
     ) -> np.ndarray:
-        """Apply severe curved/tremor & spatially-varying (parallax, moving-object, 3-basis) motion blur."""
+        """Apply curved/tremor & spatially-varying motion blur scaled cleanly to patch size."""
         if severity <= 1e-4:
             return lin_rgb
         sev = float(np.clip(severity, 0.0, 1.0))
         _, max_k = self.config.MOTION_BLUR_KERNEL_RANGE
-        length_px = sev * (float(max_k) - 1.0)
+        # Keep kernel reach <= 13% of patch side so boundary reflection never dominates small debug/256 crops
+        h, w = lin_rgb.shape[:2]
+        eff_max_k = min(float(max_k), max(11.0, float(min(h, w)) * 0.13))
+        length_px = sev * (eff_max_k - 1.0)
         if length_px <= 0.05:
             return lin_rgb
 
-        # Optional linear-light specular HDR boost so highlights streak naturally under heavy motion blur
         hdr_s = float(params.motion_hdr_boost) * min(1.0, length_px / 14.0)
         if hdr_s > 1e-4:
             x_lin = np.clip(lin_rgb * np.float32(1.0 / 255.0), np.float32(0.0), np.float32(1.0))
@@ -467,7 +495,6 @@ class SelectiveDegradationPipeline:
         if mode == 0:
             blurred = _blur_with(length_px, params.motion_angle, 1.0)
         else:
-            h, w = lin_rgb.shape[:2]
             if params._motion_mask_cache is None or params._motion_mask_cache.shape[:2] != (h, w):
                 params._motion_mask_cache = self._build_motion_spatial_field(
                     h, w, mode=mode, seed=params.motion_field_seed, ref_lin_rgb=lin_rgb
@@ -475,17 +502,14 @@ class SelectiveDegradationPipeline:
             m_field = params._motion_mask_cache
 
             if mode == 1:
-                # Parallax: background heavily blurred (`length_px`), closer FG subject mild or sharp
                 bg_b = _blur_with(length_px, params.motion_angle, 1.0)
                 fg_b = _blur_with(length_px * float(params.motion_bg_ratio), params.motion_angle, 0.4)
                 blurred = m_field * fg_b + (np.float32(1.0) - m_field) * bg_b
             elif mode == 2:
-                # Moving foreground subject: FG heavily blurred against near-static background
                 fg_b = _blur_with(length_px, params.motion_angle, 1.0)
                 bg_b = _blur_with(length_px * float(params.motion_bg_ratio), params.motion_angle, 0.3)
                 blurred = m_field * fg_b + (np.float32(1.0) - m_field) * bg_b
             else:
-                # Mode 3: smooth 3-basis spatially-varying blur field (length & angle ramp smoothly)
                 d_ang = float(params.motion_angle_delta)
                 b0 = _blur_with(length_px * 0.12, params.motion_angle, 0.35)
                 b1 = _blur_with(length_px * 0.55, params.motion_angle + 0.5 * d_ang, 0.70)
@@ -530,71 +554,62 @@ class SelectiveDegradationPipeline:
         return np.clip(np.round(out), np.float32(0.0), np.float32(255.0)).astype(np.uint8)
 
     @staticmethod
-    def _build_optical_bokeh_disc_kernel(radius: float) -> np.ndarray:
-        """Anti-aliased circular lens aperture circle-of-confusion PSF (matches real DSLR defocus!)."""
-        rad = max(0.15, float(radius))
-        half_k = max(1, int(np.ceil(rad + 0.75)))
-        coords = np.arange(-half_k, half_k + 1, dtype=np.float32)
+    def _build_anisotropic_gaussian_kernel(sigma_x: float, sigma_y: float, angle_deg: float) -> np.ndarray:
+        """Real-ESRGAN anisotropic 2D Gaussian optical blur kernel."""
+        sx = max(0.15, float(sigma_x))
+        sy = max(0.15, float(sigma_y))
+        rad_k = max(1, min(9, int(np.ceil(max(sx, sy) * 2.5))))
+        coords = np.arange(-rad_k, rad_k + 1, dtype=np.float32)
         yy, xx = np.meshgrid(coords, coords, indexing="ij")
-        dist = np.sqrt(xx * xx + yy * yy)
-        # Subpixel anti-aliased aperture rim + subtle realistic spherical-aberration ring profile
-        disc = np.clip(rad + 0.5 - dist, 0.0, 1.0)
-        rim_boost = 1.0 + 0.12 * np.square(np.minimum(dist / max(rad, 0.5), 1.0))
-        kern = (disc * rim_boost).astype(np.float32)
-        k_sum = float(kern.sum())
-        if k_sum <= 1e-6:
-            kern[half_k, half_k] = 1.0
-            return kern
-        return kern * np.float32(1.0 / k_sum)
+        th = float(np.deg2rad(angle_deg))
+        c, s = float(np.cos(th)), float(np.sin(th))
+        xr = c * xx + s * yy
+        yr = -s * xx + c * yy
+        kern = np.exp(-0.5 * ((xr * xr) / (sx * sx) + (yr * yr) / (sy * sy))).astype(np.float32)
+        kern /= max(1e-6, float(kern.sum()))
+        return kern
 
-    def _apply_focus_softness(self, img_float: np.ndarray, severity: float, params: DegradationParams) -> np.ndarray:
-        """Apply real-style optical bokeh disc PSF, Gaussian defocus, and/or bicubic resampling softness."""
+    def _apply_sr_degradation(self, img_float: np.ndarray, severity: float, params: DegradationParams) -> np.ndarray:
+        """Real-ESRGAN-style blind super-resolution & optical softness degradation (strictly monotonic)."""
         if severity <= 1e-4:
             return img_float
         sev = float(np.clip(severity, 0.0, 1.0))
         h, w = img_float.shape[:2]
         out = img_float
 
-        if params.focus_mode in (0, 2):
-            scale_f = 1.0 if params.focus_mode == 0 else 0.58
-            if params.use_bokeh_disc:
-                _, max_rad = getattr(self.config, "BOKEH_DISC_RADIUS_RANGE", (1.2, 6.5))
-                rad = sev * float(max_rad) * scale_f
-                if rad >= 0.20:
-                    kern = self._build_optical_bokeh_disc_kernel(rad)
-                    out = cv2.filter2D(out, cv2.CV_32F, kern, borderType=cv2.BORDER_REFLECT_101)
-            else:
-                _, max_sigma = getattr(self.config, "DEFOCUS_SIGMA_RANGE", (0.8, 4.4))
-                sigma = sev * float(max_sigma) * scale_f
-                if sigma >= 0.15:
-                    out = cv2.GaussianBlur(out, (0, 0), sigmaX=sigma, sigmaY=sigma)
+        # 1. Optical anisotropic Gaussian lens softness
+        blur_mul = 0.85 if params.sr_mode == 0 else (1.0 if params.sr_mode == 1 else 1.25)
+        sig_x = sev * float(params.sr_sigma_max) * blur_mul
+        sig_y = sig_x * float(params.sr_blur_aniso)
+        if sig_x >= 0.20:
+            kern = self._build_anisotropic_gaussian_kernel(sig_x, sig_y, params.sr_blur_angle)
+            out = cv2.filter2D(out, cv2.CV_32F, kern, borderType=cv2.BORDER_REFLECT_101)
 
-        if params.focus_mode in (1, 2):
-            min_scale, _ = self.config.DOWNSAMPLE_SCALE_RANGE
-            eff_sev = sev if params.focus_mode == 1 else (0.75 * sev)
-            scale = 1.0 - eff_sev * (1.0 - float(min_scale))
-            if scale < 0.985:
-                new_w = max(8, int(round(w * scale)))
-                new_h = max(8, int(round(h * scale)))
-                down = cv2.resize(out, (new_w, new_h), interpolation=cv2.INTER_AREA)
-                out = np.clip(
-                    cv2.resize(down, (w, h), interpolation=cv2.INTER_CUBIC),
-                    np.float32(0.0),
-                    np.float32(255.0),
-                )
+        # 2. Resolution loss: multi-kernel downsample -> bicubic/bilinear upsample back to (W, H)
+        down_flags = (cv2.INTER_AREA, cv2.INTER_LINEAR, cv2.INTER_CUBIC)
+        up_flags = (cv2.INTER_CUBIC, cv2.INTER_LINEAR)
+        down_flag = down_flags[int(params.sr_down_interp) % len(down_flags)]
+        up_flag = up_flags[int(params.sr_up_interp) % len(up_flags)]
 
-        if params.focus_mode in (0, 2) and params.use_chromatic_aberration and params.chroma_shift_px > 0.05:
-            shift = float(sev * params.chroma_shift_px)
-            if shift >= 0.05:
-                m_r = np.array([[1.0, 0.0, shift], [0.0, 1.0, 0.0]], dtype=np.float32)
-                m_b = np.array([[1.0, 0.0, -shift], [0.0, 1.0, 0.0]], dtype=np.float32)
-                out = out.copy()
-                out[:, :, 0] = cv2.warpAffine(
-                    out[:, :, 0], m_r, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT_101
-                )
-                out[:, :, 2] = cv2.warpAffine(
-                    out[:, :, 2], m_b, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT_101
-                )
+        base_min_s = float(params.sr_scale_factor)
+        if params.sr_mode == 2:
+            # Moderate resolution loss + optical softness (trains crisp detail boost on real soft photos!)
+            base_min_s = max(0.45, base_min_s + 0.15)
+        scale = 1.0 - sev * (1.0 - base_min_s)
+        if scale < 0.985:
+            new_w = max(12, int(round(w * scale)))
+            new_h = max(12, int(round(h * scale)))
+            down = cv2.resize(out, (new_w, new_h), interpolation=down_flag)
+            out = np.clip(
+                cv2.resize(down, (w, h), interpolation=up_flag),
+                np.float32(0.0),
+                np.float32(255.0),
+            )
+
+        # 3. Mode 1: realistic 2nd-order mild web JPEG softness (continuous Q in [92 -> 56])
+        if params.sr_mode == 1:
+            q_mild = int(round(92.0 - sev * 36.0))
+            out = self._render_base_jpeg(out, q_mild)
 
         return out
 
@@ -637,7 +652,6 @@ class SelectiveDegradationPipeline:
         cr_sub = cv2.resize(cv2.resize(cr, (half_w, half_h), interpolation=cv2.INTER_AREA), (w, h), interpolation=cv2.INTER_LINEAR)
         cb_sub = cv2.resize(cv2.resize(cb, (half_w, half_h), interpolation=cv2.INTER_AREA), (w, h), interpolation=cv2.INTER_LINEAR)
         sub_rgb = cv2.cvtColor(cv2.merge([y_ch, cr_sub, cb_sub]), cv2.COLOR_YCrCb2RGB).astype(np.float32)
-        # Subtle Gibbs ringing overshoot around high-contrast edges before JPEG
         blur_l = cv2.GaussianBlur(sub_rgb, (0, 0), sigmaX=1.0, sigmaY=1.0)
         ringed = np.clip(sub_rgb + np.float32(0.35) * (sub_rgb - blur_l), np.float32(0.0), np.float32(255.0))
         return cls._render_base_jpeg(ringed, quality)
@@ -677,193 +691,6 @@ class SelectiveDegradationPipeline:
         return np.clip(img_float * trans + air * (np.float32(1.0) - trans), np.float32(0.0), np.float32(255.0))
 
     @staticmethod
-    def _apply_reflection(
-        lin_rgb: np.ndarray,
-        severity: float,
-        params: DegradationParams,
-        refl_donor_u8: Optional[np.ndarray] = None,
-    ) -> np.ndarray:
-        """Highlight-dominant double-pane glass reflection with planar Fresnel gradient."""
-        if severity <= 1e-4:
-            return lin_rgb
-        sev = float(np.clip(severity, 0.0, 1.0))
-        h, w = lin_rgb.shape[:2]
-        if params._refl_cache is None or params._refl_cache[0].shape[:2] != (h, w):
-            if refl_donor_u8 is not None:
-                d_rs = cv2.resize(refl_donor_u8, (w, h), interpolation=cv2.INTER_AREA)
-                inv255 = np.float32(1.0 / 255.0)
-                donor_lin = np.square(np.clip(d_rs.astype(np.float32) * inv255, 0.0, 1.0)) * np.float32(255.0)
-            else:
-                donor_lin = np.roll(np.fliplr(lin_rgb), shift=(h // 5, w // 4), axis=(0, 1)).astype(np.float32)
-            refl_blur = cv2.GaussianBlur(donor_lin, (0, 0), sigmaX=params.refl_sigma, sigmaY=params.refl_sigma)
-            refl_hi = np.power(np.clip(refl_blur / np.float32(255.0), 0.0, 1.0), np.float32(1.75)) * np.float32(255.0)
-            m_shift = np.array([[1.0, 0.0, params.refl_dx], [0.0, 1.0, params.refl_dy]], dtype=np.float32)
-            refl_ghost = cv2.warpAffine(
-                refl_hi, m_shift, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT_101
-            )
-            refl_double = (np.float32(0.72) * refl_hi + np.float32(0.28) * refl_ghost) * np.array(
-                [0.94, 1.00, 0.98], dtype=np.float32
-            ).reshape(1, 1, 3)
-
-            yy, xx = np.meshgrid(np.linspace(-1.0, 1.0, h), np.linspace(-1.0, 1.0, w), indexing="ij")
-            proj = np.cos(params.refl_angle) * xx + np.sin(params.refl_angle) * yy
-            fresnel = np.clip(0.58 + 0.38 * proj, 0.18, 1.0).astype(np.float32)[:, :, None]
-            params._refl_cache = (refl_double, fresnel)
-
-        refl_double, fresnel = params._refl_cache
-        w_refl = np.float32(sev * 0.72) * fresnel
-        w_trans = np.float32(1.0) - np.float32(0.18) * w_refl
-        return np.clip(lin_rgb * w_trans + refl_double * w_refl, np.float32(0.0), np.float32(255.0))
-
-    @staticmethod
-    def _apply_radial_chromatic_aberration(
-        lin_rgb: np.ndarray, severity: float, params: DegradationParams
-    ) -> np.ndarray:
-        """Radial R/B magnification scaling: center stays crisp, outer edges fringe purple/cyan."""
-        if severity <= 1e-4:
-            return lin_rgb
-        sev = float(np.clip(severity, 0.0, 1.0))
-        h, w = lin_rgb.shape[:2]
-        cx, cy = (w - 1) * 0.5, (h - 1) * 0.5
-        yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
-        k = float(sev * params.ca_max_scale)
-        map_r_x = (cx + (xx - cx) * (1.0 - k)).astype(np.float32)
-        map_r_y = (cy + (yy - cy) * (1.0 - k)).astype(np.float32)
-        map_b_x = (cx + (xx - cx) * (1.0 + k)).astype(np.float32)
-        map_b_y = (cy + (yy - cy) * (1.0 + k)).astype(np.float32)
-        out = lin_rgb.copy()
-        out[:, :, 0] = cv2.remap(
-            lin_rgb[:, :, 0], map_r_x, map_r_y, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT_101
-        )
-        out[:, :, 2] = cv2.remap(
-            lin_rgb[:, :, 2], map_b_x, map_b_y, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT_101
-        )
-        return out
-
-    @staticmethod
-    def _build_flare_fields(h: int, w: int, params: DegradationParams) -> Tuple[np.ndarray, np.ndarray]:
-        """Lazy-compute unit-severity (flare_rgb [0..1+], veil_atten_strength [0..0.35]) for all 5 flare styles."""
-        frng = np.random.default_rng(params.flare_seed)
-        yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
-        cx, cy = float(params.flare_cx) * w, float(params.flare_cy) * h
-        dx, dy = (xx - cx) / max(h, w), (yy - cy) / max(h, w)
-        dist = np.sqrt(dx * dx + dy * dy) + np.float32(1e-4)
-        tint_arr = np.array(params.flare_tint, dtype=np.float32).reshape(1, 1, 3)
-
-        style = int(params.flare_style) % 5
-        if style == 0:
-            # 0: Wave-optics FFT Fraunhofer diffraction corona (computed fast at 128x128)
-            n = 128
-            py, px = np.mgrid[0:n, 0:n].astype(np.float32) - n * 0.5
-            rr = np.sqrt(px * px + py * py) / (n * 0.11)
-            th = np.arctan2(py, px)
-            sector = (2.0 * np.pi) / 6.0
-            ang_m = np.abs(((th + 0.18) % sector) - 0.5 * sector)
-            ap = (rr <= (np.cos(0.5 * sector) / np.maximum(np.cos(ang_m), 1e-4))).astype(np.float32)
-            dust = cv2.GaussianBlur(frng.normal(0.0, 1.2, size=(n, n)).astype(np.float32), (0, 0), sigmaX=1.2)
-            pupil = ap * np.exp(1j * (0.45 * dust))
-            pwr = np.power(np.abs(np.fft.fftshift(np.fft.fft2(pupil))) ** 2, 0.38).astype(np.float32)
-            pwr /= max(1e-8, float(pwr.max()))
-            c_n = n * 0.5
-            psf_s = np.zeros((n, n, 3), dtype=np.float32)
-            for ch, wl in enumerate((1.07, 1.00, 0.93)):
-                m = np.array([[wl, 0.0, c_n * (1.0 - wl)], [0.0, wl, c_n * (1.0 - wl)]], dtype=np.float32)
-                psf_s[:, :, ch] = cv2.warpAffine(pwr, m, (n, n), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
-            psf_full = cv2.resize(psf_s, (w * 2, h * 2), interpolation=cv2.INTER_LINEAR)
-            x0 = max(0, min(w, w - int(round(cx))))
-            y0 = max(0, min(h, h - int(round(cy))))
-            crop_psf = psf_full[y0 : y0 + h, x0 : x0 + w]
-            veil = (np.exp(-dist * 2.2) * 0.24)[:, :, None] * tint_arr
-            flare_rgb = crop_psf * np.float32(1.25) + veil
-            veil_atten = np.clip(0.16 * veil, 0.0, 0.30)
-            return flare_rgb, veil_atten
-
-        if style == 1:
-            # 1: Anamorphic / Smartphone smudge streak
-            dx_w, dy_h = (xx - cx) / w, (yy - cy) / h
-            s_main = np.exp(-np.abs(dy_h) * 32.0) * np.exp(-np.abs(dx_w) * 2.2) * 0.80
-            s_wide = np.exp(-np.abs(dy_h) * 9.5) * np.exp(-np.abs(dx_w) * 1.4) * 0.24
-            core = np.exp(-(dx_w * dx_w + dy_h * dy_h) * 52.0) * 0.85
-            ana_t = np.array([0.52, 0.78, 1.00], dtype=np.float32).reshape(1, 1, 3)
-            core_t = np.array([0.92, 0.97, 1.00], dtype=np.float32).reshape(1, 1, 3)
-            smudge = np.exp(-((dx_w * 2.4) ** 2 + (dy_h * 1.2) ** 2)) * 0.14
-            flare_rgb = (s_main + s_wide)[:, :, None] * ana_t + core[:, :, None] * core_t + smudge[:, :, None] * core_t
-            veil_atten = np.clip(0.10 * smudge[:, :, None], 0.0, 0.20)
-            return flare_rgb, veil_atten
-
-        if style == 2:
-            # 2: Off-frame golden backlit wash
-            wash = np.exp(-dist * 1.75) * 0.46 + np.exp(-dist * 4.5) * 0.40
-            flare_rgb = wash[:, :, None] * tint_arr
-            veil_atten = np.clip(0.26 * wash[:, :, None], 0.0, 0.35)
-            return flare_rgb, veil_atten
-
-        if style == 3:
-            # 3: Multi-element DSLR hexagonal/ringed ghost chain
-            ox, oy = w * 0.5, h * 0.5
-            ghost_layer = np.zeros((h, w, 3), dtype=np.float32)
-            specs = [
-                (0.28, 11, (0.95, 0.88, 0.72), 0.13, False),
-                (0.56, 20, (0.55, 0.92, 0.68), 0.11, True),
-                (0.84, 10, (0.98, 0.68, 0.42), 0.14, False),
-                (1.12, 28, (0.48, 0.74, 0.98), 0.09, True),
-                (1.48, 18, (0.85, 0.58, 0.95), 0.10, False),
-                (1.78, 34, (0.45, 0.88, 0.80), 0.08, True),
-            ]
-            for pos, rad, col, alpha, ring_edge in specs:
-                gx = cx + pos * (ox - cx)
-                gy = cy + pos * (oy - cy)
-                angles = np.linspace(0.0, 2.0 * np.pi, 6, endpoint=False) + float(frng.uniform(0.0, 0.5))
-                pts = np.round(np.stack([gx + rad * np.cos(angles), gy + rad * np.sin(angles)], axis=-1)).astype(np.int32)
-                mask = np.zeros((h, w), dtype=np.float32)
-                cv2.fillConvexPoly(mask, pts, 1.0)
-                if ring_edge:
-                    in_pts = np.round(
-                        np.stack([gx + rad * 0.72 * np.cos(angles), gy + rad * 0.72 * np.sin(angles)], axis=-1)
-                    ).astype(np.int32)
-                    inner = np.zeros((h, w), dtype=np.float32)
-                    cv2.fillConvexPoly(inner, in_pts, 1.0)
-                    mask = np.clip(0.42 * mask + 0.58 * (mask - inner), 0.0, 1.0)
-                soft = cv2.GaussianBlur(mask, (0, 0), sigmaX=max(2.0, rad * 0.18))
-                ghost_layer += (soft * np.float32(alpha))[:, :, None] * np.array(col, dtype=np.float32).reshape(1, 1, 3)
-            src_glow = (np.exp(-dist * 4.0) * 0.24)[:, :, None] * tint_arr
-            flare_rgb = ghost_layer + src_glow
-            veil_atten = np.clip(0.08 * src_glow, 0.0, 0.15)
-            return flare_rgb, veil_atten
-
-        # 4: Lens-barrel curved chromatic rainbow crescent arc
-        angle = np.arctan2(dy, dx)
-        to_c = np.arctan2(0.5 * h - cy, 0.5 * w - cx)
-        ang_d = np.arctan2(np.sin(angle - to_c), np.cos(angle - to_c))
-        crescent = np.exp(-np.square(ang_d / 0.85))
-        r_c = 0.62
-        arc = np.stack(
-            [
-                np.exp(-np.square((dist - (r_c + 0.040)) / 0.042)),
-                np.exp(-np.square((dist - r_c) / 0.042)) * 0.90,
-                np.exp(-np.square((dist - (r_c - 0.040)) / 0.042)),
-            ],
-            axis=-1,
-        ) * crescent[:, :, None] * np.float32(0.14)
-        src_veil = (np.exp(-dist * 2.2) * 0.26)[:, :, None] * tint_arr
-        flare_rgb = arc + src_veil
-        veil_atten = np.clip(0.14 * src_veil, 0.0, 0.25)
-        return flare_rgb, veil_atten
-
-    @classmethod
-    def _apply_lens_flare(cls, lin_rgb: np.ndarray, severity: float, params: DegradationParams) -> np.ndarray:
-        """Apply realistic optical lens flare in linear light with strict severity monotonicity."""
-        if severity <= 1e-4:
-            return lin_rgb
-        sev = float(np.clip(severity, 0.0, 1.0))
-        h, w = lin_rgb.shape[:2]
-        if params._flare_cache is None or params._flare_cache[0].shape[:2] != (h, w):
-            params._flare_cache = cls._build_flare_fields(h, w, params)
-        flare_rgb, veil_atten = params._flare_cache
-        atten = np.clip(1.0 - np.float32(sev) * veil_atten, 0.60, 1.0)
-        return np.clip(lin_rgb * atten + np.float32(sev * 255.0) * flare_rgb, np.float32(0.0), np.float32(255.0))
-
-    @staticmethod
     def render_lens_distortion(rgb_u8: np.ndarray, k1: float = 0.0, k2: float = 0.0) -> np.ndarray:
         """Full-frame Brown-Conrady radial distortion/correction (k1>0 barrel, k1<0 pincushion)."""
         if abs(k1) < 1e-5 and abs(k2) < 1e-5:
@@ -889,37 +716,31 @@ class SelectiveDegradationPipeline:
         refl_donor_u8: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         """Render an RGB uint8 image from `clean_rgb_u8` at signed/unsigned state `state_vec`."""
+        del refl_donor_u8
         cur = clean_rgb_u8.astype(np.float32)
 
-        # 1. Atmospheric haze (scene level)
+        # 1. Atmospheric haze
         if "dehaze" in self.type_to_idx:
             s_haze = float(state_vec[self.type_to_idx["dehaze"]])
             if s_haze > 1e-4:
                 cur = self._apply_haze(cur, s_haze, params)
 
-        # 2. Linear-light optical pipeline (reflection -> focus -> radial CA -> motion blur -> lens flare)
-        s_refl = float(state_vec[self.type_to_idx["dereflection"]]) if "dereflection" in self.type_to_idx else 0.0
-        s_foc = float(state_vec[self.type_to_idx["sharpen_focus"]]) if "sharpen_focus" in self.type_to_idx else 0.0
-        s_ca = float(state_vec[self.type_to_idx["dechromatic"]]) if "dechromatic" in self.type_to_idx else 0.0
+        # 2. Linear-light motion blur (physical shutter integration)
         s_mot = float(state_vec[self.type_to_idx["deblur_motion"]]) if "deblur_motion" in self.type_to_idx else 0.0
-        s_flr = float(state_vec[self.type_to_idx["deflare"]]) if "deflare" in self.type_to_idx else 0.0
-
-        if s_refl > 1e-4 or s_foc > 1e-4 or s_ca > 1e-4 or s_mot > 1e-4 or s_flr > 1e-4:
+        if s_mot > 1e-4:
             inv255 = np.float32(1.0 / 255.0)
             lin = np.square(np.clip(cur * inv255, np.float32(0.0), np.float32(1.0))) * np.float32(255.0)
-            if s_refl > 1e-4:
-                lin = self._apply_reflection(lin, s_refl, params, refl_donor_u8=refl_donor_u8)
-            if s_foc > 1e-4:
-                lin = self._apply_focus_softness(lin, s_foc, params)
-            if s_ca > 1e-4:
-                lin = self._apply_radial_chromatic_aberration(lin, s_ca, params)
-            if s_mot > 1e-4:
-                lin = self._apply_motion_blur_field(lin, s_mot, params)
-            if s_flr > 1e-4:
-                lin = self._apply_lens_flare(lin, s_flr, params)
+            lin = self._apply_motion_blur_field(lin, s_mot, params)
             cur = np.sqrt(np.clip(lin * inv255, np.float32(0.0), np.float32(1.0))) * np.float32(255.0)
 
-        # 3 & 4. Exact Commutative Lie-Group Exposure + Warmth in float32 [0, 1]
+        # 3. Super-resolution / Real-ESRGAN optical blur + resolution degradation
+        sr_key = "super_resolution" if "super_resolution" in self.type_to_idx else "sharpen_focus"
+        if sr_key in self.type_to_idx:
+            s_sr = float(state_vec[self.type_to_idx[sr_key]])
+            if s_sr > 1e-4:
+                cur = self._apply_sr_degradation(cur, s_sr, params)
+
+        # 4. Exact Commutative Lie-Group Exposure + Warmth in float32 [0, 1]
         exp_val = float(state_vec[self.type_to_idx["exposure"]]) if "exposure" in self.type_to_idx else 0.0
         warm_val = float(state_vec[self.type_to_idx["warmth"]]) if "warmth" in self.type_to_idx else 0.0
         if abs(exp_val) > 1e-4 or abs(warm_val) > 1e-4:
@@ -936,12 +757,13 @@ class SelectiveDegradationPipeline:
             if s_art > 1e-4:
                 cur = self._apply_deartifact_forward(cur, s_art, params)
 
-        # 6. Sensor / ISO grain (applied last so grain realization stays intact across deartifact residuals)
+        # 6. Realistic camera ISP / sensor grain (white, demosaiced correlated, or noise-before-JPEG)
         if "denoise" in self.type_to_idx:
             s_noi = float(state_vec[self.type_to_idx["denoise"]])
             if s_noi > 1e-4:
+                sev_n = float(np.clip(s_noi, 0.0, 1.0))
                 _, max_std = self.config.GAUSSIAN_NOISE_STD_RANGE
-                noise_std = np.float32(float(np.clip(s_noi, 0.0, 1.0)) * float(max_std))
+                noise_std = np.float32(sev_n * float(max_std))
                 if params.heteroscedastic_noise:
                     lum_mod = np.float32(0.70) + np.float32(0.60) * np.sqrt(
                         np.clip(cur * np.float32(1.0 / 255.0), np.float32(0.0), np.float32(1.0))
@@ -950,53 +772,57 @@ class SelectiveDegradationPipeline:
                 else:
                     noise_delta = params.get_noise_unit() * noise_std
                 cur = np.clip(cur + noise_delta, np.float32(0.0), np.float32(255.0))
+                if params.noise_mode == 2:
+                    # Realistic camera / web JPEG saved AFTER sensor noise (creates compressed chroma blotches!)
+                    q_post = int(round(92.0 - sev_n * 42.0))
+                    cur = self._render_base_jpeg(cur, q_post)
 
         return np.clip(np.round(cur), np.float32(0.0), np.float32(255.0)).astype(np.uint8)
 
     def sample_source_severity(
-        self, rng: np.random.Generator = None, params: Optional[DegradationParams] = None
+        self,
+        rng: np.random.Generator = None,
+        params: Optional[DegradationParams] = None,
+        primary_artifact: Optional[str] = None,
     ) -> np.ndarray:
-        """Sample 1 to 4 active degradations (unsigned in [min_sev, 1], signed in +/-[min_sev, 0.95])."""
+        """Artifact-first severity sampling with single-artifact-first curriculum & realistic compounds."""
         rng = rng or np.random.default_rng()
-        eff_compound_prob = max(0.15, self.compound_prob * (1.0 - 0.70 * self.curriculum_single_boost))
+        if primary_artifact is None or primary_artifact not in self.type_to_idx:
+            primary_artifact = self.sample_primary_artifact(rng=rng)
+        p_idx = self.type_to_idx[primary_artifact]
 
+        # Strong single-artifact focus during curriculum warmup (~84% single -> ~62% single steady state)
+        eff_compound_prob = max(0.12, self.compound_prob * (1.0 - 0.72 * self.curriculum_single_boost))
+        if self.detail_stage_focus:
+            # Stage 2 focuses even more cleanly on single/2-task crisp detail targets
+            eff_compound_prob = min(eff_compound_prob, 0.30)
+
+        chosen = [p_idx]
         if self.max_compound > 1 and rng.random() < eff_compound_prob:
-            u_k = float(rng.random())
-            if self.max_compound >= 4 and u_k < 0.22:
-                k = 4
-            elif self.max_compound >= 3 and u_k < 0.54:
-                k = 3
-            else:
-                k = 2
-        else:
-            k = 1
+            k = 3 if (self.max_compound >= 3 and rng.random() < 0.25) else 2
+            # Explicitly boost realistic noisy motion blur (`deblur_motion + denoise`)!
+            mot_noi_p = float(getattr(self.config, "MOTION_NOISE_COMPOUND_PROB", 0.45))
+            if (
+                primary_artifact == "deblur_motion"
+                and "denoise" in self.type_to_idx
+                and rng.random() < mot_noi_p
+            ):
+                chosen.append(self.type_to_idx["denoise"])
 
-        # Strongly up-weight structural deconvolution (`sharpen_focus`, `deblur_motion`) so bokeh & motion blur
-        # get ample exposure even alongside 8 other controls; in Stage 2 guarantee >=1 detail task every sample!
-        type_weights = np.array(
-            [
-                2.00 if name == "deblur_motion" else (2.25 if name == "sharpen_focus" else 1.0)
-                for name in self.degradation_types
-            ],
-            dtype=np.float64,
-        )
-        type_probs = type_weights / np.maximum(type_weights.sum(), 1e-8)
+            if len(chosen) < k:
+                rem = [i for i in range(self.num_types) if i not in chosen]
+                base_probs = self.stage1_artifact_probs.copy()
+                # Keep `deblur_motion` and `super_resolution` mostly disentangled so each expert stays sharp
+                if primary_artifact == "deblur_motion" and "super_resolution" in self.type_to_idx:
+                    base_probs[self.type_to_idx["super_resolution"]] *= 0.25
+                elif primary_artifact == "super_resolution" and "deblur_motion" in self.type_to_idx:
+                    base_probs[self.type_to_idx["deblur_motion"]] *= 0.25
+                rem_w = np.array([max(1e-4, base_probs[i]) for i in rem], dtype=np.float64)
+                rem_w /= rem_w.sum()
+                need = min(k - len(chosen), len(rem))
+                chosen.extend(list(rng.choice(rem, size=need, replace=False, p=rem_w)))
 
-        chosen = list(rng.choice(self.num_types, size=min(k, self.num_types), replace=False, p=type_probs))
-        if self.detail_stage_focus and self.detail_indices:
-            if not any(idx in self.detail_indices for idx in chosen):
-                if self.blur_indices and rng.random() < 0.78:
-                    forced = int(rng.choice(self.blur_indices))
-                else:
-                    forced = int(rng.choice(self.detail_indices))
-                chosen[0] = forced
-        chosen_names = [self.degradation_types[i] for i in chosen]
-
-        if "deblur_motion" in chosen_names and "sharpen_focus" in chosen_names and len(chosen) > 1 and rng.random() < 0.35:
-            drop_name = "deblur_motion" if rng.random() < 0.4 else "sharpen_focus"
-            chosen.remove(self.type_to_idx[drop_name])
-
-        damping = 1.0 if len(chosen) == 1 else (0.90 if len(chosen) == 2 else (0.82 if len(chosen) == 3 else 0.76))
+        damping = 1.0 if len(chosen) == 1 else (0.92 if len(chosen) == 2 else 0.84)
         s_src = np.zeros(self.num_types, dtype=np.float32)
         for idx in chosen:
             mag = float(np.clip(float(rng.uniform(self.min_severity, 0.95)) * damping, self.min_severity, 0.95))
@@ -1011,49 +837,66 @@ class SelectiveDegradationPipeline:
         return s_src
 
     def sample_action_vector(self, s_src: np.ndarray, rng: np.random.Generator = None) -> np.ndarray:
-        """Sample diverse controllable user action vectors (4 unsigned [0, 1] + 2 signed [-1, +1])."""
+        """Sample controllable user action vectors with explicit `"all"` blind-mode coverage."""
         rng = rng or np.random.default_rng()
         active_indices = [i for i in range(self.num_types) if abs(float(s_src[i])) > 1e-4]
         inactive_unsigned = [i for i in self.unsigned_indices if abs(float(s_src[i])) <= 1e-4]
 
-        p_sel = self.config.ACTION_DIST_SELECTIVE * (1.0 - 0.5 * self.curriculum_single_boost)
-        p_part = self.config.ACTION_DIST_PARTIAL
-        p_full = self.config.ACTION_DIST_FULL + (self.config.ACTION_DIST_SELECTIVE - p_sel)
-        p_fp = self.config.ACTION_DIST_FALSE_POS
-        u = float(rng.random())
+        if self.detail_stage_focus:
+            # Stage 2: ~82% full restoration (s_tgt == 0 -> maximizes clean DINOv2 discriminator signal!)
+            p_full = 0.62
+            p_all = 0.20
+            p_sel = 0.10
+            p_part = 0.04
+            p_fp = 0.02
+        else:
+            p_sel = float(getattr(self.config, "ACTION_DIST_SELECTIVE", 0.16)) * (
+                1.0 - 0.50 * self.curriculum_single_boost
+            )
+            p_part = float(getattr(self.config, "ACTION_DIST_PARTIAL", 0.10))
+            p_all = float(getattr(self.config, "ACTION_DIST_BLIND_ALL", 0.16))
+            p_full = float(getattr(self.config, "ACTION_DIST_FULL", 0.50)) + (
+                float(getattr(self.config, "ACTION_DIST_SELECTIVE", 0.16)) - p_sel
+            )
+            p_fp = float(getattr(self.config, "ACTION_DIST_FALSE_POS", 0.04))
 
+        u = float(rng.random())
         action = np.zeros(self.num_types, dtype=np.float32)
         full_act = self.compute_full_restore_action(s_src)
 
-        if u < p_sel and len(active_indices) >= 2:
+        if u < p_full:
+            # Exact targeted restoration of the active degradations
+            action = full_act.copy()
+
+        elif u < p_full + p_all:
+            # Blind "Restore All" preset (`[1, 1, 1, 1, 1, 0, 0]` + any active signed inverse) — matches app.py!
+            action = full_act.copy()
+            for idx in self.unsigned_indices:
+                action[idx] = 1.0
+
+        elif u < p_full + p_all + p_sel and len(active_indices) >= 2:
+            # Selective: fix a subset of degradations, keep the others untouched
             num_fix = int(rng.integers(1, len(active_indices)))
             fix_ids = rng.choice(active_indices, size=num_fix, replace=False)
             for idx in fix_ids:
-                frac = 1.0 if rng.random() < 0.75 else float(rng.uniform(0.5, 1.0))
+                frac = 1.0 if rng.random() < 0.80 else float(rng.uniform(0.5, 1.0))
                 action[idx] = full_act[idx] * frac
 
-        elif u < p_sel + p_part:
+        elif u < p_full + p_all + p_sel + p_part:
             for idx in active_indices:
                 if rng.random() < 0.85:
-                    frac = float(rng.uniform(0.25, 0.85))
+                    frac = float(rng.uniform(0.30, 0.85))
                     action[idx] = full_act[idx] * frac
 
-        elif u < p_sel + p_part + p_full:
-            action = full_act.copy()
-            # Keep exact active sliders 95% of the time so inactive `deblur_motion` isn't flooded with no-op `1.0`s!
-            if rng.random() < 0.05:
-                for idx in self.unsigned_indices:
-                    action[idx] = 1.0
-
-        elif u < p_sel + p_part + p_full + p_fp:
+        elif u < p_full + p_all + p_sel + p_part + p_fp:
             if rng.random() < 0.50:
                 for idx in active_indices:
-                    if rng.random() < 0.70:
+                    if rng.random() < 0.75:
                         action[idx] = full_act[idx]
                 if inactive_unsigned:
-                    n_fp = int(rng.integers(1, min(3, len(inactive_unsigned)) + 1))
+                    n_fp = int(rng.integers(1, min(2, len(inactive_unsigned)) + 1))
                     for idx in rng.choice(inactive_unsigned, size=n_fp, replace=False):
-                        action[idx] = float(rng.uniform(0.4, 1.0))
+                        action[idx] = float(rng.uniform(0.45, 1.0))
             else:
                 for idx in active_indices:
                     if not self.is_signed(idx) and rng.random() < 0.75:
@@ -1069,9 +912,8 @@ class SelectiveDegradationPipeline:
         else:
             action[:] = 0.0
 
-        # In Stage 2 (`detail_stage_focus`), keep >=1 active detail slider ON (except 5% identity/preserve safety)
-        # so ~95% of semantic_stage batches directly train `sem_branch` & PatchGAN instead of wasting steps!
-        if self.detail_stage_focus and self.detail_indices and rng.random() < 0.95:
+        # In Stage 2, keep >=1 active detail slider ON (except 4% identity safety)
+        if self.detail_stage_focus and self.detail_indices and rng.random() < 0.96:
             active_detail = [i for i in active_indices if i in self.detail_indices]
             if active_detail and all(abs(float(action[i])) < 0.25 for i in active_detail):
                 pick = int(rng.choice(active_detail))
@@ -1134,30 +976,35 @@ class SelectiveDegradationPipeline:
         clean_rgb_u8: np.ndarray,
         rng: np.random.Generator = None,
         align_only: bool = False,
+        primary_artifact: Optional[str] = None,
         refl_donor_u8: Optional[np.ndarray] = None,
     ):
-        """Fast synthesis returning compact components (x_src, x_tgt, a_fg, a_bg, mask_2d, s_src)."""
+        """Fast synthesis returning `(x_src, x_tgt, a_fg, a_bg, mask_2d, s_src, gan_clean_eligible)`."""
+        del refl_donor_u8
         rng = rng or np.random.default_rng()
         h, w = clean_rgb_u8.shape[:2]
         params = self.sample_params(h, w, rng=rng)
-        s_src = self.sample_source_severity(rng=rng, params=params)
-        x_src = self.render_with_params(clean_rgb_u8, s_src, params, refl_donor_u8=refl_donor_u8)
+        s_src = self.sample_source_severity(rng=rng, params=params, primary_artifact=primary_artifact)
+        x_src = self.render_with_params(clean_rgb_u8, s_src, params)
 
         if align_only:
             zeros_a = np.zeros(self.num_types, dtype=np.float32)
             ones_mask = np.ones((h, w), dtype=np.float32)
-            return x_src, x_src, zeros_a, zeros_a, ones_mask, s_src
+            return x_src, x_src, zeros_a, zeros_a, ones_mask, s_src, False
 
         a_fg = self.sample_action_vector(s_src, rng=rng)
         s_tgt_fg = self.compute_target_state(s_src, a_fg)
+        fg_is_clean = bool(np.allclose(s_tgt_fg, 0.0, atol=1e-4))
         if np.allclose(s_tgt_fg, s_src, atol=1e-4):
             x_tgt_fg = x_src.copy()
-        elif np.allclose(s_tgt_fg, 0.0, atol=1e-4):
+        elif fg_is_clean:
             x_tgt_fg = clean_rgb_u8.copy()
         else:
-            x_tgt_fg = self.render_with_params(clean_rgb_u8, s_tgt_fg, params, refl_donor_u8=refl_donor_u8)
+            x_tgt_fg = self.render_with_params(clean_rgb_u8, s_tgt_fg, params)
 
-        eff_mask_prob = self.spatial_mask_prob * (1.0 - 0.65 * self.curriculum_single_boost)
+        # Keep spatial mask rate low in Stage 2 so GAN-eligible full-clean targets stay abundant
+        base_mask_p = 0.08 if self.detail_stage_focus else self.spatial_mask_prob
+        eff_mask_prob = base_mask_p * (1.0 - 0.65 * self.curriculum_single_boost)
         if rng.random() < eff_mask_prob:
             if rng.random() < 0.68:
                 a_bg = np.zeros(self.num_types, dtype=np.float32)
@@ -1165,14 +1012,15 @@ class SelectiveDegradationPipeline:
                 a_bg = self.sample_action_vector(s_src, rng=rng)
 
             s_tgt_bg = self.compute_target_state(s_src, a_bg)
+            bg_is_clean = bool(np.allclose(s_tgt_bg, 0.0, atol=1e-4))
             if np.allclose(s_tgt_bg, s_src, atol=1e-4):
                 x_tgt_bg = x_src
-            elif np.allclose(s_tgt_bg, 0.0, atol=1e-4):
+            elif bg_is_clean:
                 x_tgt_bg = clean_rgb_u8
             elif np.allclose(s_tgt_bg, s_tgt_fg, atol=1e-4):
                 x_tgt_bg = x_tgt_fg
             else:
-                x_tgt_bg = self.render_with_params(clean_rgb_u8, s_tgt_bg, params, refl_donor_u8=refl_donor_u8)
+                x_tgt_bg = self.render_with_params(clean_rgb_u8, s_tgt_bg, params)
 
             mask = self.sample_spatial_mask(clean_rgb_u8, rng=rng)
             mask_3d = mask[:, :, None]
@@ -1184,12 +1032,18 @@ class SelectiveDegradationPipeline:
                 np.float32(0.0),
                 np.float32(255.0),
             ).astype(np.uint8)
+            full_clean = fg_is_clean and bg_is_clean
         else:
             a_bg = a_fg
             mask = np.ones((h, w), dtype=np.float32)
             x_tgt = x_tgt_fg
+            full_clean = fg_is_clean
 
-        return x_src, x_tgt, a_fg, a_bg, mask, s_src
+        has_detail_act = any(
+            abs(float(a_fg[i])) >= 0.25 or abs(float(a_bg[i])) >= 0.25 for i in self.detail_indices
+        )
+        gan_clean_eligible = bool(full_clean and has_detail_act)
+        return x_src, x_tgt, a_fg, a_bg, mask, s_src, gan_clean_eligible
 
     def synthesize_real_pair_components(
         self,
@@ -1199,11 +1053,14 @@ class SelectiveDegradationPipeline:
         rng: np.random.Generator = None,
         align_only: bool = False,
     ):
-        """Compositional Real-Pair Wrapper for GoPro, HIDE, RealBlur, and DPDD pairs!
+        """Compositional Real-Pair Wrapper for GoPro, HIDE, RealBlur & BlurDataset!
 
-        Layers synchronized invertible downstream operators (`exposure`, `warmth`, `deartifact`, `denoise`)
-        onto real camera `(blur_rgb_u8, sharp_rgb_u8)` pairs so the model trains all 6 selective sliders
-        directly on authentic real-world camera shake and DSLR lens defocus!
+        - Respects single-to-compound curriculum (`MOTION_NOISE_COMPOUND_PROB` pairs real blur with
+          realistic camera ISP noise!).
+        - Explicitly trains `"all"` (`[1, 1, 1, 1, 1, 0, 0]`) ~18% of the time so Gradio's default
+          preset is 100% in-distribution on real camera shake!
+        - NEVER runs false-positive identity training on soft 720p GoPro/RealBlur frames!
+        - Returns `gan_clean_eligible = False` so 720p/night video targets never lower Stage-2 GAN crispness!
         """
         rng = rng or np.random.default_rng()
         h, w = sharp_rgb_u8.shape[:2]
@@ -1213,16 +1070,29 @@ class SelectiveDegradationPipeline:
         downstream_candidates = [
             i
             for i, name in enumerate(self.degradation_types)
-            if i != blur_idx and name not in ("deblur_motion", "sharpen_focus")
+            if i != blur_idx and name not in ("deblur_motion", "super_resolution")
         ]
 
-        # Sample 0, 1, or 2 downstream orthogonal degradations (exposure, warmth, deartifact, denoise)
-        s_down = np.zeros(self.num_types, dtype=np.float32)
+        eff_compound_prob = max(0.12, self.compound_prob * (1.0 - 0.72 * self.curriculum_single_boost))
+        if self.detail_stage_focus:
+            eff_compound_prob = min(eff_compound_prob, 0.28)
+
+        pres_cutoff = 0.05 if self.detail_stage_focus else 0.12
         u_mode = float(rng.random())
-        need_downstream = (0.06 <= u_mode < 0.22)  # selective blur preservation needs >= 1 downstream edit
-        if downstream_candidates and (need_downstream or rng.random() < 0.58):
-            n_extra = 1 if rng.random() < 0.72 else min(2, len(downstream_candidates))
-            for idx in rng.choice(downstream_candidates, size=n_extra, replace=False):
+        need_downstream = u_mode < pres_cutoff
+
+        s_down = np.zeros(self.num_types, dtype=np.float32)
+        if downstream_candidates and (need_downstream or rng.random() < eff_compound_prob):
+            chosen_down: List[int] = []
+            mot_noi_p = float(getattr(self.config, "MOTION_NOISE_COMPOUND_PROB", 0.45))
+            if "denoise" in self.type_to_idx and self.type_to_idx["denoise"] in downstream_candidates:
+                if rng.random() < mot_noi_p:
+                    chosen_down.append(self.type_to_idx["denoise"])
+            n_target = 1 if rng.random() < 0.78 else min(2, len(downstream_candidates))
+            if len(chosen_down) < n_target:
+                rem = [i for i in downstream_candidates if i not in chosen_down]
+                chosen_down.extend(list(rng.choice(rem, size=min(n_target - len(chosen_down), len(rem)), replace=False)))
+            for idx in chosen_down:
                 mag = float(rng.uniform(self.min_severity, 0.85))
                 if self.is_signed(idx):
                     sign = params.exposure_sign if self.degradation_types[idx] == "exposure" else params.warmth_sign
@@ -1236,20 +1106,10 @@ class SelectiveDegradationPipeline:
             s_src[blur_idx] = 1.0
             zeros_a = np.zeros(self.num_types, dtype=np.float32)
             ones_mask = np.ones((h, w), dtype=np.float32)
-            return x_src, sharp_rgb_u8, zeros_a, zeros_a, ones_mask, s_src
+            return x_src, sharp_rgb_u8, zeros_a, zeros_a, ones_mask, s_src, False
 
-        fp_cutoff = 0.04 if self.detail_stage_focus else 0.06
-        pres_cutoff = 0.08 if self.detail_stage_focus else 0.22
-        if u_mode < fp_cutoff:
-            # False-Positive Safety on Real Clean Sharp Photo (prevents oversharpening clean photos!)
-            base_src = sharp_rgb_u8
-            base_tgt_fg = sharp_rgb_u8
-            s_src = s_down.copy()
-            a_fg = self.compute_full_restore_action(s_down)
-            a_fg[blur_idx] = float(rng.uniform(0.55, 1.0))
-            s_tgt_down = self.compute_target_state(s_down, a_fg)
-        elif u_mode < pres_cutoff:
-            # Selective Real-Blur Preservation (`a_blur = 0.0`: clean noise/tone, KEEP real camera blur!)
+        if u_mode < pres_cutoff:
+            # Selective real-blur preservation (`a_blur = 0.0`: clean noise/tone, KEEP real motion blur!)
             base_src = blur_rgb_u8
             base_tgt_fg = blur_rgb_u8
             s_src = s_down.copy()
@@ -1258,7 +1118,7 @@ class SelectiveDegradationPipeline:
             a_fg[blur_idx] = 0.0
             s_tgt_down = self.compute_target_state(s_down, a_fg)
         else:
-            # Active Real Camera Deblurring (`a_blur = 1.0`, 78% Stage 1 / 92% Stage 2) + downstream fixes!
+            # Active Real Camera Deblurring (`a_blur = 1.0`, ~88% Stage 1 / ~95% Stage 2)
             base_src = blur_rgb_u8
             base_tgt_fg = sharp_rgb_u8
             s_src = s_down.copy()
@@ -1268,12 +1128,12 @@ class SelectiveDegradationPipeline:
             full_down = self.compute_full_restore_action(s_down)
             for idx in downstream_candidates:
                 if abs(float(s_down[idx])) > 1e-4:
-                    if rng.random() < 0.72:
+                    if rng.random() < 0.80:
                         a_fg[idx] = full_down[idx]
-            if rng.random() < 0.20:
+            # Explicitly train blind `"all"` preset (`[1, 1, 1, 1, 1, 0, 0]`) ~18% of the time on real pairs!
+            if rng.random() < 0.18:
                 for idx in self.unsigned_indices:
-                    if idx == blur_idx or abs(float(s_down[idx])) > 1e-4:
-                        a_fg[idx] = 1.0
+                    a_fg[idx] = 1.0
             s_tgt_down = self.compute_target_state(s_down, a_fg)
 
         x_src = (
@@ -1287,7 +1147,8 @@ class SelectiveDegradationPipeline:
             else self.render_with_params(base_tgt_fg, s_tgt_down, params)
         )
 
-        eff_mask_prob = 0.55 * self.spatial_mask_prob * (1.0 - 0.65 * self.curriculum_single_boost)
+        base_mask_p = 0.06 if self.detail_stage_focus else (0.55 * self.spatial_mask_prob)
+        eff_mask_prob = base_mask_p * (1.0 - 0.65 * self.curriculum_single_boost)
         if rng.random() < eff_mask_prob:
             a_bg = np.zeros(self.num_types, dtype=np.float32)
             mask = self.sample_spatial_mask(sharp_rgb_u8, rng=rng)
@@ -1305,11 +1166,13 @@ class SelectiveDegradationPipeline:
             mask = np.ones((h, w), dtype=np.float32)
             x_tgt = x_tgt_fg
 
-        return x_src, x_tgt, a_fg, a_bg, mask, s_src
+        return x_src, x_tgt, a_fg, a_bg, mask, s_src, False
 
     def synthesize_pair(self, clean_rgb_u8: np.ndarray, rng: np.random.Generator = None):
         """Synthesize seed-synchronized (x_src, action_map [K, H, W], x_tgt, s_src)."""
-        x_src, x_tgt, a_fg, a_bg, mask, s_src = self.synthesize_components(clean_rgb_u8, rng=rng, align_only=False)
+        x_src, x_tgt, a_fg, a_bg, mask, s_src, _ = self.synthesize_components(
+            clean_rgb_u8, rng=rng, align_only=False
+        )
         h, w = clean_rgb_u8.shape[:2]
         if a_bg is a_fg or np.array_equal(a_fg, a_bg):
             action_map = np.broadcast_to(a_fg[:, None, None], (self.num_types, h, w)).copy().astype(np.float32)
@@ -1321,8 +1184,40 @@ class SelectiveDegradationPipeline:
         return x_src, action_map, x_tgt, s_src
 
 
+def _infer_clean_dataset_bucket(path: Path) -> str:
+    """Classify a clean reference image into its source dataset bucket (`div2k`, `flickr2k`, `lsdir`, `ost`, ...)."""
+    low = str(path).replace("\\", "/").lower()
+    if "div2k" in low:
+        return "div2k"
+    if "flickr2k" in low or "flickr" in low:
+        return "flickr2k"
+    if "lsdir" in low:
+        return "lsdir"
+    if "/ost" in low or "ost_" in low or "outdoorscene" in low:
+        return "ost"
+    if "ffhq" in low:
+        return "ffhq"
+    return path.parent.name.lower() or "default"
+
+
+def _infer_paired_dataset_bucket(blur_path: Path) -> str:
+    """Classify a paired motion-blur record into its sub-dataset (`gopro`, `hide`, `realblur`, `blurdataset`, ...)."""
+    low = str(blur_path).replace("\\", "/").lower()
+    if "gopro" in low or "gopr" in low:
+        return "gopro"
+    if "hide" in low:
+        return "hide"
+    if "realblur" in low:
+        return "realblur"
+    if "blurdataset" in low or "blurset" in low or "certh" in low:
+        return "blurdataset"
+    if "dpdd" in low or "realdof" in low:
+        return "dpdd"
+    return blur_path.parent.parent.name.lower() or "paired_default"
+
+
 class ControllableRestorationDataset(_TorchDataset):
-    """Hybrid Clean-Reference + Real-Paired Deblurring Dataset with Sharpness-Gated Crops."""
+    """Artifact-First, Dataset-Balanced Hybrid Clean-Reference + Real-Paired Restoration Dataset."""
 
     def __init__(
         self,
@@ -1341,17 +1236,58 @@ class ControllableRestorationDataset(_TorchDataset):
         self.compact_ipc = compact_ipc
         self.patch_size = config.PATCH_SIZE
         self.pipeline = SelectiveDegradationPipeline(config)
-        self.paired_prob = float(getattr(config, "PAIRED_REAL_PROB", 0.35)) if self.paired_records else 0.0
 
-        self._sharpness_candidates = max(1, int(getattr(config, "CLEAN_PATCH_SHARPNESS_CANDIDATES", 3)))
-        self._min_lap_var = float(getattr(config, "CLEAN_PATCH_MIN_LAPLACIAN_VAR", 18.0))
-        self._smooth_allow_prob = float(getattr(config, "CLEAN_PATCH_SMOOTH_ALLOW_PROB", 0.15))
+        self.motion_real_pair_frac = (
+            float(getattr(config, "MOTION_REAL_PAIR_FRAC", getattr(config, "PAIRED_REAL_PROB", 0.50)))
+            if self.paired_records
+            else 0.0
+        )
+
+        # Group clean images into balanced dataset buckets (`div2k`, `flickr2k`, `lsdir`, `ost`, ...)
+        self.clean_buckets: Dict[str, List[Path]] = {}
+        for p in self.image_paths:
+            bkey = _infer_clean_dataset_bucket(Path(p))
+            self.clean_buckets.setdefault(bkey, []).append(Path(p))
+        self._clean_bucket_names = sorted(self.clean_buckets.keys())
+        self._clean_bucket_probs = self._compute_clean_bucket_probs(
+            self._clean_bucket_names, getattr(config, "CLEAN_DATASET_WEIGHTS", None)
+        )
+        # High-priority DIV2K/LSDIR/Flickr2K weights for `super_resolution` crispness
+        sr_override = dict(getattr(config, "CLEAN_DATASET_WEIGHTS", {}) or {})
+        if "div2k" in sr_override:
+            sr_override["div2k"] = sr_override["div2k"] * 1.35
+        if "ost" in sr_override:
+            sr_override["ost"] = sr_override["ost"] * 0.65
+        self._sr_clean_bucket_probs = self._compute_clean_bucket_probs(self._clean_bucket_names, sr_override)
+
+        # Group paired motion records into per-subdataset balanced buckets (`gopro`, `hide`, `realblur`, ...)
+        self.paired_buckets: Dict[str, List[Tuple[Path, Path, str]]] = {}
+        for rec in self.paired_records:
+            bkey = _infer_paired_dataset_bucket(Path(rec[0]))
+            self.paired_buckets.setdefault(bkey, []).append(rec)
+        self._paired_bucket_names = sorted(self.paired_buckets.keys())
+
+        self._sharpness_candidates = max(1, int(getattr(config, "CLEAN_PATCH_SHARPNESS_CANDIDATES", 5)))
+        self._min_lap_var = float(getattr(config, "CLEAN_PATCH_MIN_LAPLACIAN_VAR", 65.0))
+        self._smooth_allow_prob = float(getattr(config, "CLEAN_PATCH_SMOOTH_ALLOW_PROB", 0.08))
+        self._paired_min_motion_diff = float(getattr(config, "PAIRED_MIN_MOTION_DIFF", 9.0))
 
         self._cache_capacity = int(getattr(config, "DECODE_CACHE_SIZE", 16)) if is_train else 0
         self._paired_cache_capacity = max(4, self._cache_capacity // 2) if (is_train and self.paired_records) else 0
-        self._max_crops_per_decode = int(getattr(config, "CROPS_PER_DECODE", 6)) if is_train else 1
-        self._decoded_ring = []
-        self._paired_ring = []
+        self._max_crops_per_decode = int(getattr(config, "CROPS_PER_DECODE", 8)) if is_train else 1
+        # Per-bucket decode rings so dataset balancing is preserved even with decode caching!
+        self._decoded_ring_by_bucket: Dict[str, list] = {}
+        self._paired_ring_by_bucket: Dict[str, list] = {}
+
+    @staticmethod
+    def _compute_clean_bucket_probs(
+        bucket_names: List[str], weights_map: Optional[Dict[str, float]]
+    ) -> np.ndarray:
+        if not bucket_names:
+            return np.array([], dtype=np.float64)
+        wmap = {str(k).lower(): float(v) for k, v in (weights_map or {}).items()}
+        raw = np.array([max(0.05, wmap.get(name, 0.25)) for name in bucket_names], dtype=np.float64)
+        return raw / raw.sum()
 
     def __len__(self):
         return len(self.image_paths) if self.image_paths else len(self.paired_records)
@@ -1364,7 +1300,7 @@ class ControllableRestorationDataset(_TorchDataset):
 
     @staticmethod
     def _estimate_patch_laplacian_var(crop_rgb: np.ndarray) -> float:
-        """Fast 2x-subsampled grayscale Laplacian variance to screen out blurry bokeh patches."""
+        """Fast 2x-subsampled grayscale Laplacian variance to reject blurry/bokeh patches."""
         small = crop_rgb[::2, ::2]
         gray = cv2.cvtColor(small, cv2.COLOR_RGB2GRAY)
         lap = cv2.Laplacian(gray, cv2.CV_32F)
@@ -1395,7 +1331,6 @@ class ControllableRestorationDataset(_TorchDataset):
 
         if h >= ps and w >= ps:
             if self.is_train:
-                # Laplacian Sharpness Gate: reject out-of-focus background bokeh in OST/Flickr2K!
                 if (
                     self._sharpness_candidates > 1
                     and (h > ps or w > ps)
@@ -1429,22 +1364,57 @@ class ControllableRestorationDataset(_TorchDataset):
             return self._augment_crop_pair(crop)
         return crop.copy()
 
-    def _decode_rgb(self, image_path: str) -> np.ndarray:
+    def _decode_rgb(self, image_path) -> np.ndarray:
         img = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
         if img is None:
             raise FileNotFoundError(f"Could not read image: {image_path}")
         return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
-    def _load_crop_with_retry(self, idx: int, max_attempts: int = 6) -> np.ndarray:
-        if self.is_train and self._cache_capacity > 0 and len(self._decoded_ring) >= self._cache_capacity:
-            slot = random.randrange(len(self._decoded_ring))
-            rgb_cached, rem = self._decoded_ring[slot]
+    def _load_crop_from_bucket(
+        self, bucket_name: str, rng: np.random.Generator, max_attempts: int = 6
+    ) -> np.ndarray:
+        """Load a sharpness-gated crop from a specific dataset bucket with per-bucket decode caching."""
+        ring = self._decoded_ring_by_bucket.setdefault(bucket_name, [])
+        per_bucket_cap = max(2, self._cache_capacity // max(1, len(self._clean_bucket_names)))
+        if self.is_train and self._cache_capacity > 0 and len(ring) >= per_bucket_cap:
+            slot = int(rng.integers(0, len(ring)))
+            rgb_cached, rem = ring[slot]
             if rem > 1:
-                self._decoded_ring[slot][1] = rem - 1
+                ring[slot][1] = rem - 1
             else:
-                self._decoded_ring.pop(slot)
+                ring.pop(slot)
             return self._crop_and_augment(rgb_cached)
 
+        bucket_paths = self.clean_buckets[bucket_name]
+        n = len(bucket_paths)
+        ps = self.patch_size
+        base_idx = int(rng.integers(0, n))
+        last_err = None
+        fallback_small = None
+        for attempt in range(max_attempts):
+            cand_idx = (base_idx + attempt) % n
+            try:
+                rgb_full = self._decode_rgb(bucket_paths[cand_idx])
+                if self.is_train and n > 1 and (rgb_full.shape[0] < ps or rgb_full.shape[1] < ps):
+                    fallback_small = rgb_full
+                    continue
+                if (
+                    self.is_train
+                    and self._cache_capacity > 0
+                    and self._max_crops_per_decode > 1
+                    and min(rgb_full.shape[0], rgb_full.shape[1]) >= int(ps * 1.5)
+                ):
+                    ring.append([rgb_full, self._max_crops_per_decode - 1])
+                return self._crop_and_augment(rgb_full)
+            except Exception as err:
+                last_err = err
+
+        if fallback_small is not None:
+            return self._crop_and_augment(fallback_small)
+        raise RuntimeError(f"Failed to read valid image from bucket '{bucket_name}': {last_err}")
+
+    def _load_crop_with_retry(self, idx: int, max_attempts: int = 6) -> np.ndarray:
+        """Deterministic indexed crop load (used by validation / evaluation sweep)."""
         n = len(self.image_paths)
         ps = self.patch_size
         last_err = None
@@ -1453,21 +1423,12 @@ class ControllableRestorationDataset(_TorchDataset):
             cand_idx = (idx + attempt) % n
             try:
                 rgb_full = self._decode_rgb(self.image_paths[cand_idx])
-                # Skip sub-patch low-res thumbnails during training whenever full-res images exist!
                 if self.is_train and n > 1 and (rgb_full.shape[0] < ps or rgb_full.shape[1] < ps):
                     fallback_small = rgb_full
                     continue
-                if (
-                    self.is_train
-                    and self._cache_capacity > 0
-                    and self._max_crops_per_decode > 1
-                    and rgb_full.shape[0] >= ps * 2
-                ):
-                    self._decoded_ring.append([rgb_full, self._max_crops_per_decode - 1])
                 return self._crop_and_augment(rgb_full)
             except Exception as err:
                 last_err = err
-
         if fallback_small is not None:
             return self._crop_and_augment(fallback_small)
         raise RuntimeError(f"Failed to read valid image after {max_attempts} attempts: {last_err}")
@@ -1477,18 +1438,16 @@ class ControllableRestorationDataset(_TorchDataset):
         h, w = sharp_rgb.shape[:2]
         if h >= ps and w >= ps:
             if self.is_train:
-                # Keep real paired crops mostly native 1:1 (`PAIRED_NATIVE_CROP_PROB=0.85`) so severe blur
-                # is NOT shrunk down by aggressive downsampling; 4-candidate Active Blur Gate rejects flat sky crops!
                 min_hw = min(h, w)
                 native_prob = float(np.clip(getattr(self.config, "PAIRED_NATIVE_CROP_PROB", 0.85), 0.0, 1.0))
                 if min_hw >= int(ps * 1.25) and random.random() >= native_prob:
-                    win = random.randint(int(ps * 1.10), min(min_hw, int(ps * 1.45)))
+                    win = random.randint(int(ps * 1.10), min(min_hw, int(ps * 1.40)))
                 else:
                     win = ps
 
                 best_b, best_s = None, None
                 best_score = -1.0
-                n_cands = 4 if (h > win or w > win) else 1
+                n_cands = 6 if (h > win or w > win) else 1
                 for _ in range(n_cands):
                     y = random.randint(0, h - win)
                     x = random.randint(0, w - win)
@@ -1498,11 +1457,11 @@ class ControllableRestorationDataset(_TorchDataset):
                     s_sub = sc[::4, ::4].astype(np.float32)
                     motion_diff = float(np.mean(np.abs(s_sub - b_sub)))
                     edge_energy = float(np.mean(np.abs(s_sub[:, 1:] - s_sub[:, :-1])))
-                    score = motion_diff + 0.35 * edge_energy
+                    score = motion_diff + 0.30 * edge_energy
                     if score > best_score:
                         best_score = score
                         best_b, best_s = bc, sc
-                    if motion_diff >= 4.5 and edge_energy >= 6.0:
+                    if motion_diff >= self._paired_min_motion_diff and edge_energy >= 7.5:
                         break
 
                 if win != ps:
@@ -1523,23 +1482,50 @@ class ControllableRestorationDataset(_TorchDataset):
             return self._augment_crop_pair(b_crop, s_crop)
         return b_crop.copy(), s_crop.copy()
 
-    def _load_paired_crop_with_retry(self, idx: int, max_attempts: int = 5) -> Tuple[np.ndarray, np.ndarray, str]:
-        if (
-            self.is_train
-            and self._paired_cache_capacity > 0
-            and len(self._paired_ring) >= self._paired_cache_capacity
-        ):
-            slot = random.randrange(len(self._paired_ring))
-            b_cached, s_cached, ch_cached, rem = self._paired_ring[slot]
+    def _load_paired_crop_from_bucket(
+        self, bucket_name: str, rng: np.random.Generator, max_attempts: int = 5
+    ) -> Tuple[np.ndarray, np.ndarray, str]:
+        ring = self._paired_ring_by_bucket.setdefault(bucket_name, [])
+        per_bucket_cap = max(2, self._paired_cache_capacity // max(1, len(self._paired_bucket_names)))
+        if self.is_train and self._paired_cache_capacity > 0 and len(ring) >= per_bucket_cap:
+            slot = int(rng.integers(0, len(ring)))
+            b_cached, s_cached, ch_cached, rem = ring[slot]
             if rem > 1:
-                self._paired_ring[slot][3] = rem - 1
+                ring[slot][3] = rem - 1
             else:
-                self._paired_ring.pop(slot)
+                ring.pop(slot)
             b_crop, s_crop = self._crop_paired_arrays(b_cached, s_cached)
             return b_crop, s_crop, ch_cached
 
-        m = len(self.paired_records)
+        recs = self.paired_buckets[bucket_name]
+        m = len(recs)
         ps = self.patch_size
+        base_idx = int(rng.integers(0, m))
+        last_err = None
+        for attempt in range(max_attempts):
+            p_idx = (base_idx + attempt) % m
+            blur_path, sharp_path, blur_channel = recs[p_idx]
+            try:
+                blur_rgb = self._decode_rgb(blur_path)
+                sharp_rgb = self._decode_rgb(sharp_path)
+                if blur_rgb.shape[:2] != sharp_rgb.shape[:2]:
+                    sh, sw = sharp_rgb.shape[:2]
+                    blur_rgb = cv2.resize(blur_rgb, (sw, sh), interpolation=cv2.INTER_LINEAR)
+                if (
+                    self.is_train
+                    and self._paired_cache_capacity > 0
+                    and self._max_crops_per_decode > 1
+                    and min(sharp_rgb.shape[0], sharp_rgb.shape[1]) >= int(ps * 1.4)
+                ):
+                    ring.append([blur_rgb, sharp_rgb, blur_channel, max(2, self._max_crops_per_decode - 1)])
+                b_crop, s_crop = self._crop_paired_arrays(blur_rgb, sharp_rgb)
+                return b_crop, s_crop, blur_channel
+            except Exception as err:
+                last_err = err
+        raise RuntimeError(f"Failed to read paired crop from bucket '{bucket_name}': {last_err}")
+
+    def _load_paired_crop_with_retry(self, idx: int, max_attempts: int = 5) -> Tuple[np.ndarray, np.ndarray, str]:
+        m = len(self.paired_records)
         last_err = None
         for attempt in range(max_attempts):
             p_idx = (idx + attempt) % m
@@ -1550,45 +1536,58 @@ class ControllableRestorationDataset(_TorchDataset):
                 if blur_rgb.shape[:2] != sharp_rgb.shape[:2]:
                     sh, sw = sharp_rgb.shape[:2]
                     blur_rgb = cv2.resize(blur_rgb, (sw, sh), interpolation=cv2.INTER_LINEAR)
-
-                if (
-                    self.is_train
-                    and self._paired_cache_capacity > 0
-                    and self._max_crops_per_decode > 1
-                    and sharp_rgb.shape[0] >= int(ps * 1.5)
-                ):
-                    self._paired_ring.append(
-                        [blur_rgb, sharp_rgb, blur_channel, max(2, self._max_crops_per_decode - 1)]
-                    )
                 b_crop, s_crop = self._crop_paired_arrays(blur_rgb, sharp_rgb)
                 return b_crop, s_crop, blur_channel
             except Exception as err:
                 last_err = err
-        raise RuntimeError(f"Failed to read valid paired deblur sample after {max_attempts} attempts: {last_err}")
+        raise RuntimeError(f"Failed to read valid paired sample after {max_attempts} attempts: {last_err}")
 
     def __getitem__(self, idx):
         rng = np.random.default_rng() if self.is_train else np.random.default_rng(self.config.SEED + idx)
 
+        # 1. Sample ARTIFACT FIRST (balanced around artifact budget!)
+        primary_artifact = self.pipeline.sample_primary_artifact(rng=rng)
+
+        # 2. Inside the artifact, balance across DATASETS!
+        eff_real_frac = self.motion_real_pair_frac * (0.70 if self.pipeline.detail_stage_focus else 1.0)
         use_paired = bool(
             self.paired_records
-            and (not self.image_paths or (self.is_train and float(rng.random()) < self.paired_prob))
+            and (
+                not self.image_paths
+                or (
+                    self.is_train
+                    and primary_artifact == "deblur_motion"
+                    and float(rng.random()) < eff_real_frac
+                )
+            )
         )
 
         if use_paired:
-            pair_idx = int(rng.integers(0, len(self.paired_records))) if self.is_train else idx
-            blur_u8, sharp_u8, blur_ch = self._load_paired_crop_with_retry(pair_idx)
+            if self.is_train and self._paired_bucket_names:
+                p_bucket = self._paired_bucket_names[int(rng.integers(0, len(self._paired_bucket_names)))]
+                blur_u8, sharp_u8, blur_ch = self._load_paired_crop_from_bucket(p_bucket, rng=rng)
+            else:
+                blur_u8, sharp_u8, blur_ch = self._load_paired_crop_with_retry(idx % len(self.paired_records))
             clean_u8 = sharp_u8
-            x_src_u8, x_tgt_u8, a_fg, a_bg, mask_2d, s_src = self.pipeline.synthesize_real_pair_components(
-                blur_u8, sharp_u8, blur_channel_name=blur_ch, rng=rng, align_only=self.align_only
+            x_src_u8, x_tgt_u8, a_fg, a_bg, mask_2d, s_src, gan_clean = (
+                self.pipeline.synthesize_real_pair_components(
+                    blur_u8, sharp_u8, blur_channel_name="deblur_motion", rng=rng, align_only=self.align_only
+                )
             )
         else:
-            clean_u8 = self._load_crop_with_retry(idx % max(1, len(self.image_paths)))
-            donor_u8 = None
-            if self.is_train and len(self._decoded_ring) >= 2:
-                d_slot = int(rng.integers(0, len(self._decoded_ring)))
-                donor_u8 = self._crop_and_augment(self._decoded_ring[d_slot][0])
-            x_src_u8, x_tgt_u8, a_fg, a_bg, mask_2d, s_src = self.pipeline.synthesize_components(
-                clean_u8, rng=rng, align_only=self.align_only, refl_donor_u8=donor_u8
+            if self.is_train and self._clean_bucket_names:
+                b_probs = (
+                    self._sr_clean_bucket_probs
+                    if primary_artifact == "super_resolution"
+                    else self._clean_bucket_probs
+                )
+                c_bucket = self._clean_bucket_names[int(rng.choice(len(self._clean_bucket_names), p=b_probs))]
+                clean_u8 = self._load_crop_from_bucket(c_bucket, rng=rng)
+            else:
+                clean_u8 = self._load_crop_with_retry(idx % max(1, len(self.image_paths)))
+
+            x_src_u8, x_tgt_u8, a_fg, a_bg, mask_2d, s_src, gan_clean = self.pipeline.synthesize_components(
+                clean_u8, rng=rng, align_only=self.align_only, primary_artifact=primary_artifact
             )
 
         inv_255 = np.float32(1.0 / 255.0)
@@ -1600,6 +1599,7 @@ class ControllableRestorationDataset(_TorchDataset):
 
         tgt_t = torch.from_numpy(x_tgt_u8).permute(2, 0, 1).float().mul_(inv_255)
         s_src_t = torch.from_numpy(s_src)
+        gan_clean_t = torch.tensor(1.0 if gan_clean else 0.0, dtype=torch.float32)
 
         if self.compact_ipc:
             return {
@@ -1610,6 +1610,7 @@ class ControllableRestorationDataset(_TorchDataset):
                 "a_bg": torch.from_numpy(a_bg),
                 "spatial_mask": torch.from_numpy(mask_2d).unsqueeze(0).half(),
                 "source_severity": s_src_t,
+                "gan_clean_eligible": gan_clean_t,
             }
 
         h, w = clean_u8.shape[:2]
@@ -1628,6 +1629,7 @@ class ControllableRestorationDataset(_TorchDataset):
             "action_map": action_map_t,
             "action_global": action_map_t.mean(dim=(1, 2)),
             "source_severity": s_src_t,
+            "gan_clean_eligible": gan_clean_t,
         }
 
 
@@ -1672,7 +1674,6 @@ _BLUR_DIR_NAMES = {
 _SHARP_DIR_NAMES = {"sharp", "gt", "groundtruth", "ground_truth", "target", "clean", "hq", "hr"}
 _NON_CLEAN_DIR_NAMES = _BLUR_DIR_NAMES | {"noisy", "noise", "lr", "low", "corrupted"}
 # Exclude synthetic low-res face/OCR subsets (`CelebA`, `Text`) & dark un-tonemapped linear RAW (`RealBlur_R`)
-# inside curated collections so paired & clean training stays 100% high-res natural sRGB photography!
 _EXCLUDED_PAIR_SUBSTRINGS = ("celeba", "text", "bmvc", "widerface", "realblur_r", "realblur-r")
 
 
@@ -1730,7 +1731,7 @@ def _normalize_pair_stem(rel_key: str) -> str:
 def _infer_pair_channel(path_str: str, default_channel: str) -> str:
     low = path_str.lower()
     if any(tok in low for tok in ("dpdd", "defocus", "realdof", "bokeh", "dof")):
-        return "sharpen_focus"
+        return "super_resolution"
     if any(tok in low for tok in ("motion", "gopro", "hide", "realblur")):
         return "deblur_motion"
     return default_channel
@@ -1742,7 +1743,7 @@ def discover_paired_blur_datasets(
     is_train: bool = True,
     exclude_domain_subsets: bool = True,
 ) -> List[Tuple[Path, Path, str]]:
-    """Auto-discover paired `(blur_path, sharp_path, blur_channel)` across GoPro, HIDE, RealBlur-J, BlurDataset & DPDD!"""
+    """Auto-discover paired `(blur_path, sharp_path, blur_channel)` across GoPro, HIDE, RealBlur-J & BlurDataset!"""
     if not roots_spec:
         return []
     if isinstance(roots_spec, (str, Path)):
@@ -1759,7 +1760,7 @@ def discover_paired_blur_datasets(
         root_path = Path(r_str)
         root_pairs: List[Tuple[Path, Path, str]] = []
 
-        # 1. Check RealBlur/HIDE-style `.txt` pair index files first (pruning CelebA/Text/RAW subtrees immediately)
+        # 1. Check RealBlur/HIDE-style `.txt` pair index files first
         for cur_dir, dirs, files in os.walk(r_str, followlinks=True):
             dirs[:] = [d for d in dirs if not _is_excluded_pair_token(d, exclude_domain_subsets)]
             for fname in files:
@@ -1794,7 +1795,7 @@ def discover_paired_blur_datasets(
                         ch = _infer_pair_channel(str(blur_p), default_channel)
                         root_pairs.append((blur_p, sharp_p, ch))
 
-        # 2. Discover sibling `(blur, sharp)` / `(motion_blurred, defocused_blurred, sharp)` / `(inputC, target)` folders
+        # 2. Discover sibling `(blur, sharp)` / `(motion_blurred, sharp)` folders
         for cur_dir, dirs, _files in os.walk(r_str, followlinks=True):
             dirs[:] = [d for d in dirs if not _is_excluded_pair_token(d, exclude_domain_subsets)]
             lower_map: Dict[str, str] = {d.lower(): d for d in dirs}
@@ -1817,8 +1818,12 @@ def discover_paired_blur_datasets(
 
             has_canonical_blur = "blur" in lower_map
             for b_sub in blur_subs:
-                # Skip duplicate `blur_gamma` when canonical `blur` already exists in the same GoPro scene
                 if b_sub.lower() == "blur_gamma" and has_canonical_blur:
+                    continue
+                # Skip defocus subfolders when scanning for motion-blur pairs
+                if default_channel == "deblur_motion" and any(
+                    tok in b_sub.lower() for tok in ("defocus", "bokeh", "dof")
+                ):
                     continue
                 b_dir = Path(cur_dir) / b_sub
                 for bp in _collect_images(b_dir):
@@ -1828,8 +1833,6 @@ def discover_paired_blur_datasets(
                         ch = _infer_pair_channel(str(bp), default_channel)
                         root_pairs.append((bp, sharp_index[key_b], ch))
 
-        # Filter train vs test/val PER top-level subdataset (so GoPro uses GoPro/train while HIDE — which only
-        # has `HIDE/test/` in the Kaggle DBlur collection — is NOT discarded alongside GoPro/test!)
         if root_pairs:
             buckets: Dict[str, List[Tuple[Path, Path, str]]] = {}
             for rec in root_pairs:
@@ -1863,24 +1866,20 @@ def discover_paired_blur_datasets(
 def create_controllable_dataset(
     config, is_train=True, dataset_path=None, align_only: bool = False, compact_ipc: bool = False, verbose: bool = True
 ):
-    """Discover clean 2K references + clean sharp targets from paired datasets + real paired camera blur."""
+    """Discover clean 2K references (dataset-balanced) + real paired motion-blur datasets."""
     split_name = "train" if is_train else "val"
     explicit_dir = dataset_path or (config.TRAIN_DATASET_PATH if is_train else config.VAL_DATASET_PATH)
 
     paired_records: List[Tuple[Path, Path, str]] = []
     if is_train:
         motion_root = getattr(config, "PAIRED_MOTION_DATASET_PATH", None)
-        defocus_root = getattr(config, "PAIRED_DEFOCUS_DATASET_PATH", None)
         if motion_root:
             paired_records.extend(discover_paired_blur_datasets(motion_root, "deblur_motion", is_train=True))
-        if defocus_root:
-            paired_records.extend(discover_paired_blur_datasets(defocus_root, "sharpen_focus", is_train=True))
 
     paths: List[Path] = []
     source_desc = ""
 
     if explicit_dir:
-        # Support comma-separated multiple clean/curated roots (e.g. `/kaggle/input/df2k,/kaggle/input/curated`)
         dir_parts = [p.strip() for p in str(explicit_dir).split(",") if p.strip()]
         auto_pairs: List[Tuple[Path, Path, str]] = []
         for d_str in dir_parts:
@@ -1892,7 +1891,12 @@ def create_controllable_dataset(
                 if (str(rec[0]), str(rec[1])) not in existing_sigs:
                     paired_records.append(rec)
 
+        # Exclude BOTH blurred inputs AND paired sharp targets from clean pool (unless REUSE_PAIRED_CLEAN_FOR_SYNTH=True)
+        reuse_paired_clean = bool(getattr(config, "REUSE_PAIRED_CLEAN_FOR_SYNTH", False))
         blur_exclude = {str(bp) for bp, _sp, _ch in paired_records}
+        if not reuse_paired_clean:
+            blur_exclude |= {str(sp) for _bp, sp, _ch in paired_records}
+
         if len(dir_parts) == 1:
             target_root = Path(dir_parts[0])
             div2k_sub = target_root / ("DIV2K_train_HR" if is_train else "DIV2K_valid_HR")
@@ -1962,10 +1966,7 @@ def create_controllable_dataset(
                 f"No images found in {root}. Pass --train-root / --val-root or --paired-motion-root."
             )
 
-    # Reuse all verified clean `sharp`/`gt` images from paired datasets inside `paths` so they ALSO train
-    # all 6 main tasks (`denoise`, `deartifact`, `sharpen_focus`, `exposure`, `warmth`, `deblur_motion`)!
-    added_paired_clean = 0
-    if is_train and paired_records and bool(getattr(config, "REUSE_PAIRED_CLEAN_FOR_SYNTH", True)):
+    if is_train and paired_records and bool(getattr(config, "REUSE_PAIRED_CLEAN_FOR_SYNTH", False)):
         existing_clean = {str(p) for p in paths}
         extra_clean = sorted(
             {
@@ -1977,7 +1978,6 @@ def create_controllable_dataset(
         )
         if extra_clean:
             paths = list(paths) + extra_clean
-            added_paired_clean = len(extra_clean)
 
     limit = config.TRAIN_IMAGES_COUNT if is_train else config.VAL_IMAGES_COUNT
     if limit and 0 < limit < len(paths):
@@ -1986,22 +1986,7 @@ def create_controllable_dataset(
         rng.shuffle(shuffled)
         paths = sorted(shuffled[:limit])
 
-    if verbose:
-        clean_note = (
-            f" (incl. +{added_paired_clean} clean sharp/GT images from paired datasets)"
-            if added_paired_clean > 0
-            else ""
-        )
-        pair_msg = ""
-        if paired_records:
-            n_mot = sum(1 for _b, _s, ch in paired_records if ch == "deblur_motion")
-            n_foc = sum(1 for _b, _s, ch in paired_records if ch == "sharpen_focus")
-            pair_msg = (
-                f" + {len(paired_records)} real camera pairs "
-                f"(motion={n_mot}, defocus={n_foc}, p_real={getattr(config, 'PAIRED_REAL_PROB', 0.42):.2f})"
-            )
-        print(f"[{split_name}] Using {len(paths)} clean reference images from {source_desc}{clean_note}{pair_msg}")
-    return ControllableRestorationDataset(
+    ds = ControllableRestorationDataset(
         paths,
         config,
         is_train=is_train,
@@ -2009,4 +1994,25 @@ def create_controllable_dataset(
         compact_ipc=compact_ipc,
         paired_records=paired_records,
     )
-
+    if verbose:
+        clean_b_str = ", ".join(
+            f"{k}:{len(ds.clean_buckets[k])}({p*100:.0f}%)"
+            for k, p in zip(ds._clean_bucket_names, ds._clean_bucket_probs)
+        )
+        pair_msg = ""
+        if paired_records:
+            pb_str = ", ".join(f"{k}:{len(ds.paired_buckets[k])}" for k in ds._paired_bucket_names)
+            pair_msg = (
+                f" | Real Motion Pairs: {len(paired_records)} balanced [{pb_str}] "
+                f"(real_frac={ds.motion_real_pair_frac:.2f})"
+            )
+        art_str = ", ".join(
+            f"{n}:{p*100:.0f}%"
+            for n, p in zip(ds.pipeline.degradation_types, ds.pipeline.stage1_artifact_probs)
+        )
+        print(
+            f"[{split_name}] Clean HR Pool ({len(paths)} imgs) [{clean_b_str}]{pair_msg}\n"
+            f"  ↳ Artifact Budget (Stage 1): {art_str}",
+            flush=True,
+        )
+    return ds

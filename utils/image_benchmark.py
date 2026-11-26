@@ -204,15 +204,16 @@ def run_single_image_benchmark(
     # PART 1: RAW IMAGE "AS-IS" SWEEP (Zero Synthetic Degradation Added)
     # =========================================================================
     print(f"\n[1/3] Running Raw Image 'As-Is' Slider Sweep on '{image_stem}' ({w_orig}x{h_orig})...")
+    sr_key = "super_resolution" if "super_resolution" in config.DEGRADATION_TYPES else "sharpen_focus"
     raw_specs = [
         ("2. Identity (none)", "none", "none", False, 1.0, 0.0),
         ("3. Denoise+Deartifact", "denoise=1.0,deartifact=1.0", "none", False, 1.0, 0.0),
-        ("4. Motion+Focus Sharp", "deblur_motion=1.0,sharpen_focus=1.0", "none", False, 1.0, 0.55),
+        ("4. Motion+SuperRes", f"deblur_motion=1.0,{sr_key}=1.0", "none", False, 1.0, 0.65),
         ("5. Brighten + Warm", "exposure=0.40,warmth=0.35", "none", False, 1.0, 0.0),
         ("6. Darken + Cool", "exposure=-0.35,warmth=-0.35", "none", False, 1.0, 0.0),
         ("7. Restore All (Pixel)", "all", "none", False, 1.0, 0.0),
-        ("8. Restore All (Detail)", "all", "none", False, 1.0, 0.70),
-        ("9. 1-Click Obj Mask", "all", "none", True, 1.0, 0.70),
+        ("8. Restore All (Detail)", "all", "none", False, 1.0, 1.0),
+        ("9. 1-Click Obj Mask", "all", "none", True, 1.0, 1.0),
     ]
 
     raw_rows_visual = []
@@ -305,9 +306,9 @@ def run_single_image_benchmark(
     scenarios = [
         {
             "name": "Mild Everyday",
-            "banner": "Scenario 1 [Mild Everyday]: Noise (0.38) + JPEG/Band (0.48) + Warm Cast (+0.55) | Selective = Keep Cast",
-            "state": {"denoise": 0.38, "deartifact": 0.48, "warmth": 0.55},
-            "focus_mode": 0,
+            "banner": "Scenario 1 [Mild Everyday]: Noise (0.45) + JPEG/Band (0.50) + Warm Cast (+0.55) | Selective = Keep Cast",
+            "state": {"denoise": 0.45, "deartifact": 0.50, "warmth": 0.55},
+            "sr_mode": 0,
             "artifact_mode": 0,
             "selective_spec": "denoise=1.0,deartifact=1.0,warmth=0.0",
             "selective_label": "4. Selective (Keep Cast)",
@@ -317,9 +318,9 @@ def run_single_image_benchmark(
         },
         {
             "name": "Night Handheld",
-            "banner": "Scenario 2 [Night Handheld]: Dark Exp (-0.68) + Heavy Noise (0.70) + Motion (0.70) | Selective = Keep Blur",
-            "state": {"exposure": -0.68, "denoise": 0.70, "deblur_motion": 0.70},
-            "focus_mode": 0,
+            "banner": "Scenario 2 [Night Handheld]: Dark Exp (-0.68) + Heavy Noise (0.72) + Motion (0.70) | Selective = Keep Blur",
+            "state": {"exposure": -0.68, "denoise": 0.72, "deblur_motion": 0.70},
+            "sr_mode": 0,
             "artifact_mode": 0,
             "selective_spec": "denoise=1.0,exposure=0.68,deblur_motion=0.0",
             "selective_label": "4. Selective (Keep Blur)",
@@ -328,28 +329,28 @@ def run_single_image_benchmark(
             "partial_spec": "denoise=0.5,exposure=0.34,deblur_motion=0.5",
         },
         {
-            "name": "Washout + Bokeh",
-            "banner": "Scenario 3 [Washout + Bokeh]: Bright Washout (+0.65) + Defocus (0.65) + Banding (0.55) | Selective = Keep Bokeh",
-            "state": {"exposure": 0.65, "sharpen_focus": 0.65, "deartifact": 0.55},
-            "focus_mode": 0,
+            "name": "Blind Super-Res",
+            "banner": "Scenario 3 [Super-Res + Haze]: Low-Res SR (0.78) + Haze (0.55) + Banding (0.55) | Selective = Keep Haze",
+            "state": {sr_key: 0.78, "dehaze": 0.55, "deartifact": 0.55},
+            "sr_mode": 0,
             "artifact_mode": 1,
-            "selective_spec": "exposure=-0.65,deartifact=1.0,sharpen_focus=0.0",
-            "selective_label": "4. Selective (Keep Bokeh)",
-            "exact_spec": "exposure=-0.65,deartifact=1.0,sharpen_focus=1.0",
-            "all_spec": "all,exposure=-0.65",
-            "partial_spec": "exposure=-0.325,deartifact=0.5,sharpen_focus=0.5",
+            "selective_spec": f"{sr_key}=1.0,deartifact=1.0,dehaze=0.0",
+            "selective_label": "4. Selective (Keep Haze)",
+            "exact_spec": f"{sr_key}=1.0,deartifact=1.0,dehaze=1.0",
+            "all_spec": "all",
+            "partial_spec": f"{sr_key}=0.5,deartifact=0.5,dehaze=0.5",
         },
         {
             "name": "Web Compression",
-            "banner": "Scenario 4 [Web Torture]: LowRes/SR (0.68) + Heavy JPEG (0.75) + Motion (0.45) + Cool (-0.45) | Selective = DeJPEG",
-            "state": {"sharpen_focus": 0.68, "deartifact": 0.75, "deblur_motion": 0.45, "warmth": -0.45},
-            "focus_mode": 1,
+            "banner": "Scenario 4 [Web Torture]: LowRes/SR (0.72) + Heavy JPEG (0.75) + Noise (0.45) + Cool (-0.45) | Selective = DeJPEG",
+            "state": {sr_key: 0.72, "deartifact": 0.75, "denoise": 0.45, "warmth": -0.45},
+            "sr_mode": 1,
             "artifact_mode": 0,
-            "selective_spec": "deartifact=1.0,sharpen_focus=0.0,deblur_motion=0.0,warmth=0.0",
+            "selective_spec": f"deartifact=1.0,{sr_key}=0.0,denoise=0.0,warmth=0.0",
             "selective_label": "4. Selective (DeJPEG)",
-            "exact_spec": "sharpen_focus=1.0,deartifact=1.0,deblur_motion=1.0,warmth=0.45",
+            "exact_spec": f"{sr_key}=1.0,deartifact=1.0,denoise=1.0,warmth=0.45",
             "all_spec": "all,warmth=0.45",
-            "partial_spec": "sharpen_focus=0.5,deartifact=0.5,deblur_motion=0.5,warmth=0.225",
+            "partial_spec": f"{sr_key}=0.5,deartifact=0.5,denoise=0.5,warmth=0.225",
         },
     ]
 
@@ -359,7 +360,7 @@ def run_single_image_benchmark(
     for s_idx, sc in enumerate(scenarios):
         rng = np.random.default_rng(seed + s_idx * 97)
         params = pipeline.sample_params(sh, sw, rng=rng)
-        params.focus_mode = int(sc["focus_mode"])
+        params.sr_mode = int(sc["sr_mode"])
         params.artifact_mode = int(sc["artifact_mode"])
 
         s_src = np.zeros(config.NUM_ACTIONS, dtype=np.float32)

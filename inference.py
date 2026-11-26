@@ -161,12 +161,25 @@ class ControllableInferencer:
         tile_size: Optional[int] = None,
         tile_overlap: Optional[int] = None,
         lens_distortion_k1: float = 0.0,
+        upscale: int = 1,
     ):
-        """Restore an RGB uint8 image with global sliders, directional tone/WB, or 1-click semantic masks."""
+        """Restore an RGB uint8 image with 7 orthogonal controls, optional 2x/4x SR upscale & 1-click masks."""
         if abs(float(lens_distortion_k1)) > 1e-4:
             image_rgb_u8 = SelectiveDegradationPipeline.render_lens_distortion(
                 image_rgb_u8, k1=float(lens_distortion_k1)
             )
+
+        up_factor = max(1, int(upscale or 1))
+        if up_factor > 1:
+            h0, w0 = image_rgb_u8.shape[:2]
+            image_rgb_u8 = cv2.resize(
+                image_rgb_u8, (w0 * up_factor, h0 * up_factor), interpolation=cv2.INTER_CUBIC
+            )
+            if point_mask is not None:
+                px, py = float(point_mask[0]), float(point_mask[1])
+                if not (0.0 <= px <= 1.0 and 0.0 <= py <= 1.0 and (px < 1.0 or py < 1.0)):
+                    point_mask = (px * up_factor, py * up_factor)
+
         h, w = image_rgb_u8.shape[:2]
         src_t = (
             torch.from_numpy(image_rgb_u8.astype(np.float32) / 255.0)
@@ -178,6 +191,14 @@ class ControllableInferencer:
         signed_types = getattr(self.config, "SIGNED_ACTION_TYPES", ["exposure", "warmth"])
         fg_vec = parse_action_spec(action, self.config.DEGRADATION_TYPES, signed_types=signed_types)
         bg_vec = parse_action_spec(bg_action, self.config.DEGRADATION_TYPES, signed_types=signed_types)
+
+        # When 2x/4x Super-Resolution Upscale is requested and action is not explicit 'none', engage SR slider!
+        if up_factor > 1 and (action or "").strip().lower() not in ("none", "preserve", "zero", "identity"):
+            sr_key = "super_resolution" if "super_resolution" in self.config.DEGRADATION_TYPES else "sharpen_focus"
+            if sr_key in self.config.DEGRADATION_TYPES:
+                sr_idx = self.config.DEGRADATION_TYPES.index(sr_key)
+                if fg_vec[sr_idx] < 1e-4:
+                    fg_vec[sr_idx] = 1.0
 
         resolved_mask = None
         if point_mask is not None:
@@ -359,6 +380,13 @@ def main():
     parser.add_argument("--tile-size", type=int, default=None, help="Seamless tile size for 2K/4K photos (default: 512)")
     parser.add_argument("--tile-overlap", type=int, default=None, help="Overlap margin between tiles (default: 96)")
     parser.add_argument(
+        "--upscale",
+        type=int,
+        choices=[1, 2, 4],
+        default=1,
+        help="Optional Super-Resolution output upscale factor (1=same size, 2=2x SR, 4=4x SR)",
+    )
+    parser.add_argument(
         "--lens-k1",
         type=float,
         default=0.0,
@@ -420,6 +448,7 @@ def main():
         tile_size=args.tile_size,
         tile_overlap=args.tile_overlap,
         lens_distortion_k1=args.lens_k1,
+        upscale=args.upscale,
     )
 
     out_dir = Path(args.output_dir)

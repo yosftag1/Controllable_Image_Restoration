@@ -51,9 +51,10 @@ class _MockTinyVisionBackbone(nn.Module):
         )
         self.norm_out = nn.LayerNorm(embed_dim)
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor, return_intermediates: bool = False):
         feat = self.patch_embed(x)  # [B, D, Hp, Wp]
         tokens = feat.flatten(2).transpose(1, 2)  # [B, N, D]
+        intermediates = []
         for blk in self.blocks:
             h = blk["norm1"](tokens)
             q = blk["q_proj"](h)
@@ -62,8 +63,12 @@ class _MockTinyVisionBackbone(nn.Module):
             attn = F.scaled_dot_product_attention(q, k, v)
             tokens = tokens + blk["out_proj"](attn)
             tokens = tokens + blk["fc2"](F.gelu(blk["fc1"](blk["norm2"](tokens))))
+            if return_intermediates:
+                intermediates.append(self.norm_out(tokens))
         tokens = self.norm_out(tokens)
         summary = tokens.mean(dim=1)
+        if return_intermediates:
+            return summary, tokens, intermediates
         return summary, tokens
 
 
@@ -161,3 +166,51 @@ class SemanticEncoder(nn.Module):
             "grid": spatial_grid,
             "mask_grid": spatial_grid,
         }
+
+    def extract_discriminator_grids(
+        self,
+        rgb_01: torch.Tensor,
+        max_size: int = 252,
+        enable_grad: bool = False,
+    ) -> list:
+        """Extract 3 multi-layer 2D spatial DINOv2 feature grids for the Stage-2 ADD/S3Diff discriminator.
+
+        Reuses the already-loaded frozen DINOv2 backbone at zero extra VRAM while allowing input gradients
+        (`enable_grad=True`) during Generator adversarial updates.
+        """
+        ps = self.patch_size
+        x = rgb_01.clamp(0.0, 1.0)
+        bsz, _, h, w = x.shape
+        if max_size > 0 and max(h, w) > max_size:
+            scale = float(max_size) / float(max(h, w))
+            th = max(ps, int(round((h * scale) / ps)) * ps)
+            tw = max(ps, int(round((w * scale) / ps)) * ps)
+            x = F.interpolate(x, size=(th, tw), mode="bilinear", align_corners=False)
+        else:
+            x, _, _ = self._resize_to_patch_multiple(x)
+        hp, wp = x.shape[-2] // ps, x.shape[-1] // ps
+        num_patches = hp * wp
+
+        with torch.set_grad_enabled(bool(enable_grad)):
+            if self.encoder_type == "dinov2_reg":
+                x_norm = (x - self.imagenet_mean.to(device=x.device, dtype=x.dtype)) / self.imagenet_std.to(
+                    device=x.device, dtype=x.dtype
+                )
+                dino_out = self.dinov2_reg(pixel_values=x_norm, output_hidden_states=True)
+                hidden_states = dino_out.hidden_states
+                n_layers = len(hidden_states) - 1  # exclude patch embedding at index 0
+                if n_layers >= 3:
+                    pick = [max(1, n_layers // 3), max(2, (2 * n_layers) // 3), n_layers]
+                else:
+                    pick = list(range(1, len(hidden_states)))
+                grids = []
+                for li in pick:
+                    seq = hidden_states[li][:, -num_patches:, :].float()
+                    grids.append(seq.transpose(1, 2).reshape(bsz, -1, hp, wp))
+                return grids
+            else:
+                _, _, intermediates = self.mock(x, return_intermediates=True)
+                return [
+                    seq.float().transpose(1, 2).reshape(bsz, -1, hp, wp)
+                    for seq in intermediates[-3:]
+                ]
